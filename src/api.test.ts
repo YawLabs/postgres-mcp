@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { getMaxRows, isWritesAllowed } from "./api.js";
+import { getMaxRows, getPoolMax, isWritesAllowed } from "./api.js";
 
 describe("isWritesAllowed", () => {
   const original = process.env.ALLOW_WRITES;
@@ -58,6 +58,36 @@ describe("getMaxRows", () => {
     for (const v of ["abc", "-5", "0", ""]) {
       process.env.POSTGRES_MAX_ROWS = v;
       assert.equal(getMaxRows(), 1000, `POSTGRES_MAX_ROWS=${JSON.stringify(v)} should default`);
+    }
+  });
+});
+
+describe("getPoolMax", () => {
+  const original = process.env.POSTGRES_POOL_MAX;
+  afterEach(() => {
+    if (original === undefined) delete process.env.POSTGRES_POOL_MAX;
+    else process.env.POSTGRES_POOL_MAX = original;
+  });
+
+  it("defaults to 5", () => {
+    delete process.env.POSTGRES_POOL_MAX;
+    assert.equal(getPoolMax(), 5);
+  });
+
+  it("accepts positive integers", () => {
+    process.env.POSTGRES_POOL_MAX = "1";
+    assert.equal(getPoolMax(), 1);
+  });
+
+  it("floors fractional values", () => {
+    process.env.POSTGRES_POOL_MAX = "3.7";
+    assert.equal(getPoolMax(), 3);
+  });
+
+  it("falls back to 5 for invalid values", () => {
+    for (const v of ["abc", "-5", "0", ""]) {
+      process.env.POSTGRES_POOL_MAX = v;
+      assert.equal(getPoolMax(), 5, `POSTGRES_POOL_MAX=${JSON.stringify(v)} should default`);
     }
   });
 });

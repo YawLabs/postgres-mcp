@@ -48,7 +48,7 @@ export function getMaxRows(): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1000;
 }
 
-function getPoolMax(): number {
+export function getPoolMax(): number {
   const raw = process.env.POSTGRES_POOL_MAX;
   if (!raw) return 5;
   const parsed = Number(raw);
