@@ -43,13 +43,21 @@ jobs:
       - name: Smoke test published package
         working-directory: ${{ runner.temp }}
         run: |
+          # npm registry propagation is usually <30s but occasionally stalls
+          # for several minutes (observed ~7min on v0.1.0 initial publish).
+          # Give it up to 10 minutes before failing the release.
           VERSION="${GITHUB_REF_NAME#v}"
-          for i in 1 2 3 4 5; do
+          for i in $(seq 1 60); do
             if npm view "@yawlabs/postgres-mcp@${VERSION}" version >/dev/null 2>&1; then
+              echo "Registry reports @yawlabs/postgres-mcp@${VERSION} available (attempt $i)"
               break
             fi
-            echo "Waiting for @yawlabs/postgres-mcp@${VERSION} to appear on the registry (attempt $i)..."
-            sleep 5
+            if [ "$i" = "60" ]; then
+              echo "Gave up waiting for @yawlabs/postgres-mcp@${VERSION} after 10 minutes." >&2
+              exit 1
+            fi
+            echo "Waiting for @yawlabs/postgres-mcp@${VERSION} to appear on the registry (attempt $i/60)..."
+            sleep 10
           done
           OUTPUT=$(npx -y "@yawlabs/postgres-mcp@${VERSION}" --version)
           echo "npx output: $OUTPUT"
