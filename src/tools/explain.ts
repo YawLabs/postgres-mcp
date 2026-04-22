@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { type ApiResponse, isWritesAllowed, runReadOnly, runReadWrite } from "../api.js";
 
+const paramValue: z.ZodType<unknown> = z.lazy(() =>
+  z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(paramValue), z.record(z.string(), paramValue)]),
+);
+
 export const explainTools = [
   {
     name: "pg_explain",
@@ -8,7 +12,7 @@ export const explainTools = [
       "Get the query plan for a SQL statement. By default, this uses plain EXPLAIN (no execution). " +
       "Set `analyze: true` to run the query with EXPLAIN ANALYZE — for non-SELECT statements, " +
       "ALLOW_WRITES=1 is required (since ANALYZE actually executes the statement). " +
-      "Format is `text` (default) or `json`.",
+      "Format is `text` (default) or `json`. Pass the raw SQL (not an EXPLAIN-prefixed statement).",
     annotations: {
       title: "Explain query plan",
       readOnlyHint: false,
@@ -17,13 +21,10 @@ export const explainTools = [
       openWorldHint: true,
     },
     inputSchema: z.object({
-      sql: z.string().min(1).describe("The SQL statement to explain."),
+      sql: z.string().min(1).max(1_000_000).describe("The SQL statement to explain. Do NOT prefix with EXPLAIN."),
       analyze: z.boolean().default(false).describe("Run EXPLAIN ANALYZE (actually executes the query)."),
       format: z.enum(["text", "json"]).default("text").describe("Output format."),
-      params: z
-        .array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
-        .optional()
-        .describe("Positional parameters referenced as $1, $2, ... in the SQL."),
+      params: z.array(paramValue).optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
     }),
     handler: async (input: unknown) => {
       const { sql, analyze, format, params } = input as {
@@ -32,6 +33,18 @@ export const explainTools = [
         format: "text" | "json";
         params?: unknown[];
       };
+
+      // LLMs often pass pre-wrapped SQL like "EXPLAIN ANALYZE SELECT ..." which
+      // would become "EXPLAIN (ANALYZE) EXPLAIN ANALYZE SELECT ..." below —
+      // a syntax error. Reject with a clear hint so the next call is correct.
+      if (/^\s*EXPLAIN\b/i.test(sql)) {
+        return {
+          ok: false,
+          error:
+            "The `sql` parameter should be the query to explain, not an EXPLAIN statement. " +
+            "Use the `analyze` and `format` parameters on this tool instead of prefixing the SQL.",
+        };
+      }
 
       const flags: string[] = [];
       if (analyze) flags.push("ANALYZE");

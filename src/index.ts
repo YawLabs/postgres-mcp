@@ -3,10 +3,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isWritesAllowed, shutdown } from "./api.js";
+import { adminTools } from "./tools/admin.js";
 import { explainTools } from "./tools/explain.js";
 import { healthTools } from "./tools/health.js";
 import { queryTools } from "./tools/query.js";
 import { schemaTools } from "./tools/schemas.js";
+import { statsTools } from "./tools/stats.js";
 
 // Injected at build time by esbuild; falls back to reading package.json for tsc builds.
 declare const __VERSION__: string | undefined;
@@ -26,7 +28,7 @@ if (subcommand === "version" || subcommand === "--version") {
 
 // ─── No subcommand — start the MCP server ───
 
-const allTools = [...queryTools, ...schemaTools, ...explainTools, ...healthTools];
+const allTools = [...queryTools, ...schemaTools, ...explainTools, ...healthTools, ...statsTools, ...adminTools];
 
 const server = new McpServer({
   name: "@yawlabs/postgres-mcp",

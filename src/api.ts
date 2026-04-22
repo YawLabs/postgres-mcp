@@ -2,13 +2,16 @@
  * PostgreSQL connection pool with read-only enforcement.
  *
  * Config:
- *   - DATABASE_URL                    — postgres connection string (required)
- *   - ALLOW_WRITES                    — set to "1" or "true" to allow DML/DDL (default: read-only)
- *   - POSTGRES_STATEMENT_TIMEOUT_MS   — per-statement timeout (default: 30000)
- *   - POSTGRES_MAX_ROWS               — max rows returned by pg_query (default: 1000)
- *   - POSTGRES_POOL_MAX               — max pool connections (default: 5). Set to 1 for
- *                                       single-threaded backends (pglite-socket, PgBouncer
- *                                       transaction mode) that can't handle concurrent queries.
+ *   - DATABASE_URL                         — postgres connection string (required)
+ *   - ALLOW_WRITES                         — set to "1" or "true" to allow DML/DDL (default: read-only)
+ *   - POSTGRES_STATEMENT_TIMEOUT_MS        — per-statement timeout (default: 30000)
+ *   - POSTGRES_MAX_ROWS                    — max rows returned by pg_query (default: 1000)
+ *   - POSTGRES_POOL_MAX                    — max pool connections (default: 5). Set to 1 for
+ *                                            single-threaded backends (pglite-socket, PgBouncer
+ *                                            transaction mode) that can't handle concurrent queries.
+ *   - POSTGRES_SSL_REJECT_UNAUTHORIZED     — "false" to disable TLS cert verification (for managed
+ *                                            databases using private-CA certs: Supabase, Neon,
+ *                                            RDS with a custom CA). Connection is still encrypted.
  *
  * Safety model:
  *   User-provided SQL runs in a `BEGIN READ ONLY` transaction by default, so
@@ -60,13 +63,26 @@ export function isWritesAllowed(): boolean {
   return v === "1" || v === "true";
 }
 
+export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
+  const raw = process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
+  if (raw === undefined) return undefined;
+  if (raw === "0" || raw === "false") return { rejectUnauthorized: false };
+  if (raw === "1" || raw === "true") return { rejectUnauthorized: true };
+  return undefined;
+}
+
 export function getPool(): pg.Pool {
   if (pool) return pool;
+  const ssl = getSslConfig();
   pool = new pg.Pool({
     connectionString: getDatabaseUrl(),
     statement_timeout: getStatementTimeoutMs(),
     max: getPoolMax(),
-    idleTimeoutMillis: 10_000,
+    // MCP sessions can have minutes-long gaps between tool calls. A short
+    // idleTimeout forces a reconnect on every tool call. 60s keeps the pool
+    // warm without holding connections indefinitely.
+    idleTimeoutMillis: 60_000,
+    ...(ssl ? { ssl } : {}),
   });
   // pg's Pool emits 'error' for idle client failures. Log to stderr so the
   // stdio MCP protocol channel (stdout) stays clean.

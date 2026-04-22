@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { getMaxRows, getPoolMax, isWritesAllowed } from "./api.js";
+import { getMaxRows, getPoolMax, getSslConfig, isWritesAllowed } from "./api.js";
 
 describe("isWritesAllowed", () => {
   const original = process.env.ALLOW_WRITES;
@@ -88,6 +88,50 @@ describe("getPoolMax", () => {
     for (const v of ["abc", "-5", "0", ""]) {
       process.env.POSTGRES_POOL_MAX = v;
       assert.equal(getPoolMax(), 5, `POSTGRES_POOL_MAX=${JSON.stringify(v)} should default`);
+    }
+  });
+});
+
+describe("getSslConfig", () => {
+  const original = process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
+  afterEach(() => {
+    if (original === undefined) delete process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
+    else process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = original;
+  });
+
+  it("returns undefined when unset (let pg driver handle URL)", () => {
+    delete process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
+    assert.equal(getSslConfig(), undefined);
+  });
+
+  it("returns rejectUnauthorized=false for 'false'", () => {
+    process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = "false";
+    assert.deepEqual(getSslConfig(), { rejectUnauthorized: false });
+  });
+
+  it("returns rejectUnauthorized=false for '0'", () => {
+    process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = "0";
+    assert.deepEqual(getSslConfig(), { rejectUnauthorized: false });
+  });
+
+  it("returns rejectUnauthorized=true for 'true'", () => {
+    process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = "true";
+    assert.deepEqual(getSslConfig(), { rejectUnauthorized: true });
+  });
+
+  it("returns rejectUnauthorized=true for '1'", () => {
+    process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = "1";
+    assert.deepEqual(getSslConfig(), { rejectUnauthorized: true });
+  });
+
+  it("returns undefined for unrecognized values (defers to pg driver)", () => {
+    for (const v of ["yes", "no", "TRUE", "False", "", "maybe"]) {
+      process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = v;
+      assert.equal(
+        getSslConfig(),
+        undefined,
+        `POSTGRES_SSL_REJECT_UNAUTHORIZED=${JSON.stringify(v)} should return undefined`,
+      );
     }
   });
 });

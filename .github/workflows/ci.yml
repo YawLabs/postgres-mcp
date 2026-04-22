@@ -8,9 +8,11 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node-version: [18, 20, 22]
 
     steps:
@@ -25,3 +27,45 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: npm test
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres_mcp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          -c shared_preload_libraries=pg_stat_statements
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Enable pg_stat_statements
+        env:
+          PGPASSWORD: postgres
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y postgresql-client
+          psql -h localhost -U postgres -d postgres_mcp_test -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+
+      - name: Run integration tests
+        env:
+          POSTGRES_MCP_INTEGRATION: '1'
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres_mcp_test
+        run: npm run test:integration

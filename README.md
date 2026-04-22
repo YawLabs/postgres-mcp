@@ -75,16 +75,41 @@ Read-only is the default. If you want the agent to be able to `INSERT`, `UPDATE`
 
 Prefer scoping this to dev/test databases — for production, leave writes off and use migration tools out-of-band.
 
+## What can an agent do with this?
+
+Once connected, the agent picks tools automatically based on what you ask. A few real examples:
+
+- **"Describe the users table"** -> `pg_describe_table` -> returns columns, PK, FKs, indexes.
+- **"Which tables have a `user_id` column?"** -> `pg_search_columns` with pattern `user_id` -> one call instead of iterating every table.
+- **"This query is slow, why?"** -> `pg_explain` with `analyze: true` -> returns the plan with actual row counts and timing.
+- **"What's the slowest query we run?"** -> `pg_top_queries` -> returns the top N from `pg_stat_statements` with mean/total/min/max times.
+- **"Why is my app hanging?"** -> `pg_inspect_locks` -> returns blocked PIDs and the queries holding their locks; follow up with `pg_kill` (with `ALLOW_WRITES=1`) to cancel the blocker.
+- **"Do we have any unused indexes?"** -> `pg_unused_indexes` -> returns non-unique, non-primary indexes with zero or low scan counts + their size.
+- **"Is `pgvector` installed?"** -> `pg_list_extensions` -> yes/no with version.
+
 ## Tools
 
 | Tool | Description |
 |------|-------------|
 | `pg_query` | Run a SQL query. Read-only by default; writes require `ALLOW_WRITES=1`. Supports parameterized queries via `params`. |
 | `pg_list_schemas` | List non-system schemas. |
-| `pg_list_tables` | List tables (and optionally views) in a schema with estimated row counts. |
+| `pg_list_tables` | List tables (and optionally views) in a schema with estimated row counts. Paginated via `limit`/`offset`. |
 | `pg_describe_table` | Columns, primary key, foreign keys, and indexes for a table. |
+| `pg_list_views` | List views and materialized views in a schema, including their SQL definitions. |
+| `pg_list_functions` | List functions, procedures, and aggregates in a schema with signatures and return types. |
+| `pg_list_extensions` | List installed extensions (pgvector, postgis, pg_stat_statements, etc.) with versions. |
+| `pg_search_columns` | Find columns by name pattern across all user schemas. Case-insensitive, supports SQL LIKE wildcards. |
 | `pg_explain` | `EXPLAIN` or `EXPLAIN ANALYZE` for a SQL statement. Text or JSON output. |
 | `pg_health` | Server version, database size, connection count, active queries, table count. |
+| `pg_top_queries` | Top N queries by total/mean execution time. Requires the `pg_stat_statements` extension. |
+| `pg_seq_scan_tables` | Tables with heavy sequential scans — missing-index candidates. |
+| `pg_unused_indexes` | Non-unique, non-primary indexes with low scan counts — drop candidates. |
+| `pg_inspect_locks` | Who is blocking whom right now (blocked PID, blocker PID, lock type, queries). |
+| `pg_list_roles` | Database roles with login/superuser/createdb flags and group memberships. |
+| `pg_table_privileges` | Who has SELECT/INSERT/UPDATE/DELETE/etc. on a table or whole schema. |
+| `pg_table_bloat` | Tables with high dead-tuple ratios — VACUUM candidates. |
+| `pg_replication_status` | Replication slots, connected replicas, and current WAL position. |
+| `pg_kill` | Cancel a running query or terminate a backend connection. Requires `ALLOW_WRITES=1`. |
 
 ## Configuration
 
@@ -96,8 +121,43 @@ All env vars are read from the MCP server's environment:
 | `ALLOW_WRITES` | unset | Set to `1` or `true` to allow DML/DDL via `pg_query` and `pg_explain` ANALYZE of writes. |
 | `POSTGRES_STATEMENT_TIMEOUT_MS` | `30000` | Per-statement timeout. |
 | `POSTGRES_MAX_ROWS` | `1000` | Cap on rows returned by `pg_query`. |
+| `POSTGRES_POOL_MAX` | `5` | Max pool connections. Set to `1` for single-threaded backends (pglite-socket, PgBouncer transaction mode). |
+| `POSTGRES_SSL_REJECT_UNAUTHORIZED` | unset | Set to `false` to skip TLS cert verification (for managed DBs using private-CA certs). Connection is still encrypted. |
 
-SSL is handled by the `pg` driver based on the connection string — use `?sslmode=require` (or equivalent) in `DATABASE_URL` for cloud-hosted databases.
+### Connecting to managed Postgres (Supabase, Neon, RDS, etc.)
+
+Most managed databases require TLS but serve certs signed by a private CA that Node's default trust store doesn't recognize. The symptom is one of:
+
+- `self signed certificate in certificate chain`
+- `unable to get local issuer certificate`
+- `unable to verify the first certificate`
+
+To allow the connection while keeping traffic encrypted, add `POSTGRES_SSL_REJECT_UNAUTHORIZED=false` to the `env` block:
+
+```json
+"env": {
+  "DATABASE_URL": "postgres://user:pass@host:5432/db?sslmode=require",
+  "POSTGRES_SSL_REJECT_UNAUTHORIZED": "false"
+}
+```
+
+This disables certificate chain verification only -- the TCP connection is still TLS-encrypted end-to-end. For production setups where you can install the CA, prefer putting the cert in the Node trust store (`NODE_EXTRA_CA_CERTS`) over disabling verification globally.
+
+## Troubleshooting
+
+**`DATABASE_URL is not set`** — Your MCP client is launching the server without the env var. On Windows especially, env vars set in bash / PowerShell profiles are not inherited by MCP servers launched via `cmd`. Put `DATABASE_URL` directly in the `env` block of `.mcp.json`.
+
+**`password authentication failed`** — Check the username, password, and that the user has `CONNECT` privilege on the database. URL-encode special characters in the password (`@` → `%40`, `#` → `%23`, `/` → `%2F`).
+
+**`SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string`** — The password in your connection string is empty or became `null` after URL decoding. Re-check your connection string.
+
+**`canceling statement due to statement timeout`** — A single query exceeded `POSTGRES_STATEMENT_TIMEOUT_MS` (default 30s). Increase it, narrow the query with `WHERE`, or add an index. This is working as designed -- the timeout exists so a runaway query cannot hang the agent.
+
+**`Write blocked: this server is in read-only mode`** — You asked the agent to write but `ALLOW_WRITES` is not set. Add `ALLOW_WRITES=1` to the `env` block of `.mcp.json` and restart your MCP client. Only do this for dev/test DBs.
+
+**Connection pool exhaustion with PgBouncer transaction mode or pglite-socket** — These backends don't support concurrent queries on a single connection. Set `POSTGRES_POOL_MAX=1` in the env block.
+
+**First query is slow, subsequent queries are fast** — Expected. The pg driver lazily establishes the first connection; subsequent queries reuse the pool.
 
 ## License
 

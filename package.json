@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/postgres-mcp",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "description": "PostgreSQL MCP server — query, schema introspection, explain, and health checks for AI assistants",
   "license": "MIT",
   "author": "YawLabs <contact@yaw.sh>",
@@ -33,6 +33,7 @@
     "start": "node dist/index.js",
     "test": "npm run build && node --test dist/**/*.test.js",
     "test:ci": "npm run test",
+    "test:integration": "npm run build && node --test dist/**/*.integration.test.js",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "prepublishOnly": "npm run build"

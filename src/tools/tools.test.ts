@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { adminTools } from "./admin.js";
 import { explainTools } from "./explain.js";
 import { healthTools } from "./health.js";
 import { queryTools } from "./query.js";
 import { schemaTools } from "./schemas.js";
+import { statsTools } from "./stats.js";
 
-const allTools = [...queryTools, ...schemaTools, ...explainTools, ...healthTools];
+const allTools = [...queryTools, ...schemaTools, ...explainTools, ...healthTools, ...statsTools, ...adminTools];
 
 describe("Tool definitions", () => {
   it("should have no duplicate tool names", () => {
@@ -18,8 +20,8 @@ describe("Tool definitions", () => {
     );
   });
 
-  it("should have the expected total tool count (v0.1.0 surface)", () => {
-    assert.equal(allTools.length, 6);
+  it("should have the expected total tool count", () => {
+    assert.equal(allTools.length, 19);
   });
 
   for (const tool of allTools) {

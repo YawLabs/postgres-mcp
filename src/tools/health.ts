@@ -14,8 +14,17 @@ export const healthTools = [
       idempotentHint: true,
       openWorldHint: true,
     },
-    inputSchema: z.object({}),
-    handler: async () => {
+    inputSchema: z.object({
+      activeQueryLimit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .default(10)
+        .describe("Max active queries to return (default 10, max 100)."),
+    }),
+    handler: async (input: unknown) => {
+      const { activeQueryLimit } = input as { activeQueryLimit: number };
       const [versionRes, sizeRes, connsRes, activeRes, tableCountRes] = await Promise.all([
         runInternal<{ version: string }>(`SELECT version() AS version`),
         runInternal<{ database: string; size_pretty: string; size_bytes: string }>(
@@ -52,7 +61,8 @@ export const healthTools = [
              AND state <> 'idle'
              AND pid <> pg_backend_pid()
            ORDER BY query_start ASC NULLS LAST
-           LIMIT 10`,
+           LIMIT $1`,
+          [activeQueryLimit],
         ),
         runInternal<{ count: string }>(
           `SELECT count(*)::text AS count
