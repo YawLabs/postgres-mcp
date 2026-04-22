@@ -134,10 +134,10 @@ export const schemaTools = [
       const foreignKeysQuery = `
         SELECT
           con.conname AS constraint_name,
-          array_agg(att.attname ORDER BY u.attposition) AS columns,
+          array_agg(att.attname::text ORDER BY u.attposition) AS columns,
           cl.relname AS foreign_table,
           fn.nspname AS foreign_schema,
-          array_agg(fatt.attname ORDER BY u.attposition) AS foreign_columns
+          array_agg(fatt.attname::text ORDER BY u.attposition) AS foreign_columns
         FROM pg_catalog.pg_constraint con
         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace

@@ -86,7 +86,10 @@ export const adminTools = [
     }),
     handler: async (input: unknown) => {
       const { includeSystem } = input as { includeSystem: boolean };
-      const filter = includeSystem ? "" : "WHERE r.rolname NOT LIKE 'pg\\_%' ESCAPE '\\\\'";
+      // `starts_with` (pg 11+) is cleaner than LIKE for a literal-underscore
+      // prefix match — LIKE requires escaping _ and the escape clause itself
+      // needs careful backslash handling through JS -> SQL.
+      const filter = includeSystem ? "" : "WHERE NOT starts_with(r.rolname, 'pg_')";
       return runInternal<{
         name: string;
         can_login: boolean;
@@ -97,6 +100,8 @@ export const adminTools = [
         bypass_rls: boolean;
         member_of: string[];
       }>(
+        // Cast member_of to text[] so node-pg parses it into a JS array.
+        // Without the cast, it comes back as the postgres text form `{a,b}`.
         `SELECT
            r.rolname AS name,
            r.rolcanlogin AS can_login,
@@ -106,11 +111,11 @@ export const adminTools = [
            r.rolreplication AS replication,
            r.rolbypassrls AS bypass_rls,
            COALESCE(
-             (SELECT array_agg(g.rolname ORDER BY g.rolname)
+             (SELECT array_agg(g.rolname::text ORDER BY g.rolname)
               FROM pg_catalog.pg_auth_members m
               JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
               WHERE m.member = r.oid),
-             ARRAY[]::name[]
+             ARRAY[]::text[]
            ) AS member_of
          FROM pg_catalog.pg_roles r
          ${filter}
