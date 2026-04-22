@@ -1,0 +1,12 @@
+# Force LF line endings in the working tree on every OS. Biome formats with
+# LF; without this, git on Windows converts to CRLF on checkout and CI lint
+# fails with a full-file formatter diff on Windows runners.
+* text=auto eol=lf
+
+# Explicit binary markers so git doesn't try to normalize them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
