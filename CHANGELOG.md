@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-22
+
+### Fixed
+- `pg_list_roles` with `includeSystem: false` (the default) now actually
+  excludes built-in `pg_*` roles. The previous `LIKE 'pg\_%' ESCAPE '\\'`
+  filter ended up as SQL `ESCAPE '\\'` (two backslashes), which Postgres
+  rejects since `ESCAPE` requires a single character — so the whole filter
+  was silently being dropped. Replaced with `starts_with(rolname, 'pg_')`.
+- `pg_describe_table` foreign-key `columns` and `foreign_columns` are now
+  proper JSON arrays. They were previously returned as the raw postgres
+  text form (e.g. `"{user_id}"`) because `array_agg(name)` returns `name[]`,
+  which node-pg doesn't auto-parse. Cast to `text[]` so the driver parses.
+
+### Infrastructure (main branch CI hygiene; no user-facing changes)
+- `.gitattributes` forces LF line endings in the working tree on every OS,
+  so biome's formatter doesn't reject every file on Windows runners after
+  git's auto-CRLF conversion.
+- The integration CI job now starts postgres via `docker run` with
+  `-c shared_preload_libraries=pg_stat_statements` instead of the `services:`
+  block (which passes options to `docker create`, where `-c` means
+  --cpu-shares and collided with the postmaster flag).
+- Cross-platform test discovery via `scripts/run-tests.mjs`. `node --test dist`
+  hangs on Windows; `dist/**/*.test.js` globs only expand in bash with
+  globstar. The wrapper uses `fs.readdirSync({ recursive: true })` (stdlib)
+  and passes explicit paths, plus `--test-concurrency=1` for the integration
+  suite so fixture-schema setup doesn't race.
+
 ## [0.3.0] - 2026-04-22
 
 ### Added
