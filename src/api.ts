@@ -22,6 +22,12 @@
 
 import pg from "pg";
 
+// pg 8.14+ supports `queryMode: 'extended'` on QueryConfig to force the
+// extended query protocol even when `values` is empty. @types/pg has not yet
+// exposed this field, so we widen the type locally. Remove once DefinitelyTyped
+// catches up.
+type UserQueryConfig = pg.QueryConfig & { queryMode?: "extended" | "simple" };
+
 let pool: pg.Pool | null = null;
 
 function getDatabaseUrl(): string {
@@ -136,13 +142,23 @@ function toQueryResult(result: pg.QueryResult, maxRows: number): QueryResult {
   };
 }
 
-/** Run user-provided SQL in a READ ONLY transaction. Always rolls back. */
+/**
+ * Run user-provided SQL in a READ ONLY transaction. Always rolls back.
+ *
+ * The user SQL is sent with `queryMode: 'extended'` so pg uses the extended
+ * query protocol unconditionally (even when `params` is an empty array).
+ * The extended protocol limits a request to a single statement, which blocks
+ * the stacked-query injection pattern that defeated the archived reference
+ * server -- payloads like `COMMIT; DROP SCHEMA x CASCADE;` would otherwise
+ * end the READ ONLY transaction mid-stream and run DDL in autocommit.
+ * See: https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/
+ */
 export async function runReadOnly(sql: string, params: unknown[] = []): Promise<ApiResponse<QueryResult>> {
   const client = await getPool().connect();
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN READ ONLY");
-    const result = await client.query(sql, params);
+    const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
     await client.query("ROLLBACK");
     return { ok: true, data: toQueryResult(result, maxRows) };
   } catch (err) {
@@ -169,7 +185,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
-    const result = await client.query(sql, params);
+    const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
     await client.query("COMMIT");
     return { ok: true, data: toQueryResult(result, maxRows) };
   } catch (err) {
@@ -202,7 +218,7 @@ export async function runReadWriteRollback(sql: string, params: unknown[] = []):
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
-    const result = await client.query(sql, params);
+    const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
     await client.query("ROLLBACK");
     return { ok: true, data: toQueryResult(result, maxRows) };
   } catch (err) {

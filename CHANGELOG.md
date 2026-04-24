@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- User SQL is now sent with `queryMode: 'extended'`, forcing pg to use the
+  extended query protocol regardless of whether `params` is empty. The
+  extended protocol restricts each request to a single statement, closing
+  the stacked-query injection pattern documented by
+  [Datadog Security Labs](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/)
+  against the now-archived `@modelcontextprotocol/server-postgres`. Without
+  this fix, a payload like `SELECT 1; COMMIT; DROP SCHEMA x CASCADE;` passed
+  to `pg_query` would escape the `BEGIN READ ONLY` wrapper and run DDL in
+  autocommit. Added an integration regression test that asserts the
+  multi-statement request is rejected by Postgres.
+- `@types/pg` bumped from `^8.11.10` to `^8.20.0` to track pg 8.20.0 runtime.
+
 ## [0.3.2] - 2026-04-24
 
 ### Fixed

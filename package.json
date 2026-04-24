@@ -38,12 +38,11 @@
     "lint:fix": "biome check --write src/",
     "prepublishOnly": "npm run build"
   },
-  "dependencies": {},
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^25.6.0",
-    "@types/pg": "^8.11.10",
+    "@types/pg": "^8.20.0",
     "esbuild": "^0.28.0",
     "pg": "^8.13.0",
     "typescript": "^6.0.3",
