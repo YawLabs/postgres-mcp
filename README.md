@@ -2,7 +2,6 @@
 
 [![npm version](https://img.shields.io/npm/v/@yawlabs/postgres-mcp)](https://www.npmjs.com/package/@yawlabs/postgres-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/YawLabs/postgres-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/YawLabs/postgres-mcp/actions/workflows/ci.yml) [![Release](https://github.com/YawLabs/postgres-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/YawLabs/postgres-mcp/actions/workflows/release.yml)
 
 **Query a PostgreSQL database from Claude Code, Cursor, and any MCP client.** Read-only by default — writes opt in via a single env var — so an agent can't silently drop your tables.
 
@@ -25,9 +24,9 @@ None of them position themselves as a general-purpose daily driver you'd hand to
 ## Why this one?
 
 - **Read-only by default** — user SQL runs in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes. Opt in with `ALLOW_WRITES=1`.
-- **Extended query protocol for all user SQL** — `pg_query` sends user input with `queryMode: 'extended'`, which restricts each request to a single statement. This closes the [stacked-query injection class](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (`COMMIT; DROP SCHEMA x CASCADE;`) that defeated the reference server's `BEGIN READ ONLY` wrapper. CI has a regression test.
+- **Extended query protocol for all user SQL** — `pg_query` sends user input with `queryMode: 'extended'`, which restricts each request to a single statement. This closes the [stacked-query injection class](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (`COMMIT; DROP SCHEMA x CASCADE;`) that defeated the reference server's `BEGIN READ ONLY` wrapper. Integration test asserts the rejection.
 - **Parameterized queries** — `pg_query` takes a `params` array for `$1`, `$2`, etc. No string-interpolated SQL in our code path.
-- **Written from scratch, actively maintained** — not a fork of the deprecated code. Versioned, tested against real Postgres in CI, and under the [YawLabs](https://yaw.sh) release pipeline.
+- **Written from scratch, actively maintained** — not a fork of the deprecated code. Unit + integration tests (`npm test`, `npm run test:integration`) run against a real Postgres; releases cut via `release.sh`.
 - **Schema introspection built in** — `pg_list_schemas`, `pg_list_tables`, `pg_describe_table` return columns, primary keys, foreign keys, and indexes without the agent having to remember `pg_catalog` joins.
 - **`EXPLAIN` as a first-class tool** — text or JSON format, with optional `ANALYZE`. ANALYZE for non-SELECT statements requires `ALLOW_WRITES=1` and always rolls back, so the plan is real but the write doesn't persist.
 - **Perf diagnostics the deprecated server never had** — `pg_top_queries` (from `pg_stat_statements`), `pg_seq_scan_tables`, `pg_unused_indexes`, `pg_table_bloat`, `pg_inspect_locks`, `pg_replication_status`. Answer "why is this slow?" in one tool call.
