@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-24
+
+### Fixed
+- `pg_explain` with `analyze: true` and `ALLOW_WRITES=1` no longer persists
+  writes executed by `EXPLAIN ANALYZE`. Previously the write ran inside a
+  `BEGIN; ... COMMIT` transaction, so `pg_explain { analyze: true, sql:
+  "INSERT ..." }` would actually insert the row. Now writes run inside a
+  `BEGIN; ... ROLLBACK` transaction — the plan (with real row counts and
+  timing) comes back but the mutation is rolled back. This matches the user
+  expectation when asking for a plan, and the tool description has been
+  updated to reflect it.
+- `pg_health` `table_count` now excludes `pg_temp_%` schemas, matching the
+  filter in `pg_list_schemas`. The `relkind` filter already masked most
+  divergence, but the two queries are now consistent.
+- `pg_seq_scan_tables` ratio column simplified. The previous CASE had a
+  branch that only fired when `idx_scan = 0 AND seq_scan = 0` (practically
+  unreachable given the table was ordered by `seq_scan DESC`), returning
+  `0` and implying a distinction that didn't exist. Now returns `NULL`
+  whenever `idx_scan = 0`, which is the meaningful ratio-undefined case.
+
+### Added
+- `process.stdin` `end` handler cleans up the pg pool when the MCP client
+  disconnects. Previously the server kept running for up to 60 seconds
+  (the pool's idle timeout) after the parent closed the pipe.
+- Shared `src/tools/params.ts` for the `paramValue` zod schema, previously
+  duplicated verbatim in `query.ts` and `explain.ts`.
+
+### Infrastructure
+- Integration test suites now share one `before(setupFixtures)` /
+  `after(teardownFixtures)` per file via an outer `describe`, instead of
+  running DROP/CREATE per inner `describe`. Each file previously reset
+  the fixture schema 3-4 times; now it resets once.
+
 ## [0.3.1] - 2026-04-22
 
 ### Fixed
