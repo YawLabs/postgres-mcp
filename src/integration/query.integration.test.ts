@@ -90,6 +90,56 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.equal(res.ok, false);
       assert.match(res.error ?? "", /syntax|42601/i);
     });
+
+    // Regression test for the stacked-query SQL injection reported by Datadog
+    // Security Labs against @modelcontextprotocol/server-postgres v0.6.2:
+    // https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/
+    // The attack ends the READ ONLY transaction early with `COMMIT;` then runs
+    // a destructive statement. Our defense is that pg_query always calls
+    // client.query(sql, params) with a values array, which forces the extended
+    // query protocol — and the extended protocol rejects multi-statement SQL.
+    it("rejects stacked-query injection that defeated the reference server", async () => {
+      const payload = `SELECT 1; COMMIT; DROP SCHEMA ${FIXTURE_SCHEMA} CASCADE;`;
+      const res = (await pgQuery.handler({ sql: payload })) as { ok: boolean; error?: string };
+
+      assert.equal(res.ok, false, "stacked-query payload must be rejected");
+      assert.match(
+        res.error ?? "",
+        /cannot insert multiple commands|multiple commands|42601/i,
+        "expected extended-protocol multi-statement rejection",
+      );
+
+      // Belt-and-suspenders: even if the rejection message ever changes, the
+      // schema must still exist — no DROP landed.
+      const check = (await pgQuery.handler({
+        sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.users`,
+      })) as { ok: boolean; data?: { rows: { c: number }[] } };
+      assert.equal(check.ok, true, "fixture schema must survive the injection attempt");
+      assert.ok((check.data?.rows[0]?.c ?? 0) > 0);
+    });
+
+    // Same defense, verified with ALLOW_WRITES=1 on — the extended-protocol
+    // guard is upstream of the READ ONLY wrapper, so it must still block even
+    // when the READ ONLY guard is lifted.
+    it("rejects stacked-query injection even when ALLOW_WRITES=1", async () => {
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        const payload = `SELECT 1; DROP SCHEMA ${FIXTURE_SCHEMA} CASCADE;`;
+        const res = (await pgQuery.handler({ sql: payload })) as { ok: boolean; error?: string };
+        assert.equal(res.ok, false);
+        assert.match(res.error ?? "", /cannot insert multiple commands|multiple commands|42601/i);
+
+        const check = (await pgQuery.handler({
+          sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.users`,
+        })) as { ok: boolean; data?: { rows: { c: number }[] } };
+        assert.equal(check.ok, true);
+        assert.ok((check.data?.rows[0]?.c ?? 0) > 0);
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
+    });
   });
 
   describe("pg_explain", () => {

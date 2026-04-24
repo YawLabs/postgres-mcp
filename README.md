@@ -8,17 +8,33 @@
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
+## Backstory
+
+Anthropic's reference Postgres MCP server, `@modelcontextprotocol/server-postgres`, was [archived in May 2025](https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres) and [marked deprecated on npm](https://www.npmjs.com/package/@modelcontextprotocol/server-postgres) in July 2025. Anthropic has not shipped a replacement. Despite the deprecation, the last published version (v0.6.2) is still pulled ~20,000 times per week — a lot of agents are pointed at an unmaintained package.
+
+That unmaintained package also has a known, [publicly documented stacked-query SQL injection](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (Datadog Security Labs) that bypasses its `BEGIN READ ONLY` wrapper with input like `COMMIT; DROP SCHEMA public CASCADE;`. It has never been patched at npm.
+
+A handful of community forks have appeared, but each fills a narrow slice:
+
+- [`@zeddotdev/postgres-context-server`](https://www.npmjs.com/package/@zeddotdev/postgres-context-server) — Zed's fork, primarily a security patch on the original shape.
+- **Postgres MCP Pro** (Crystal DBA) — focused on index tuning and hypothetical-index / buffer-cache diagnostics.
+- **AWS Labs Postgres MCP** — tied to Aurora / RDS Data API + Secrets Manager.
+
+None of them position themselves as a general-purpose daily driver you'd hand to Claude Code or Cursor against an arbitrary Postgres: modern introspection, perf helpers, role/privilege awareness, and a write-safety posture out of the box. That's the gap `@yawlabs/postgres-mcp` fills.
+
 ## Why this one?
 
-The official Anthropic `@modelcontextprotocol/server-postgres` was [deprecated on npm](https://www.npmjs.com/package/@modelcontextprotocol/server-postgres) in early 2026. This one picks up where it left off, with a few extras:
-
-- **Read-only by default** — user SQL runs in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes. Opt in to writes with `ALLOW_WRITES=1`.
-- **Schema introspection built in** — `pg_list_schemas`, `pg_list_tables`, `pg_describe_table` return columns, primary keys, foreign keys, and indexes without you having to remember the `pg_catalog` joins.
-- **`EXPLAIN` as a first-class tool** — text or JSON format, with optional `ANALYZE`. ANALYZE for non-SELECT statements requires `ALLOW_WRITES=1` since it actually runs the query.
-- **Health snapshot** — `pg_health` returns version, db size, connection counts, and the 10 longest-running active queries in one call. Use it as a connection smoke-test and to catch runaway queries.
-- **Instant startup** — ships as a single bundled file with zero runtime dependencies. No multi-minute `node_modules` install on every npx cold start.
+- **Read-only by default** — user SQL runs in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes. Opt in with `ALLOW_WRITES=1`.
+- **Extended query protocol for all user SQL** — `pg_query` sends user input with `queryMode: 'extended'`, which restricts each request to a single statement. This closes the [stacked-query injection class](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (`COMMIT; DROP SCHEMA x CASCADE;`) that defeated the reference server's `BEGIN READ ONLY` wrapper. CI has a regression test.
+- **Parameterized queries** — `pg_query` takes a `params` array for `$1`, `$2`, etc. No string-interpolated SQL in our code path.
+- **Written from scratch, actively maintained** — not a fork of the deprecated code. Versioned, tested against real Postgres in CI, and under the [YawLabs](https://yaw.sh) release pipeline.
+- **Schema introspection built in** — `pg_list_schemas`, `pg_list_tables`, `pg_describe_table` return columns, primary keys, foreign keys, and indexes without the agent having to remember `pg_catalog` joins.
+- **`EXPLAIN` as a first-class tool** — text or JSON format, with optional `ANALYZE`. ANALYZE for non-SELECT statements requires `ALLOW_WRITES=1` and always rolls back, so the plan is real but the write doesn't persist.
+- **Perf diagnostics the deprecated server never had** — `pg_top_queries` (from `pg_stat_statements`), `pg_seq_scan_tables`, `pg_unused_indexes`, `pg_table_bloat`, `pg_inspect_locks`, `pg_replication_status`. Answer "why is this slow?" in one tool call.
+- **Health snapshot** — `pg_health` returns version, db size, connection counts, and the 10 longest-running active queries in one call.
+- **Role and privilege awareness** — `pg_list_roles` and `pg_table_privileges` for the common "who can touch what?" questions.
+- **Instant startup** — ships as a single bundled file with zero runtime dependencies. No multi-minute `node_modules` install on every `npx` cold start.
 - **Result truncation** — large result sets are capped at `POSTGRES_MAX_ROWS` (default 1000) with a `truncated: true` flag, so a stray `SELECT * FROM events` doesn't blow out the model context.
-- **Parameterized queries** — `pg_query` accepts a `params` array for `$1`, `$2`, etc. No string-interpolated SQL.
 
 ## Quick start
 
