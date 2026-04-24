@@ -94,3 +94,9 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   void cleanup().finally(() => process.exit(0));
 });
+// MCP clients typically disconnect by closing our stdin rather than sending a
+// signal. Without this, the pg pool's 60s idle timeout keeps node alive long
+// after the client is gone; proactively clean up and exit.
+process.stdin.on("end", () => {
+  void cleanup().finally(() => process.exit(0));
+});

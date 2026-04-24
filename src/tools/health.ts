@@ -70,7 +70,8 @@ export const healthTools = [
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
            WHERE c.relkind IN ('r', 'p')
              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-             AND n.nspname NOT LIKE 'pg_toast%'`,
+             AND n.nspname NOT LIKE 'pg_toast%'
+             AND n.nspname NOT LIKE 'pg_temp_%'`,
         ),
       ]);
 

@@ -1,9 +1,6 @@
 import { z } from "zod";
-import { type ApiResponse, isWritesAllowed, runReadOnly, runReadWrite } from "../api.js";
-
-const paramValue: z.ZodType<unknown> = z.lazy(() =>
-  z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(paramValue), z.record(z.string(), paramValue)]),
-);
+import { type ApiResponse, isWritesAllowed, runReadOnly, runReadWriteRollback } from "../api.js";
+import { paramValue } from "./params.js";
 
 export const explainTools = [
   {
@@ -11,8 +8,10 @@ export const explainTools = [
     description:
       "Get the query plan for a SQL statement. By default, this uses plain EXPLAIN (no execution). " +
       "Set `analyze: true` to run the query with EXPLAIN ANALYZE — for non-SELECT statements, " +
-      "ALLOW_WRITES=1 is required (since ANALYZE actually executes the statement). " +
-      "Format is `text` (default) or `json`. Pass the raw SQL (not an EXPLAIN-prefixed statement).",
+      "ALLOW_WRITES=1 is required (since ANALYZE actually executes the statement). Writes " +
+      "executed during EXPLAIN ANALYZE are always rolled back, so you can inspect a plan for " +
+      "an INSERT/UPDATE/DELETE without persisting the mutation. Format is `text` (default) or " +
+      "`json`. Pass the raw SQL (not an EXPLAIN-prefixed statement).",
     annotations: {
       title: "Explain query plan",
       readOnlyHint: false,
@@ -52,11 +51,13 @@ export const explainTools = [
       const explainSql = flags.length > 0 ? `EXPLAIN (${flags.join(", ")}) ${sql}` : `EXPLAIN ${sql}`;
 
       // EXPLAIN without ANALYZE is always safe (parse + plan, no execution).
-      // EXPLAIN ANALYZE executes the statement — route through read-write
-      // when writes are enabled so writable plans work; otherwise read-only.
+      // EXPLAIN ANALYZE actually executes the statement; when writes are
+      // allowed, route through the rollback variant so the plan comes back
+      // but any write the user asked to analyze does not persist. Without
+      // ALLOW_WRITES, read-only is fine: reads work, writes fail with 25006.
       const result: ApiResponse =
         analyze && isWritesAllowed()
-          ? await runReadWrite(explainSql, params ?? [])
+          ? await runReadWriteRollback(explainSql, params ?? [])
           : await runReadOnly(explainSql, params ?? []);
 
       if (!result.ok) return result;

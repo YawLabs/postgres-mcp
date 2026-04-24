@@ -185,6 +185,39 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
 }
 
 /**
+ * Run SQL in a read-write transaction that always rolls back. Used by
+ * EXPLAIN ANALYZE on write statements: postgres needs the write to execute
+ * so ANALYZE can report actual row counts and timing, but the user asked
+ * for a plan — not to commit the mutation. Requires ALLOW_WRITES=1 because
+ * we still need to lift the READ ONLY guard to let the write run at all.
+ */
+export async function runReadWriteRollback(sql: string, params: unknown[] = []): Promise<ApiResponse<QueryResult>> {
+  if (!isWritesAllowed()) {
+    return {
+      ok: false,
+      error: "Write blocked: ALLOW_WRITES is not set. Set ALLOW_WRITES=1 in the MCP server env to enable DML/DDL.",
+    };
+  }
+  const client = await getPool().connect();
+  const maxRows = getMaxRows();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(sql, params);
+    await client.query("ROLLBACK");
+    return { ok: true, data: toQueryResult(result, maxRows) };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Already rolled back or connection broken — swallow.
+    }
+    return { ok: false, error: formatPgError(err) };
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Run an internal, trusted read-only query (used by introspection tools).
  * Does not wrap in a READ ONLY transaction because the SQL is fixed and
  * parameterized by us, not the caller.

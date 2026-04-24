@@ -1,12 +1,6 @@
 import { z } from "zod";
 import { isWritesAllowed, runReadOnly, runReadWrite } from "../api.js";
-
-// Any JSON value that can legally be bound as a postgres parameter. Covers
-// scalars, arrays (for postgres array columns / ANY), and objects (for
-// json/jsonb columns — pg serializes these automatically).
-const paramValue: z.ZodType<unknown> = z.lazy(() =>
-  z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(paramValue), z.record(z.string(), paramValue)]),
-);
+import { paramValue } from "./params.js";
 
 export const queryTools = [
   {

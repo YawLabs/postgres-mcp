@@ -141,9 +141,8 @@ export const statsTools = [
            n_live_tup::text AS live_tuples,
            seq_tup_read::text AS seq_tup_read,
            CASE
-             WHEN COALESCE(idx_scan, 0) = 0 AND seq_scan > 0 THEN NULL
-             WHEN COALESCE(idx_scan, 0) = 0 THEN 0
-             ELSE (seq_scan::numeric / NULLIF(idx_scan, 0))::numeric(10, 2)::float8
+             WHEN COALESCE(idx_scan, 0) = 0 THEN NULL
+             ELSE (seq_scan::numeric / idx_scan)::numeric(10, 2)::float8
            END AS ratio
          FROM pg_catalog.pg_stat_user_tables
          WHERE n_live_tup >= $1
