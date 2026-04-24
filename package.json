@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/postgres-mcp",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "PostgreSQL MCP server — query, schema introspection, explain, and health checks for AI assistants",
   "license": "MIT",
   "author": "YawLabs <contact@yaw.sh>",
