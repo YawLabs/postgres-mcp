@@ -174,6 +174,35 @@ This disables certificate chain verification only -- the TCP connection is still
 
 **First query is slow, subsequent queries are fast** — Expected. The pg driver lazily establishes the first connection; subsequent queries reuse the pool.
 
+## Development
+
+Run the full suite (unit + integration) against a real Postgres:
+
+```bash
+DATABASE_URL='postgres://user:pass@host:5432/db' POSTGRES_MCP_INTEGRATION=1 npm run test:integration
+```
+
+The integration suite assumes a disposable database -- it creates and drops a `postgres_mcp_integration` schema. Don't point it at anything you care about.
+
+### Windows: integration tests via WSL2
+
+Native Postgres on Windows ARM64 is fragile (UCRT runtime gaps, missing ARM64 builds). The reliable path is a disposable Ubuntu under WSL2:
+
+```powershell
+wsl --install -d Ubuntu --no-launch
+# reboot, then:
+wsl -d Ubuntu -u root bash -c "apt-get update && apt-get install -y postgresql postgresql-contrib nodejs npm"
+wsl -d Ubuntu -u root bash /mnt/c/path/to/postgres-mcp/scripts/wsl-pg-setup.sh
+```
+
+`wsl-pg-setup.sh` sets the `postgres` password to `postgres`, creates `postgres_mcp_test`, and opens the listener. Then run the suite from inside WSL (WSL2's NAT blocks the Windows host from reaching :5432, so don't try to run the tests from PowerShell):
+
+```bash
+wsl -d Ubuntu -u root bash -c "cd /root/postgres-mcp && DATABASE_URL='postgres://postgres:postgres@localhost:5432/postgres_mcp_test' POSTGRES_MCP_INTEGRATION=1 npm run test:integration"
+```
+
+Tear down when finished: `wsl --unregister Ubuntu`.
+
 ## License
 
 MIT © 2026 YawLabs
