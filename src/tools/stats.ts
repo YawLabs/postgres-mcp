@@ -64,22 +64,25 @@ export const statsTools = [
 
       return runInternal<{
         query: string;
-        calls: string;
+        calls: number;
         total_time_ms: number;
         mean_time_ms: number;
         min_time_ms: number;
         max_time_ms: number;
-        rows: string;
+        rows: number;
         hit_percent: number | null;
       }>(
+        // calls and rows are bigint counters; cast to float8 so node-pg returns
+        // them as JS numbers (matches the timing fields). Precision is fine --
+        // 2^53 is ~9e15, well above any realistic call/row count.
         `SELECT
            query,
-           calls::text AS calls,
+           calls::float8 AS calls,
            ${totalCol}::numeric(18, 2)::float8 AS total_time_ms,
            ${meanCol}::numeric(18, 2)::float8 AS mean_time_ms,
            ${minCol}::numeric(18, 2)::float8 AS min_time_ms,
            ${maxCol}::numeric(18, 2)::float8 AS max_time_ms,
-           rows::text AS rows,
+           rows::float8 AS rows,
            CASE
              WHEN (shared_blks_hit + shared_blks_read) > 0
              THEN (shared_blks_hit::float8 / (shared_blks_hit + shared_blks_read) * 100)::numeric(5, 2)::float8

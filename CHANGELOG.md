@@ -26,6 +26,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `@types/pg` bumped from `^8.11.10` to `^8.20.0` to track pg 8.20.0 runtime.
 
 ### Added
+- npm tarball now ships `LICENSE`, `README.md`, and `CHANGELOG.md` alongside
+  the bundle. Previously the `files` allowlist was `["dist/index.js"]` only,
+  so `npm pack` produced a tarball with no docs and no license file -- bad
+  for downstream consumers and registry surfaces that read README from the
+  tarball rather than the repo.
+- README workflow examples now show three multi-tool sequences (unstick a
+  hung app via `pg_inspect_locks` -> `pg_kill`, chase a slow page via
+  `pg_top_queries` -> `pg_explain` -> `pg_unused_indexes`, oncall triage via
+  `pg_health` -> `pg_inspect_locks` -> `pg_replication_status`). The previous
+  example list was single-tool only.
+- New `pg_table_bloat` integration test asserts every returned `dead_ratio`
+  is a finite number in `[0, 1]`. Locks down the invariant that the recent
+  `dead / (live + dead)` formula change was meant to enforce.
+- New `pg_query` integration tests for the `$1`-without-params error path
+  and the result-count-equals-`POSTGRES_MAX_ROWS` boundary (must NOT flag
+  `truncated: true`).
+- New `pg_explain` integration tests for `analyze: true` on a SELECT in
+  read-only mode (works) and on an INSERT in read-only mode (errors with
+  the ALLOW_WRITES hint).
+- npm `keywords` expanded with `agent`, `claude`, `claude-code`, `cursor`,
+  `llm` so registry / search engine queries for "postgres mcp claude code"
+  surface this package.
 - `POSTGRES_CONNECTION_TIMEOUT_MS` env var (default `10000`). Without it, a
   dead host hangs the first connection attempt until the OS times out
   (~2 minutes on most platforms), and the agent waits the whole time before
@@ -39,6 +61,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - README now states the supported Postgres versions: tested on 17 and 18,
   expected to work on 13+.
+
+### Changed
+- `pg_top_queries` now returns `calls` and `rows` as JS numbers (cast to
+  `float8` in SQL) instead of strings. The previous `::text` cast forced
+  consumers to parse `"42"` to use it; the timing fields next to them were
+  already numbers, so the response shape was inconsistent. float8 is fine
+  -- 2^53 is well above any realistic per-query call/row count.
+- `pg_health` partial-failure shape: failed sub-queries now contribute to a
+  top-level `_warnings: string[]` array, and the affected fields stay null
+  instead of becoming `{error: "..."}`. Previously a failure of the size
+  query made `data.database.size_bytes` resolve to `undefined` with no
+  signal -- LLMs couldn't tell "missing" from "errored". This matches the
+  `_warnings` convention `pg_describe_table` already uses.
+- `shutdown()` now races `pool.end()` against a 5 s timer. `pool.end()`
+  waits for in-flight queries with no upper bound, so a wedged query
+  (frozen NFS, network hang) could leave the MCP server appearing stuck on
+  exit until the OS reaped the TCP sockets.
+- `pg_table_privileges` description tightened to spell out that omitting
+  `table` returns privileges for every table in the schema.
+- README now lists supported PG versions explicitly and groups workflow
+  examples by single-tool / multi-tool intent.
 
 ### Fixed
 - `pg_table_bloat` now uses `dead / (live + dead)` for `dead_ratio` instead of

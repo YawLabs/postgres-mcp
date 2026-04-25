@@ -128,8 +128,9 @@ export const adminTools = [
     name: "pg_table_privileges",
     description:
       "Show which roles have which privileges (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, " +
-      "REFERENCES, TRIGGER) on a table or on all tables in a schema. Use this to answer " +
-      "'who can write to this table?' or to audit schema-wide access before a migration.",
+      "REFERENCES, TRIGGER) on a table or on every table in a schema. If `table` is omitted, " +
+      "the result spans every table in `schema`, ordered by table then grantee. Use this to " +
+      "answer 'who can write to this table?' or to audit schema-wide access before a migration.",
     annotations: {
       title: "Show table privileges",
       readOnlyHint: true,

@@ -92,15 +92,20 @@ Prefer scoping this to dev/test databases — for production, leave writes off a
 
 ## What can an agent do with this?
 
-Once connected, the agent picks tools automatically based on what you ask. A few real examples:
+Once connected, the agent picks tools automatically based on what you ask. A few single-tool examples:
 
-- **"Describe the users table"** -> `pg_describe_table` -> returns columns, PK, FKs, indexes.
+- **"Describe the users table"** -> `pg_describe_table` -> returns kind, columns, PK, FKs, indexes.
 - **"Which tables have a `user_id` column?"** -> `pg_search_columns` with pattern `user_id` -> one call instead of iterating every table.
 - **"This query is slow, why?"** -> `pg_explain` with `analyze: true` -> returns the plan with actual row counts and timing.
 - **"What's the slowest query we run?"** -> `pg_top_queries` -> returns the top N from `pg_stat_statements` with mean/total/min/max times.
-- **"Why is my app hanging?"** -> `pg_inspect_locks` -> returns blocked PIDs and the queries holding their locks; follow up with `pg_kill` (with `ALLOW_WRITES=1`) to cancel the blocker.
 - **"Do we have any unused indexes?"** -> `pg_unused_indexes` -> returns non-unique, non-primary indexes with zero or low scan counts + their size.
 - **"Is `pgvector` installed?"** -> `pg_list_extensions` -> yes/no with version.
+
+The bigger leverage is multi-tool reasoning. A few real workflows:
+
+- **Unstick a hung app.** `pg_inspect_locks` returns blocked PID + blocking PID + the offending query, then `pg_kill` (`ALLOW_WRITES=1` required) cancels the blocker. The agent can run both in one turn — it's the fastest path from "the app is frozen" to "back up."
+- **Chase a slow page.** `pg_top_queries` ranks the worst queries, `pg_explain` with `analyze: true` shows the plan for the top hit, `pg_seq_scan_tables` and `pg_unused_indexes` say whether the answer is "add an index here" or "drop a dead one there."
+- **Oncall triage.** `pg_health` checks connectivity + active-query count + database size; `pg_inspect_locks` and `pg_replication_status` confirm whether contention or replication lag is in play before paging the on-call DBA.
 
 ## Tools
 

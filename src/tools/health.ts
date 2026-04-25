@@ -79,15 +79,26 @@ export const healthTools = [
       // directly instead of returning a half-empty object.
       if (!versionRes.ok) return versionRes;
 
+      // Surface partial-failure messages on a top-level _warnings array rather
+      // than nesting `{error: "..."}` inside the data fields. The nested form
+      // makes `data.database.size_bytes` resolve to undefined when an LLM looks
+      // it up, with no signal that "it failed" vs "missing key".
+      const warnings: string[] = [];
+      if (!sizeRes.ok) warnings.push(`database fetch failed: ${sizeRes.error}`);
+      if (!connsRes.ok) warnings.push(`connections fetch failed: ${connsRes.error}`);
+      if (!activeRes.ok) warnings.push(`active_queries fetch failed: ${activeRes.error}`);
+      if (!tableCountRes.ok) warnings.push(`table_count fetch failed: ${tableCountRes.error}`);
+
       return {
         ok: true,
         data: {
           connected: true,
           version: versionRes.data?.[0]?.version,
-          database: sizeRes.ok ? sizeRes.data?.[0] : { error: sizeRes.error },
-          connections: connsRes.ok ? connsRes.data?.[0] : { error: connsRes.error },
+          database: sizeRes.ok ? sizeRes.data?.[0] : null,
+          connections: connsRes.ok ? connsRes.data?.[0] : null,
           active_queries: activeRes.ok ? activeRes.data : [],
           table_count: tableCountRes.ok ? tableCountRes.data?.[0]?.count : null,
+          ...(warnings.length > 0 ? { _warnings: warnings } : {}),
         },
       };
     },

@@ -7,6 +7,7 @@ import { FIXTURE_SCHEMA, integrationEnabled, setupFixtures, teardownFixtures } f
 const inspectLocks = adminTools.find((t) => t.name === "pg_inspect_locks")!;
 const listRoles = adminTools.find((t) => t.name === "pg_list_roles")!;
 const tablePrivileges = adminTools.find((t) => t.name === "pg_table_privileges")!;
+const tableBloat = adminTools.find((t) => t.name === "pg_table_bloat")!;
 const seqScanTables = statsTools.find((t) => t.name === "pg_seq_scan_tables")!;
 const unusedIndexes = statsTools.find((t) => t.name === "pg_unused_indexes")!;
 
@@ -96,6 +97,23 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       // Should find the fixture tables (minSize=0 includes everything).
       const tables = (res.data ?? []).map((r) => r.table);
       assert.ok(tables.length > 0, "expected some stats rows from fixture schema");
+    });
+  });
+
+  describe("pg_table_bloat", () => {
+    it("returns finite dead_ratio in [0, 1] for every row", async () => {
+      const res = (await tableBloat.handler({ minDeadRatio: 0, limit: 100 })) as {
+        ok: boolean;
+        data?: { table: string; dead_ratio: number }[];
+      };
+      assert.equal(res.ok, true);
+      for (const row of res.data ?? []) {
+        assert.ok(Number.isFinite(row.dead_ratio), `dead_ratio must be finite for ${row.table}, got ${row.dead_ratio}`);
+        assert.ok(
+          row.dead_ratio >= 0 && row.dead_ratio <= 1,
+          `dead_ratio must be in [0,1] for ${row.table}, got ${row.dead_ratio}`,
+        );
+      }
     });
   });
 

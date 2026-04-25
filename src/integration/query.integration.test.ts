@@ -91,6 +91,31 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /syntax|42601/i);
     });
 
+    it("rejects $1 reference when no params array is passed", async () => {
+      const res = (await pgQuery.handler({
+        sql: `SELECT email FROM ${FIXTURE_SCHEMA}.users WHERE id = $1`,
+      })) as { ok: boolean; error?: string };
+      assert.equal(res.ok, false);
+      assert.match(res.error ?? "", /\$1|parameter/i);
+    });
+
+    it("does not flag truncated when result count equals POSTGRES_MAX_ROWS", async () => {
+      const original = process.env.POSTGRES_MAX_ROWS;
+      // Fixture has exactly 3 users -- request a max of 3 to hit the boundary.
+      process.env.POSTGRES_MAX_ROWS = "3";
+      try {
+        const res = (await pgQuery.handler({
+          sql: `SELECT id FROM ${FIXTURE_SCHEMA}.users ORDER BY id`,
+        })) as { ok: boolean; data?: { rows: unknown[]; truncated?: boolean } };
+        assert.equal(res.ok, true);
+        assert.equal(res.data?.rows.length, 3);
+        assert.notStrictEqual(res.data?.truncated, true, "truncated must be falsy at the boundary, not true");
+      } finally {
+        if (original === undefined) delete process.env.POSTGRES_MAX_ROWS;
+        else process.env.POSTGRES_MAX_ROWS = original;
+      }
+    });
+
     // Regression test for the stacked-query SQL injection reported by Datadog
     // Security Labs against @modelcontextprotocol/server-postgres v0.6.2:
     // https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/
@@ -172,6 +197,40 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       })) as { ok: boolean; error?: string };
       assert.equal(res.ok, false);
       assert.match(res.error ?? "", /EXPLAIN/);
+    });
+
+    it("EXPLAIN ANALYZE on a SELECT works in read-only mode (no ALLOW_WRITES)", async () => {
+      const original = process.env.ALLOW_WRITES;
+      delete process.env.ALLOW_WRITES;
+      try {
+        const res = (await pgExplain.handler({
+          sql: `SELECT count(*) FROM ${FIXTURE_SCHEMA}.users`,
+          analyze: true,
+          format: "text",
+        })) as { ok: boolean; data?: { plan: string }; error?: string };
+        assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+        assert.match(res.data?.plan ?? "", /actual time=/i, "expected ANALYZE timing in plan");
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
+    });
+
+    it("EXPLAIN ANALYZE on an INSERT errors with the read-only hint when ALLOW_WRITES is off", async () => {
+      const original = process.env.ALLOW_WRITES;
+      delete process.env.ALLOW_WRITES;
+      try {
+        const res = (await pgExplain.handler({
+          sql: `INSERT INTO ${FIXTURE_SCHEMA}.users (email) VALUES ('blocked-explain@example.com')`,
+          analyze: true,
+          format: "text",
+        })) as { ok: boolean; error?: string };
+        assert.equal(res.ok, false, "EXPLAIN ANALYZE INSERT must fail without ALLOW_WRITES");
+        assert.match(res.error ?? "", /read-only|ALLOW_WRITES/i);
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
     });
 
     it("EXPLAIN ANALYZE of a write statement does not persist (regression: rollback, not commit)", async () => {

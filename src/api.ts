@@ -262,8 +262,20 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
 }
 
 export async function shutdown(): Promise<void> {
-  if (pool) {
-    await pool.end();
-    pool = null;
+  if (!pool) return;
+  // pool.end() waits for in-flight queries with no upper bound. If a query is
+  // wedged below the statement_timeout (network hang, frozen NFS, etc.), the
+  // process appears stuck on exit. Cap the wait so cleanup is bounded and the
+  // signal handler can still call process.exit().
+  const ending = pool;
+  pool = null;
+  try {
+    await Promise.race([
+      ending.end(),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error("pool shutdown timed out after 5s")), 5_000)),
+    ]);
+  } catch {
+    // Best-effort -- if pool.end() lost the race, the underlying TCP sockets
+    // get reaped when the process exits.
   }
 }
