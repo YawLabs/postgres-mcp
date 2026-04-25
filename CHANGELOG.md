@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `@types/pg` bumped from `^8.11.10` to `^8.20.0` to track pg 8.20.0 runtime.
 
 ### Added
+- `pg_explain` accepts a `hypothetical_indexes` parameter -- list of
+  `{table, columns, using?}` -- which asks the planner "what would the
+  plan be if these indexes existed?". Requires the
+  [HypoPG](https://github.com/HypoPG/hypopg) extension
+  (`CREATE EXTENSION hypopg;`); the tool returns a friendly hint pointing
+  at that command if HypoPG isn't installed. Indexes are session-scoped
+  and torn down at the end of the call via `hypopg_reset()`, so they
+  never persist across MCP requests and never touch real disk. Closes
+  the biggest competitive gap vs. Crystal DBA's Postgres MCP Pro per
+  the comp-landscape audit. WSL setup script now installs the
+  `postgresql-${V}-hypopg` package opportunistically; the matrix test
+  runs against PG17 and PG18 and verifies the planner switches a Seq
+  Scan to an Index/Bitmap scan when a hypothetical index is supplied.
 - `pg_describe_table` now returns four new fields:
   - `referenced_by` -- incoming FKs (other tables whose foreign keys point at
     this one). Answers "what depends on this table?" before a destructive

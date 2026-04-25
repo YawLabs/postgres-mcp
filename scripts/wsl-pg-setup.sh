@@ -34,6 +34,12 @@ fi
 for V in "${PG_VERSIONS[@]}"; do
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     "postgresql-${V}" "postgresql-contrib-${V}"
+  # HypoPG (hypothetical-index extension) -- best effort. PGDG usually ships
+  # it within a release of a new major; if it's not yet packaged for this
+  # version, the integration test for hypothetical_indexes falls through to
+  # exercising the "extension not installed" error path instead.
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "postgresql-${V}-hypopg" \
+    || echo "  postgresql-${V}-hypopg not available -- HypoPG tests will skip"
 done
 
 # When multiple PG versions are installed in the same dpkg pass, the postinst

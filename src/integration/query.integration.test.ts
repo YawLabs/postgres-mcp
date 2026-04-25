@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
+import { runInternal } from "../api.js";
 import { explainTools } from "../tools/explain.js";
 import { healthTools } from "../tools/health.js";
 import { queryTools } from "../tools/query.js";
@@ -237,6 +238,52 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       })) as { ok: boolean; error?: string };
       assert.equal(res.ok, false);
       assert.match(res.error ?? "", /EXPLAIN/);
+    });
+
+    it("hypothetical_indexes returns a friendly error when HypoPG is not installed", async () => {
+      const check = (await runInternal<{ installed: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
+      )) as { ok: boolean; data?: { installed: boolean }[] };
+      const installed = check.ok && check.data?.[0]?.installed === true;
+      if (installed) return; // positive-path test below covers this case
+
+      const res = (await pgExplain.handler({
+        sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE user_id = 1`,
+        analyze: false,
+        format: "text",
+        hypothetical_indexes: [{ table: `${FIXTURE_SCHEMA}.posts`, columns: ["title"], using: "btree" }],
+      })) as { ok: boolean; error?: string };
+      assert.equal(res.ok, false);
+      assert.match(res.error ?? "", /HypoPG|CREATE EXTENSION hypopg/i);
+    });
+
+    it("hypothetical_indexes flips a seq scan to an index scan when HypoPG is installed", async () => {
+      const check = (await runInternal<{ installed: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
+      )) as { ok: boolean; data?: { installed: boolean }[] };
+      const installed = check.ok && check.data?.[0]?.installed === true;
+      if (!installed) return; // negative-path test above covers this case
+
+      // Baseline: explain without a hypothetical index over `body` (no real
+      // index exists for this column in the fixture).
+      const baseline = (await pgExplain.handler({
+        sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE body = 'world'`,
+        analyze: false,
+        format: "text",
+      })) as { ok: boolean; data?: { plan: string } };
+      assert.equal(baseline.ok, true);
+      assert.match(baseline.data?.plan ?? "", /Seq Scan/i, "expected a Seq Scan with no real index on body");
+
+      // With a hypothetical index on `body`, the planner should prefer it.
+      // HypoPG-suggested scans show up as "Index Scan using <index_btree_...>".
+      const withHypo = (await pgExplain.handler({
+        sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE body = 'world'`,
+        analyze: false,
+        format: "text",
+        hypothetical_indexes: [{ table: `${FIXTURE_SCHEMA}.posts`, columns: ["body"], using: "btree" }],
+      })) as { ok: boolean; data?: { plan: string } };
+      assert.equal(withHypo.ok, true);
+      assert.match(withHypo.data?.plan ?? "", /Index|Bitmap/i, "expected an index/bitmap scan with hypothetical index");
     });
 
     it("EXPLAIN ANALYZE on a SELECT works in read-only mode (no ALLOW_WRITES)", async () => {

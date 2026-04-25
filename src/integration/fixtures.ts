@@ -88,6 +88,12 @@ export async function setupFixtures(): Promise<void> {
       throw new Error(`Fixture setup failed on statement:\n${sql}\n\nError: ${res.error}`);
     }
   }
+
+  // Best-effort: enable HypoPG so pg_explain hypothetical_indexes tests can
+  // exercise the positive path. If the binary isn't installed (e.g. PGDG
+  // hasn't packaged it for this PG major yet), the test falls back to
+  // exercising the "extension not installed" error path.
+  await runInternal(`CREATE EXTENSION IF NOT EXISTS hypopg`);
 }
 
 /** Clean up the fixture schema and close the pool. */

@@ -119,7 +119,7 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 | `pg_list_functions` | List functions, procedures, and aggregates in a schema with signatures and return types. |
 | `pg_list_extensions` | List installed extensions (pgvector, postgis, pg_stat_statements, etc.) with versions. |
 | `pg_search_columns` | Find columns by name pattern across all user schemas. Case-insensitive, supports SQL LIKE wildcards. |
-| `pg_explain` | `EXPLAIN` or `EXPLAIN ANALYZE` for a SQL statement. Text or JSON output. |
+| `pg_explain` | `EXPLAIN` or `EXPLAIN ANALYZE` for a SQL statement. Text or JSON output. Optional `hypothetical_indexes` (requires the [HypoPG](https://github.com/HypoPG/hypopg) extension) lets you ask "what would the plan be with these indexes?" without creating them on disk. |
 | `pg_health` | Server version, database size, connection count, active queries, table count. |
 | `pg_top_queries` | Top N queries by total/mean execution time. Requires the `pg_stat_statements` extension. |
 | `pg_seq_scan_tables` | Tables with heavy sequential scans — missing-index candidates. |

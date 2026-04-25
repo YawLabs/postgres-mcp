@@ -255,11 +255,24 @@ function toQueryResult(result: pg.QueryResult, maxRows: number, typeNames: Recor
  * end the READ ONLY transaction mid-stream and run DDL in autocommit.
  * See: https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/
  */
-export async function runReadOnly(sql: string, params: unknown[] = []): Promise<ApiResponse<QueryResult>> {
+/** Optional in-transaction hooks. `setup` runs after BEGIN, before user SQL.
+ *  `teardown` runs in `finally` (always executed) so it can clean up
+ *  session-scoped state (e.g. HypoPG hypothetical indexes) even on error. */
+export interface RunHooks {
+  setup?: (client: pg.PoolClient) => Promise<void>;
+  teardown?: (client: pg.PoolClient) => Promise<void>;
+}
+
+export async function runReadOnly(
+  sql: string,
+  params: unknown[] = [],
+  hooks: RunHooks = {},
+): Promise<ApiResponse<QueryResult>> {
   const client = await getPool().connect();
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN READ ONLY");
+    if (hooks.setup) await hooks.setup(client);
     const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
@@ -272,6 +285,13 @@ export async function runReadOnly(sql: string, params: unknown[] = []): Promise<
     }
     return { ok: false, error: formatPgError(err) };
   } finally {
+    if (hooks.teardown) {
+      try {
+        await hooks.teardown(client);
+      } catch {
+        // Teardown is best-effort — never let it shadow a real error.
+      }
+    }
     client.release();
   }
 }
@@ -311,7 +331,11 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
  * for a plan — not to commit the mutation. Requires ALLOW_WRITES=1 because
  * we still need to lift the READ ONLY guard to let the write run at all.
  */
-export async function runReadWriteRollback(sql: string, params: unknown[] = []): Promise<ApiResponse<QueryResult>> {
+export async function runReadWriteRollback(
+  sql: string,
+  params: unknown[] = [],
+  hooks: RunHooks = {},
+): Promise<ApiResponse<QueryResult>> {
   if (!isWritesAllowed()) {
     return {
       ok: false,
@@ -322,6 +346,7 @@ export async function runReadWriteRollback(sql: string, params: unknown[] = []):
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
+    if (hooks.setup) await hooks.setup(client);
     const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
@@ -334,6 +359,13 @@ export async function runReadWriteRollback(sql: string, params: unknown[] = []):
     }
     return { ok: false, error: formatPgError(err) };
   } finally {
+    if (hooks.teardown) {
+      try {
+        await hooks.teardown(client);
+      } catch {
+        // Teardown is best-effort.
+      }
+    }
     client.release();
   }
 }
