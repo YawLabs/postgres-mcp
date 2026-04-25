@@ -111,10 +111,10 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 
 | Tool | Description |
 |------|-------------|
-| `pg_query` | Run a SQL query. Read-only by default; writes require `ALLOW_WRITES=1`. Supports parameterized queries via `params`. |
+| `pg_query` | Run a SQL query. Read-only by default; writes require `ALLOW_WRITES=1`. Supports parameterized queries via `params`. Result fields include `dataTypeName` (e.g. `int4`, `jsonb`) alongside `dataTypeID`. |
 | `pg_list_schemas` | List non-system schemas. |
 | `pg_list_tables` | List tables (and optionally views) in a schema with estimated row counts. Paginated via `limit`/`offset`. |
-| `pg_describe_table` | Columns, primary key, foreign keys, and indexes for a table. |
+| `pg_describe_table` | Kind, columns, PK, outgoing FKs, incoming FKs (`referenced_by`), CHECK / UNIQUE / EXCLUDE constraints, indexes, and partition parent/children for a relation. |
 | `pg_list_views` | List views and materialized views in a schema, including their SQL definitions. |
 | `pg_list_functions` | List functions, procedures, and aggregates in a schema with signatures and return types. |
 | `pg_list_extensions` | List installed extensions (pgvector, postgis, pg_stat_statements, etc.) with versions. |

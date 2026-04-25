@@ -26,6 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `@types/pg` bumped from `^8.11.10` to `^8.20.0` to track pg 8.20.0 runtime.
 
 ### Added
+- `pg_describe_table` now returns four new fields:
+  - `referenced_by` -- incoming FKs (other tables whose foreign keys point at
+    this one). Answers "what depends on this table?" before a destructive
+    change. None of the surveyed competing Postgres MCP servers expose this;
+    in psql you'd run `\d+` on every candidate table and squint.
+  - `constraints` -- CHECK / UNIQUE non-PK / EXCLUDE constraints with each
+    constraint's full definition string from `pg_get_constraintdef()`. PK and
+    FK still live in their dedicated fields, so no double-listing.
+  - `partition_of` -- when the relation is a partition, the parent
+    schema / table.
+  - `partitions` -- when the relation is a `partitioned_table`, the list of
+    children with their `pg_get_expr()` partition bounds.
+- `pg_query` result `fields` now include `dataTypeName` (e.g. `int4`, `text`,
+  `jsonb`) alongside `dataTypeID`. Previously LLMs saw only the OID and had
+  to map it themselves. Resolution is process-cached against `pg_type`, with
+  a single miss-fill query for any OID introduced by `CREATE TYPE` mid-session.
 - npm tarball now ships `LICENSE`, `README.md`, and `CHANGELOG.md` alongside
   the bundle. Previously the `files` allowlist was `["dist/index.js"]` only,
   so `npm pack` produced a tarball with no docs and no license file -- bad

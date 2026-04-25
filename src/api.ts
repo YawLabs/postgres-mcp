@@ -112,9 +112,37 @@ export function getPool(): pg.Pool {
 export interface QueryResult {
   rows: Record<string, unknown>[];
   rowCount: number | null;
-  fields: { name: string; dataTypeID: number }[];
+  fields: { name: string; dataTypeID: number; dataTypeName?: string }[];
   command: string;
   truncated?: boolean;
+}
+
+// pg_type oid -> typname. Bootstrapped on first user query, then miss-filled
+// for any new oid (e.g. a CREATE TYPE during the session). Cleared on
+// shutdown(). The cache is small (a few hundred rows on a stock cluster).
+let typeNameCache: Map<number, string> | null = null;
+
+async function resolveTypeNames(client: pg.PoolClient, oids: number[]): Promise<Record<number, string>> {
+  if (oids.length === 0) return {};
+  if (!typeNameCache) {
+    typeNameCache = new Map();
+    const res = await client.query<{ oid: number; typname: string }>("SELECT oid, typname FROM pg_catalog.pg_type");
+    for (const row of res.rows) typeNameCache.set(row.oid, row.typname);
+  }
+  const missing = oids.filter((o) => !typeNameCache?.has(o));
+  if (missing.length > 0) {
+    const res = await client.query<{ oid: number; typname: string }>(
+      "SELECT oid, typname FROM pg_catalog.pg_type WHERE oid = ANY($1)",
+      [missing],
+    );
+    for (const row of res.rows) typeNameCache.set(row.oid, row.typname);
+  }
+  const out: Record<number, string> = {};
+  for (const oid of oids) {
+    const n = typeNameCache.get(oid);
+    if (n !== undefined) out[oid] = n;
+  }
+  return out;
 }
 
 export interface ApiResponse<T = unknown> {
@@ -141,13 +169,18 @@ function formatPgError(err: unknown): string {
   return parts.join(" ");
 }
 
-function toQueryResult(result: pg.QueryResult, maxRows: number): QueryResult {
+function toQueryResult(result: pg.QueryResult, maxRows: number, typeNames: Record<number, string> = {}): QueryResult {
   const truncated = result.rows.length > maxRows;
   const rows = truncated ? result.rows.slice(0, maxRows) : result.rows;
   return {
     rows,
     rowCount: result.rowCount,
-    fields: result.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID })),
+    fields: result.fields.map((f) => {
+      const name = typeNames[f.dataTypeID];
+      return name !== undefined
+        ? { name: f.name, dataTypeID: f.dataTypeID, dataTypeName: name }
+        : { name: f.name, dataTypeID: f.dataTypeID };
+    }),
     command: result.command,
     ...(truncated ? { truncated: true } : {}),
   };
@@ -171,7 +204,8 @@ export async function runReadOnly(sql: string, params: unknown[] = []): Promise<
     await client.query("BEGIN READ ONLY");
     const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
     await client.query("ROLLBACK");
-    return { ok: true, data: toQueryResult(result, maxRows) };
+    const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
+    return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -198,7 +232,8 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
     await client.query("BEGIN");
     const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
     await client.query("COMMIT");
-    return { ok: true, data: toQueryResult(result, maxRows) };
+    const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
+    return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -231,7 +266,8 @@ export async function runReadWriteRollback(sql: string, params: unknown[] = []):
     await client.query("BEGIN");
     const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
     await client.query("ROLLBACK");
-    return { ok: true, data: toQueryResult(result, maxRows) };
+    const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
+    return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -262,6 +298,7 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
 }
 
 export async function shutdown(): Promise<void> {
+  typeNameCache = null;
   if (!pool) return;
   // pool.end() waits for in-flight queries with no upper bound. If a query is
   // wedged below the statement_timeout (network hang, frozen NFS, etc.), the

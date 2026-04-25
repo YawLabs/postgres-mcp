@@ -88,9 +88,11 @@ export const schemaTools = [
     name: "pg_describe_table",
     description:
       "Describe a relation: kind (table / view / materialized_view / partitioned_table / foreign_table), " +
-      "columns (name, type, nullable, default), primary key, foreign keys, and indexes. Works on views and " +
-      "materialized views too -- PK/FK/indexes will simply be empty for a plain view. Use `kind` to " +
-      "disambiguate before assuming you can write to the relation.",
+      "columns (name, type, nullable, default), primary key, foreign keys (outgoing), `referenced_by` " +
+      "(other tables whose FKs point at this one), `constraints` (CHECK / UNIQUE non-PK / EXCLUDE), " +
+      "indexes, and partition info (`partition_of` parent, `partitions` children). Works on views and " +
+      "materialized views too -- PK/FK/constraint/index lists will simply be empty for a plain view. " +
+      "Use `kind` to disambiguate before assuming you can write to the relation.",
     annotations: {
       title: "Describe table",
       readOnlyHint: true,
@@ -191,13 +193,101 @@ export const schemaTools = [
         ORDER BY i.relname
       `;
 
-      const [kindRes, cols, pk, fks, idxs] = await Promise.all([
-        runInternal<{ kind: string }>(kindQuery, [schema, table]),
-        runInternal(columnsQuery, [schema, table]),
-        runInternal<{ column_name: string }>(primaryKeyQuery, [schema, table]),
-        runInternal(foreignKeysQuery, [schema, table]),
-        runInternal(indexesQuery, [schema, table]),
-      ]);
+      // CHECK / UNIQUE-non-PK / EXCLUDE constraints. PK and FK are handled by
+      // their dedicated queries above; we don't double-list them here.
+      const constraintsQuery = `
+        SELECT
+          con.conname AS name,
+          CASE con.contype
+            WHEN 'c' THEN 'check'
+            WHEN 'u' THEN 'unique'
+            WHEN 'x' THEN 'exclude'
+            ELSE con.contype::text
+          END AS type,
+          pg_catalog.pg_get_constraintdef(con.oid, true) AS definition
+        FROM pg_catalog.pg_constraint con
+        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1
+          AND c.relname = $2
+          AND con.contype IN ('c', 'u', 'x')
+        ORDER BY con.contype, con.conname
+      `;
+
+      // Reverse FKs: tables whose foreign keys point AT this one. Answers
+      // "what depends on this table?" -- a routine question before a
+      // destructive change. None of the surveyed competing MCP servers
+      // expose this; in psql you'd run \d+ on the parent and squint.
+      const referencedByQuery = `
+        SELECT
+          con.conname AS constraint_name,
+          srcn.nspname AS schema,
+          src.relname AS "table",
+          array_agg(srcatt.attname::text ORDER BY u.attposition) AS columns,
+          array_agg(refatt.attname::text ORDER BY u.attposition) AS referenced_columns
+        FROM pg_catalog.pg_constraint con
+        JOIN pg_catalog.pg_class src ON src.oid = con.conrelid
+        JOIN pg_catalog.pg_namespace srcn ON srcn.oid = src.relnamespace
+        JOIN pg_catalog.pg_class ref ON ref.oid = con.confrelid
+        JOIN pg_catalog.pg_namespace refn ON refn.oid = ref.relnamespace
+        JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, attposition) ON TRUE
+        JOIN pg_catalog.pg_attribute srcatt ON srcatt.attrelid = con.conrelid AND srcatt.attnum = u.attnum
+        JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fu(attnum, attposition) ON fu.attposition = u.attposition
+        JOIN pg_catalog.pg_attribute refatt ON refatt.attrelid = con.confrelid AND refatt.attnum = fu.attnum
+        WHERE refn.nspname = $1
+          AND ref.relname = $2
+          AND con.contype = 'f'
+        GROUP BY con.conname, srcn.nspname, src.relname
+        ORDER BY srcn.nspname, src.relname, con.conname
+      `;
+
+      // Partition parent (when $1.$2 is a partition) and partition children
+      // (when $1.$2 is a partitioned_table). pg_inherits covers both classic
+      // inheritance and declarative partitioning; we only return rows when
+      // the JOIN with pg_partitioned_table / partition-bound-spec confirms
+      // partition rather than plain inheritance.
+      const partitionParentQuery = `
+        SELECT
+          parn.nspname AS schema,
+          par.relname AS "table"
+        FROM pg_catalog.pg_inherits i
+        JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace childn ON childn.oid = child.relnamespace
+        JOIN pg_catalog.pg_class par ON par.oid = i.inhparent
+        JOIN pg_catalog.pg_namespace parn ON parn.oid = par.relnamespace
+        WHERE childn.nspname = $1
+          AND child.relname = $2
+          AND child.relispartition
+      `;
+
+      const partitionChildrenQuery = `
+        SELECT
+          childn.nspname AS schema,
+          child.relname AS "table",
+          pg_catalog.pg_get_expr(child.relpartbound, child.oid) AS bound
+        FROM pg_catalog.pg_inherits i
+        JOIN pg_catalog.pg_class par ON par.oid = i.inhparent
+        JOIN pg_catalog.pg_namespace parn ON parn.oid = par.relnamespace
+        JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid
+        JOIN pg_catalog.pg_namespace childn ON childn.oid = child.relnamespace
+        WHERE parn.nspname = $1
+          AND par.relname = $2
+          AND child.relispartition
+        ORDER BY childn.nspname, child.relname
+      `;
+
+      const [kindRes, cols, pk, fks, idxs, constraints, referencedBy, partitionParent, partitionChildren] =
+        await Promise.all([
+          runInternal<{ kind: string }>(kindQuery, [schema, table]),
+          runInternal(columnsQuery, [schema, table]),
+          runInternal<{ column_name: string }>(primaryKeyQuery, [schema, table]),
+          runInternal(foreignKeysQuery, [schema, table]),
+          runInternal(indexesQuery, [schema, table]),
+          runInternal(constraintsQuery, [schema, table]),
+          runInternal(referencedByQuery, [schema, table]),
+          runInternal<{ schema: string; table: string }>(partitionParentQuery, [schema, table]),
+          runInternal(partitionChildrenQuery, [schema, table]),
+        ]);
 
       if (!cols.ok) return cols;
       if (!cols.data || cols.data.length === 0) {
@@ -212,6 +302,12 @@ export const schemaTools = [
       if (!pk.ok) warnings.push(`primary_key fetch failed: ${pk.error}`);
       if (!fks.ok) warnings.push(`foreign_keys fetch failed: ${fks.error}`);
       if (!idxs.ok) warnings.push(`indexes fetch failed: ${idxs.error}`);
+      if (!constraints.ok) warnings.push(`constraints fetch failed: ${constraints.error}`);
+      if (!referencedBy.ok) warnings.push(`referenced_by fetch failed: ${referencedBy.error}`);
+      if (!partitionParent.ok) warnings.push(`partition_of fetch failed: ${partitionParent.error}`);
+      if (!partitionChildren.ok) warnings.push(`partitions fetch failed: ${partitionChildren.error}`);
+
+      const parentRow = partitionParent.ok ? partitionParent.data?.[0] : undefined;
 
       return {
         ok: true,
@@ -222,7 +318,13 @@ export const schemaTools = [
           columns: cols.data,
           primary_key: pk.ok ? (pk.data ?? []).map((r) => r.column_name) : [],
           foreign_keys: fks.ok ? fks.data : [],
+          referenced_by: referencedBy.ok ? referencedBy.data : [],
+          constraints: constraints.ok ? constraints.data : [],
           indexes: idxs.ok ? idxs.data : [],
+          ...(parentRow ? { partition_of: parentRow } : {}),
+          ...(partitionChildren.ok && (partitionChildren.data ?? []).length > 0
+            ? { partitions: partitionChildren.data }
+            : {}),
           ...(warnings.length > 0 ? { _warnings: warnings } : {}),
         },
       };

@@ -29,7 +29,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
   });
 
   describe("pg_list_tables", () => {
-    it("returns users, posts, and the quoted 'Odd Table'", async () => {
+    it("returns the fixture tables, partition parent, and the quoted 'Odd Table'", async () => {
       const res = (await listTables.handler({
         schema: FIXTURE_SCHEMA,
         includeViews: false,
@@ -38,8 +38,11 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       })) as { ok: boolean; data?: { name: string; type: string }[] };
       assert.equal(res.ok, true);
       const names = (res.data ?? []).map((r) => r.name).sort();
-      assert.deepEqual(names, ["Odd Table", "posts", "users"]);
-      assert.ok((res.data ?? []).every((r) => r.type === "table"));
+      // Includes plain tables, the partition parent (relkind='p'), and the
+      // partition child (which is also relkind='r'). Order alphabetical.
+      assert.deepEqual(names, ["Odd Table", "events", "events_2026", "posts", "products", "users"]);
+      const events = (res.data ?? []).find((r) => r.name === "events");
+      assert.equal(events?.type, "partitioned_table");
     });
 
     it("with includeViews returns the view too", async () => {
@@ -56,6 +59,14 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
     });
 
     it("paginates with limit and offset", async () => {
+      const allRes = (await listTables.handler({
+        schema: FIXTURE_SCHEMA,
+        includeViews: false,
+        limit: 500,
+        offset: 0,
+      })) as { ok: boolean; data?: { name: string }[] };
+      const allNames = (allRes.data ?? []).map((r) => r.name).sort();
+
       const page1 = (await listTables.handler({
         schema: FIXTURE_SCHEMA,
         includeViews: false,
@@ -68,10 +79,18 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         limit: 2,
         offset: 2,
       })) as { ok: boolean; data?: { name: string }[] };
+      const page3 = (await listTables.handler({
+        schema: FIXTURE_SCHEMA,
+        includeViews: false,
+        limit: 2,
+        offset: 4,
+      })) as { ok: boolean; data?: { name: string }[] };
+
       assert.equal(page1.data?.length, 2);
-      assert.equal(page2.data?.length, 1);
-      const combined = [...(page1.data ?? []), ...(page2.data ?? [])].map((r) => r.name);
-      assert.deepEqual(combined.sort(), ["Odd Table", "posts", "users"]);
+      assert.equal(page2.data?.length, 2);
+      assert.equal(page3.data?.length, allNames.length - 4);
+      const combined = [...(page1.data ?? []), ...(page2.data ?? []), ...(page3.data ?? [])].map((r) => r.name);
+      assert.deepEqual(combined.sort(), allNames);
     });
   });
 
@@ -108,6 +127,56 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(res.data?.kind, "view");
       assert.deepEqual(res.data?.primary_key, []);
       assert.deepEqual(res.data?.foreign_keys, []);
+    });
+
+    it("returns CHECK and UNIQUE constraints in `constraints`", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "products" })) as {
+        ok: boolean;
+        data?: { constraints: { name: string; type: string; definition: string }[] };
+      };
+      assert.equal(res.ok, true);
+      const types = (res.data?.constraints ?? []).map((c) => c.type);
+      assert.ok(types.includes("check"), `expected CHECK constraint, got types=${JSON.stringify(types)}`);
+      assert.ok(types.includes("unique"), `expected UNIQUE constraint, got types=${JSON.stringify(types)}`);
+      const check = res.data?.constraints.find((c) => c.type === "check");
+      assert.match(check?.definition ?? "", /price > 0/i);
+    });
+
+    it("lists incoming FKs in `referenced_by` (users is referenced by posts)", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "users" })) as {
+        ok: boolean;
+        data?: { referenced_by: { table: string; columns: string[]; referenced_columns: string[] }[] };
+      };
+      assert.equal(res.ok, true);
+      const incoming = res.data?.referenced_by ?? [];
+      const fromPosts = incoming.find((r) => r.table === "posts");
+      assert.ok(fromPosts, `expected posts in referenced_by, got ${JSON.stringify(incoming)}`);
+      assert.deepEqual(fromPosts.columns, ["user_id"]);
+      assert.deepEqual(fromPosts.referenced_columns, ["id"]);
+    });
+
+    it("returns partitions on a partitioned_table parent", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "events" })) as {
+        ok: boolean;
+        data?: { kind: string; partitions?: { schema: string; table: string; bound: string }[] };
+      };
+      assert.equal(res.ok, true);
+      assert.equal(res.data?.kind, "partitioned_table");
+      const children = res.data?.partitions ?? [];
+      assert.ok(
+        children.some((c) => c.table === "events_2026"),
+        `expected events_2026 in partitions, got ${JSON.stringify(children)}`,
+      );
+    });
+
+    it("returns partition_of on a partition child", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "events_2026" })) as {
+        ok: boolean;
+        data?: { partition_of?: { schema: string; table: string } };
+      };
+      assert.equal(res.ok, true);
+      assert.equal(res.data?.partition_of?.table, "events");
+      assert.equal(res.data?.partition_of?.schema, FIXTURE_SCHEMA);
     });
 
     it("handles quoted identifiers like 'Odd Table'", async () => {

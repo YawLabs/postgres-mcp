@@ -29,6 +29,21 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       );
     });
 
+    it("attaches dataTypeName alongside dataTypeID for each field", async () => {
+      const res = (await pgQuery.handler({
+        sql: `SELECT id, email, metadata FROM ${FIXTURE_SCHEMA}.users LIMIT 1`,
+      })) as {
+        ok: boolean;
+        data?: { fields: { name: string; dataTypeID: number; dataTypeName?: string }[] };
+      };
+      assert.equal(res.ok, true);
+      const fields = res.data?.fields ?? [];
+      const byName = Object.fromEntries(fields.map((f) => [f.name, f]));
+      assert.equal(byName.id?.dataTypeName, "int4");
+      assert.equal(byName.email?.dataTypeName, "text");
+      assert.equal(byName.metadata?.dataTypeName, "jsonb");
+    });
+
     it("supports parameterized queries", async () => {
       const res = (await pgQuery.handler({
         sql: `SELECT email FROM ${FIXTURE_SCHEMA}.users WHERE id = $1`,

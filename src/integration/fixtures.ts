@@ -50,6 +50,28 @@ export async function setupFixtures(): Promise<void> {
     `CREATE FUNCTION ${FIXTURE_SCHEMA}.user_count() RETURNS BIGINT
        LANGUAGE SQL AS $$ SELECT COUNT(*) FROM ${FIXTURE_SCHEMA}.users $$`,
 
+    // Constraints fixture: CHECK + UNIQUE non-PK so describe_table.constraints
+    // has rows to exercise. EXCLUDE needs btree_gist; skip to keep fixture
+    // dependency-free.
+    `CREATE TABLE ${FIXTURE_SCHEMA}.products (
+       id SERIAL PRIMARY KEY,
+       sku TEXT NOT NULL,
+       price NUMERIC NOT NULL,
+       CONSTRAINT products_sku_unique UNIQUE (sku),
+       CONSTRAINT products_price_positive CHECK (price > 0)
+     )`,
+
+    // Partition fixture: declarative range partitioning so describe_table
+    // returns partition_of (on a child) and partitions (on the parent).
+    `CREATE TABLE ${FIXTURE_SCHEMA}.events (
+       id BIGSERIAL,
+       occurred_at DATE NOT NULL,
+       payload TEXT,
+       PRIMARY KEY (id, occurred_at)
+     ) PARTITION BY RANGE (occurred_at)`,
+    `CREATE TABLE ${FIXTURE_SCHEMA}.events_2026 PARTITION OF ${FIXTURE_SCHEMA}.events
+       FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`,
+
     `INSERT INTO ${FIXTURE_SCHEMA}.users (email, metadata) VALUES
        ('a@example.com', '{"role":"admin"}'::jsonb),
        ('b@example.com', '{"role":"user"}'::jsonb),
