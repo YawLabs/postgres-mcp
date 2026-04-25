@@ -129,6 +129,7 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 | `pg_table_privileges` | Who has SELECT/INSERT/UPDATE/DELETE/etc. on a table or whole schema. |
 | `pg_table_bloat` | Tables with high dead-tuple ratios — VACUUM candidates. |
 | `pg_replication_status` | Replication slots, connected replicas, and current WAL position. |
+| `pg_advisor` | Rolled-up DBA lints in one call: sequence-exhaustion candidates, tables without a primary key, and (configurable) public tables with RLS disabled. The "what should I be looking at?" starting point. |
 | `pg_kill` | Cancel a running query or terminate a backend connection. Requires `ALLOW_WRITES=1`. |
 
 ## Configuration

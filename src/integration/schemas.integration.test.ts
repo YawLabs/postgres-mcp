@@ -40,7 +40,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       const names = (res.data ?? []).map((r) => r.name).sort();
       // Includes plain tables, the partition parent (relkind='p'), and the
       // partition child (which is also relkind='r'). Order alphabetical.
-      assert.deepEqual(names, ["Odd Table", "events", "events_2026", "posts", "products", "users"]);
+      assert.deepEqual(names, ["Odd Table", "events", "events_2026", "no_pk_table", "posts", "products", "users"]);
       const events = (res.data ?? []).find((r) => r.name === "events");
       assert.equal(events?.type, "partitioned_table");
     });
@@ -67,29 +67,24 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       })) as { ok: boolean; data?: { name: string }[] };
       const allNames = (allRes.data ?? []).map((r) => r.name).sort();
 
-      const page1 = (await listTables.handler({
-        schema: FIXTURE_SCHEMA,
-        includeViews: false,
-        limit: 2,
-        offset: 0,
-      })) as { ok: boolean; data?: { name: string }[] };
-      const page2 = (await listTables.handler({
-        schema: FIXTURE_SCHEMA,
-        includeViews: false,
-        limit: 2,
-        offset: 2,
-      })) as { ok: boolean; data?: { name: string }[] };
-      const page3 = (await listTables.handler({
-        schema: FIXTURE_SCHEMA,
-        includeViews: false,
-        limit: 2,
-        offset: 4,
-      })) as { ok: boolean; data?: { name: string }[] };
-
-      assert.equal(page1.data?.length, 2);
-      assert.equal(page2.data?.length, 2);
-      assert.equal(page3.data?.length, allNames.length - 4);
-      const combined = [...(page1.data ?? []), ...(page2.data ?? []), ...(page3.data ?? [])].map((r) => r.name);
+      // Walk the table list two-at-a-time and verify each page is the
+      // expected size (full pages of 2, then a final partial page with
+      // whatever's left). Resilient to fixture growth.
+      const pageSize = 2;
+      const pages: { name: string }[][] = [];
+      for (let offset = 0; offset < allNames.length; offset += pageSize) {
+        const page = (await listTables.handler({
+          schema: FIXTURE_SCHEMA,
+          includeViews: false,
+          limit: pageSize,
+          offset,
+        })) as { ok: boolean; data?: { name: string }[] };
+        const got = page.data ?? [];
+        const expectedSize = Math.min(pageSize, allNames.length - offset);
+        assert.equal(got.length, expectedSize, `page at offset=${offset} should have ${expectedSize} rows`);
+        pages.push(got);
+      }
+      const combined = pages.flat().map((r) => r.name);
       assert.deepEqual(combined.sort(), allNames);
     });
   });

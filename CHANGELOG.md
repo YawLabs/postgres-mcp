@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `@types/pg` bumped from `^8.11.10` to `^8.20.0` to track pg 8.20.0 runtime.
 
 ### Added
+- New `pg_advisor` tool: rolled-up DBA lints in one call. Returns three
+  categories of findings -- `sequence_exhaustion` (sequences whose
+  last_value is past `seqExhaustionThreshold` of max_value, default 50%;
+  the classic "BIGINT, eventually" incident class), `tables_without_primary_key`
+  (bloat candidates and a sign of design drift), and
+  `public_tables_without_rls` (default `public`; configurable via
+  `rlsSchemas`). Use as the "what should I be looking at?" starting
+  point and drill into `pg_unused_indexes` / `pg_table_bloat` /
+  `pg_seq_scan_tables` for the perf side.
 - `pg_explain` accepts a `hypothetical_indexes` parameter -- list of
   `{table, columns, using?}` -- which asks the planner "what would the
   plan be if these indexes existed?". Requires the

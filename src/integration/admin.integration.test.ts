@@ -8,6 +8,7 @@ const inspectLocks = adminTools.find((t) => t.name === "pg_inspect_locks")!;
 const listRoles = adminTools.find((t) => t.name === "pg_list_roles")!;
 const tablePrivileges = adminTools.find((t) => t.name === "pg_table_privileges")!;
 const tableBloat = adminTools.find((t) => t.name === "pg_table_bloat")!;
+const advisor = adminTools.find((t) => t.name === "pg_advisor")!;
 const seqScanTables = statsTools.find((t) => t.name === "pg_seq_scan_tables")!;
 const unusedIndexes = statsTools.find((t) => t.name === "pg_unused_indexes")!;
 
@@ -114,6 +115,43 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
           `dead_ratio must be in [0,1] for ${row.table}, got ${row.dead_ratio}`,
         );
       }
+    });
+  });
+
+  describe("pg_advisor", () => {
+    it("flags tables without a primary key (fixture has `no_pk_table`)", async () => {
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.5,
+        rlsSchemas: ["public"],
+        limit: 100,
+      })) as {
+        ok: boolean;
+        data?: {
+          sequence_exhaustion: unknown[];
+          tables_without_primary_key: { schema: string; table: string }[];
+          public_tables_without_rls: unknown[];
+        };
+      };
+      assert.equal(res.ok, true);
+      const noPk = res.data?.tables_without_primary_key ?? [];
+      assert.ok(
+        noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "no_pk_table"),
+        `expected no_pk_table in tables_without_primary_key, got ${JSON.stringify(noPk)}`,
+      );
+      assert.ok(Array.isArray(res.data?.sequence_exhaustion));
+      assert.ok(Array.isArray(res.data?.public_tables_without_rls));
+    });
+
+    it("threshold filters sequence_exhaustion: 0.99 hides everything in a fresh fixture", async () => {
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.99,
+        rlsSchemas: ["public"],
+        limit: 100,
+      })) as { ok: boolean; data?: { sequence_exhaustion: unknown[] } };
+      assert.equal(res.ok, true);
+      // Fresh sequences in the fixture are nowhere near max_value, so a 99%
+      // threshold should produce an empty list.
+      assert.deepEqual(res.data?.sequence_exhaustion, []);
     });
   });
 

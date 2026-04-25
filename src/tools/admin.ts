@@ -304,6 +304,118 @@ export const adminTools = [
   },
 
   {
+    name: "pg_advisor",
+    description:
+      "Rolled-up DBA lint pass. One call returns three categories of findings:\n" +
+      "- sequence_exhaustion: SERIAL / BIGSERIAL / IDENTITY sequences whose `last_value` is " +
+      "above `seqExhaustionThreshold` of `max_value`. The classic incident class.\n" +
+      "- tables_without_primary_key: user tables with no PK. Bloat candidates and a sign of " +
+      "design drift; some replication setups also need PKs.\n" +
+      "- public_tables_without_rls: tables in `public` (or any schema in `rlsSchemas`) with " +
+      "row-level security disabled. Useful as a security baseline check.\n" +
+      "Use this as the 'what should I be looking at?' starting point, then drill into " +
+      "`pg_unused_indexes`, `pg_table_bloat`, `pg_seq_scan_tables` for the perf side.",
+    annotations: {
+      title: "Database advisor (DBA lints)",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: z.object({
+      seqExhaustionThreshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .default(0.5)
+        .describe("Minimum used-fraction (last_value / max_value) to flag a sequence (default 0.5 = 50%)."),
+      rlsSchemas: z
+        .array(z.string().min(1).max(63))
+        .default(["public"])
+        .describe("Schemas where RLS-missing should be flagged. Defaults to ['public']."),
+      limit: z.number().int().min(1).max(500).default(50).describe("Max rows per category (default 50)."),
+    }),
+    handler: async (input: unknown) => {
+      const { seqExhaustionThreshold, rlsSchemas, limit } = input as {
+        seqExhaustionThreshold: number;
+        rlsSchemas: string[];
+        limit: number;
+      };
+
+      const [seqRes, noPkRes, rlsRes] = await Promise.all([
+        runInternal<{
+          schema: string;
+          sequence: string;
+          last_value: string;
+          max_value: string;
+          pct_used: number;
+        }>(
+          // pg_sequences was added in PG10. last_value can be NULL on a never-
+          // touched sequence; we filter those out (nothing to report yet).
+          `SELECT
+             schemaname AS schema,
+             sequencename AS sequence,
+             last_value::text AS last_value,
+             max_value::text AS max_value,
+             (last_value::float8 / NULLIF(max_value::float8, 0))::numeric(6, 4)::float8 AS pct_used
+           FROM pg_catalog.pg_sequences
+           WHERE last_value IS NOT NULL
+             AND max_value > 0
+             AND (last_value::float8 / max_value::float8) >= $1
+           ORDER BY pct_used DESC NULLS LAST
+           LIMIT $2`,
+          [seqExhaustionThreshold, limit],
+        ),
+        runInternal<{ schema: string; table: string }>(
+          `SELECT
+             n.nspname AS schema,
+             c.relname AS "table"
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           WHERE c.relkind = 'r'
+             AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+             AND n.nspname NOT LIKE 'pg_%'
+             AND NOT EXISTS (
+               SELECT 1 FROM pg_catalog.pg_index i
+               WHERE i.indrelid = c.oid AND i.indisprimary
+             )
+           ORDER BY n.nspname, c.relname
+           LIMIT $1`,
+          [limit],
+        ),
+        runInternal<{ schema: string; table: string }>(
+          `SELECT
+             n.nspname AS schema,
+             c.relname AS "table"
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           WHERE c.relkind IN ('r', 'p')
+             AND n.nspname = ANY($1)
+             AND NOT c.relrowsecurity
+           ORDER BY n.nspname, c.relname
+           LIMIT $2`,
+          [rlsSchemas, limit],
+        ),
+      ]);
+
+      const warnings: string[] = [];
+      if (!seqRes.ok) warnings.push(`sequence_exhaustion fetch failed: ${seqRes.error}`);
+      if (!noPkRes.ok) warnings.push(`tables_without_primary_key fetch failed: ${noPkRes.error}`);
+      if (!rlsRes.ok) warnings.push(`public_tables_without_rls fetch failed: ${rlsRes.error}`);
+
+      return {
+        ok: true,
+        data: {
+          sequence_exhaustion: seqRes.ok ? seqRes.data : [],
+          tables_without_primary_key: noPkRes.ok ? noPkRes.data : [],
+          public_tables_without_rls: rlsRes.ok ? rlsRes.data : [],
+          ...(warnings.length > 0 ? { _warnings: warnings } : {}),
+        },
+      };
+    },
+  },
+
+  {
     name: "pg_table_bloat",
     description:
       "Estimate table bloat (dead tuples + free space) for tables in a schema. Returns live " +

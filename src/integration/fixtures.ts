@@ -72,6 +72,10 @@ export async function setupFixtures(): Promise<void> {
     `CREATE TABLE ${FIXTURE_SCHEMA}.events_2026 PARTITION OF ${FIXTURE_SCHEMA}.events
        FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`,
 
+    // Advisor fixture: a heap table with no primary key. Used by the
+    // pg_advisor tables_without_primary_key check.
+    `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_table (id INT, label TEXT)`,
+
     `INSERT INTO ${FIXTURE_SCHEMA}.users (email, metadata) VALUES
        ('a@example.com', '{"role":"admin"}'::jsonb),
        ('b@example.com', '{"role":"user"}'::jsonb),
