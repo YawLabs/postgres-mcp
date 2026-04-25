@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- User SQL fetches are now memory-bounded by Postgres, not by Node. The
+  prior flow had node-pg materialize the entire result set into memory and
+  then sliced down to `POSTGRES_MAX_ROWS` for output -- so a payload like
+  `SELECT * FROM big1 CROSS JOIN big2` could OOM the MCP process before
+  the 30 s `statement_timeout` fired. User SQL now runs through a
+  server-side `DECLARE ... NO SCROLL CURSOR FOR ...` + `FETCH MAX_ROWS+1`
+  pattern; only the response-sized batch is ever materialized in Node.
+  Non-cursorable statements (DDL, DML without RETURNING, utility commands)
+  fall back to a direct execute via `SAVEPOINT` so the outer transaction
+  stays alive -- those statements never produce a runaway result set
+  anyway.
 - User SQL is now sent with `queryMode: 'extended'`, forcing pg to use the
   extended query protocol regardless of whether `params` is empty. The
   extended protocol restricts each request to a single statement, closing

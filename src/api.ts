@@ -169,6 +169,64 @@ function formatPgError(err: unknown): string {
   return parts.join(" ");
 }
 
+/**
+ * Run user SQL with a memory-bounded fetch.
+ *
+ * Without this wrapper, node-pg materializes the entire result set into
+ * Node memory before our `MAX_ROWS` slice runs -- so a payload like
+ * `SELECT * FROM big1 CROSS JOIN big2` could OOM the MCP process before
+ * the `statement_timeout` fired. Truncation was output-only, not
+ * fetch-bounded.
+ *
+ * The fix: wrap the user SQL in a server-side `DECLARE ... CURSOR FOR`,
+ * fetch only `maxRows + 1` rows, close the cursor. Postgres now does the
+ * heavy lifting and we never hold more than the response size in Node.
+ *
+ * Not every statement is cursorable -- DDL, DML without RETURNING, and
+ * a few utility commands fail at DECLARE with SQLSTATE 0A000. We wrap
+ * the attempt in a SAVEPOINT so a DECLARE failure doesn't abort the
+ * outer transaction; on the fallback path we execute the SQL directly,
+ * accepting that those statements never produce a runaway result set
+ * anyway (DDL returns no rows, DML without RETURNING returns no rows).
+ */
+async function runUserQueryBounded(
+  client: pg.PoolClient,
+  sql: string,
+  params: unknown[],
+  maxRows: number,
+): Promise<pg.QueryResult> {
+  await client.query("SAVEPOINT __pgmcp_sp");
+  try {
+    await client.query({
+      text: `DECLARE __pgmcp_cur NO SCROLL CURSOR FOR ${sql}`,
+      values: params,
+      queryMode: "extended",
+    } as UserQueryConfig);
+    const fetched = await client.query(`FETCH ${maxRows + 1} FROM __pgmcp_cur`);
+    try {
+      await client.query("CLOSE __pgmcp_cur");
+    } catch {
+      // CLOSE on a still-open cursor should not fail in normal flow;
+      // a stale-cursor edge here doesn't change correctness because the
+      // outer txn rollback below releases the cursor too.
+    }
+    await client.query("RELEASE SAVEPOINT __pgmcp_sp");
+    return fetched;
+  } catch {
+    // Cursorable-or-not is decided at parse/plan time inside DECLARE.
+    // Fall back to a direct execute for the non-cursorable case (DDL,
+    // DML-without-RETURNING, utility commands). The savepoint rollback
+    // is what lets the outer transaction stay alive.
+    await client.query("ROLLBACK TO SAVEPOINT __pgmcp_sp");
+    await client.query("RELEASE SAVEPOINT __pgmcp_sp");
+    return client.query({
+      text: sql,
+      values: params,
+      queryMode: "extended",
+    } as UserQueryConfig);
+  }
+}
+
 function toQueryResult(result: pg.QueryResult, maxRows: number, typeNames: Record<number, string> = {}): QueryResult {
   const truncated = result.rows.length > maxRows;
   const rows = truncated ? result.rows.slice(0, maxRows) : result.rows;
@@ -202,7 +260,7 @@ export async function runReadOnly(sql: string, params: unknown[] = []): Promise<
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN READ ONLY");
-    const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
+    const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
@@ -230,7 +288,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
-    const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
+    const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("COMMIT");
     const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
@@ -264,7 +322,7 @@ export async function runReadWriteRollback(sql: string, params: unknown[] = []):
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
-    const result = await client.query({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig);
+    const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames) };

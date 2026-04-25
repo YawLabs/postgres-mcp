@@ -114,6 +114,31 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /\$1|parameter/i);
     });
 
+    it("bounds fetch via cursor: a SELECT generating 1M rows returns only MAX_ROWS+truncated quickly", async () => {
+      // Without the cursor wrap, generate_series(1, 1_000_000) materializes
+      // a million rows in node-pg before the slice. With the wrap, postgres
+      // FETCHes only MAX_ROWS+1 rows. We can't easily measure peak memory in
+      // a test, but a 1M-row generate_series running in <1s is the canary --
+      // a non-bounded fetch on a developer laptop tops 5s and several
+      // hundred MB resident.
+      const original = process.env.POSTGRES_MAX_ROWS;
+      process.env.POSTGRES_MAX_ROWS = "10";
+      const start = Date.now();
+      try {
+        const res = (await pgQuery.handler({
+          sql: "SELECT generate_series(1, 1000000) AS i",
+        })) as { ok: boolean; data?: { rows: { i: number }[]; truncated?: boolean } };
+        const elapsedMs = Date.now() - start;
+        assert.equal(res.ok, true);
+        assert.equal(res.data?.rows.length, 10);
+        assert.equal(res.data?.truncated, true);
+        assert.ok(elapsedMs < 2000, `expected <2s with bounded fetch, took ${elapsedMs}ms`);
+      } finally {
+        if (original === undefined) delete process.env.POSTGRES_MAX_ROWS;
+        else process.env.POSTGRES_MAX_ROWS = original;
+      }
+    });
+
     it("does not flag truncated when result count equals POSTGRES_MAX_ROWS", async () => {
       const original = process.env.POSTGRES_MAX_ROWS;
       // Fixture has exactly 3 users -- request a max of 3 to hit the boundary.
