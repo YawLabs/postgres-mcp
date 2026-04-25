@@ -9,7 +9,9 @@
 set -uo pipefail
 
 REPO_DST=/root/postgres-mcp
-REPO_SRC=/mnt/c/Users/jeff/yaw/postgres-mcp
+# Derive REPO_SRC from this script's location so any contributor can run it.
+# Script lives at <repo>/scripts/wsl-test-matrix.sh, so go one dir up.
+REPO_SRC="$(cd "$(dirname "$0")/.." && pwd)"
 
 rsync -a --delete \
   --exclude=node_modules --exclude=dist --exclude=.git \

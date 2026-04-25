@@ -182,7 +182,7 @@ Run the full suite (unit + integration) against a real Postgres:
 DATABASE_URL='postgres://user:pass@host:5432/db' POSTGRES_MCP_INTEGRATION=1 npm run test:integration
 ```
 
-The integration suite assumes a disposable database -- it creates and drops a `postgres_mcp_integration` schema. Don't point it at anything you care about.
+The integration suite assumes a disposable database -- it creates and drops a `test_fixture` schema. Don't point it at anything you care about.
 
 ### Windows: integration tests via WSL2
 

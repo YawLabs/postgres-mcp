@@ -328,7 +328,7 @@ export const adminTools = [
         .min(0)
         .max(1)
         .default(0.1)
-        .describe("Minimum dead/live ratio to include (default 0.1 = 10%)."),
+        .describe("Minimum dead-tuple fraction to include — dead / (live + dead). Default 0.1 = 10%."),
       limit: z.number().int().min(1).max(200).default(50).describe("Max rows to return (default 50)."),
     }),
     handler: async (input: unknown) => {
@@ -354,22 +354,23 @@ export const adminTools = [
         last_autovacuum: string | null;
         last_analyze: string | null;
       }>(
+        // dead_ratio = dead / (live + dead): bounded [0, 1]. A 100%-dead table
+        // (live=0, dead>0) correctly reports 1.0 instead of 0. Tables with both
+        // counters at 0 are filtered out -- nothing to report.
         `SELECT
            schemaname AS schema,
            relname AS "table",
            n_live_tup::text AS live_tuples,
            n_dead_tup::text AS dead_tuples,
-           CASE
-             WHEN n_live_tup = 0 THEN 0
-             ELSE (n_dead_tup::float8 / GREATEST(n_live_tup, 1))::numeric(6, 3)::float8
-           END AS dead_ratio,
+           (n_dead_tup::float8 / (n_live_tup + n_dead_tup))::numeric(6, 3)::float8 AS dead_ratio,
            pg_size_pretty(pg_total_relation_size(relid)) AS size_pretty,
            pg_total_relation_size(relid)::text AS size_bytes,
            last_vacuum::text AS last_vacuum,
            last_autovacuum::text AS last_autovacuum,
            last_analyze::text AS last_analyze
          FROM pg_catalog.pg_stat_user_tables
-         WHERE (n_dead_tup::float8 / GREATEST(n_live_tup, 1)) >= $1
+         WHERE (n_live_tup + n_dead_tup) > 0
+           AND (n_dead_tup::float8 / (n_live_tup + n_dead_tup)) >= $1
            ${schemaFilter}
          ORDER BY n_dead_tup DESC
          LIMIT $2`,

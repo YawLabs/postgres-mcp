@@ -29,13 +29,10 @@ if (files.length === 0) {
   process.exit(1);
 }
 
-const nodeArgs = ["--test"];
-if (integrationOnly) {
-  // Three integration files each set up / tear down the same fixture schema.
-  // Running them in parallel races on the shared schema; serialize.
-  nodeArgs.push("--test-concurrency=1");
-}
-nodeArgs.push(...files);
+// Always serialize. Integration files race on the shared `test_fixture` schema;
+// unit files mutate `process.env` (ALLOW_WRITES, POSTGRES_MAX_ROWS, ...) which
+// is process-wide, so parallel files flap on env values written by another file.
+const nodeArgs = ["--test", "--test-concurrency=1", ...files];
 
 const child = spawn(process.execPath, nodeArgs, { stdio: "inherit" });
 child.on("exit", (code) => process.exit(code ?? 1));

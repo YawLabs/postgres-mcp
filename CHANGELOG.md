@@ -18,7 +18,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `pg_query` would escape the `BEGIN READ ONLY` wrapper and run DDL in
   autocommit. Added an integration regression test that asserts the
   multi-statement request is rejected by Postgres.
+- `pg` minimum bumped from `^8.13.0` to `^8.14.0`. The `queryMode: 'extended'`
+  option that backs the stacked-query guard above is silently ignored on pg
+  8.13.x -- a fresh `npm install` resolving to that range would have regressed
+  the security guard with no visible signal. Today's lockfile pins 8.20.0;
+  the range bump prevents future installs from sliding back.
 - `@types/pg` bumped from `^8.11.10` to `^8.20.0` to track pg 8.20.0 runtime.
+
+### Fixed
+- `pg_table_bloat` now uses `dead / (live + dead)` for `dead_ratio` instead of
+  `dead / live`. The previous formula reported `0` for tables with `live = 0`
+  even when `dead > 0`, hiding the most-bloated tables (an empty-shell table
+  full of dead tuples is the textbook VACUUM target). The new formula is
+  bounded `[0, 1]`, behaves correctly at edges, and the `WHERE` filter now
+  excludes tables with both counters at 0 entirely. The `minDeadRatio`
+  parameter description was updated to match.
+- `npm test` now serializes test files with `--test-concurrency=1`. Unit tests
+  in `api.test.ts` and `tools/admin.test.ts` both mutate `process.env`
+  (`ALLOW_WRITES`, `POSTGRES_MAX_ROWS`, etc.); under Node's default parallel
+  test-file scheduling these races could flap on CI.
+- README integration-suite paragraph corrected: the schema is named
+  `test_fixture`, not `postgres_mcp_integration`.
+- `scripts/wsl-test-matrix.sh` derives `REPO_SRC` from its own location instead
+  of a hardcoded `/mnt/c/Users/jeff/...` path. Anyone other than the original
+  author can now run the matrix from their own clone.
 
 ## [0.3.2] - 2026-04-24
 
