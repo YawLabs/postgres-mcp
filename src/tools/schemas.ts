@@ -86,7 +86,11 @@ export const schemaTools = [
 
   {
     name: "pg_describe_table",
-    description: "Describe a table: columns (name, type, nullable, default), primary key, foreign keys, and indexes.",
+    description:
+      "Describe a relation: kind (table / view / materialized_view / partitioned_table / foreign_table), " +
+      "columns (name, type, nullable, default), primary key, foreign keys, and indexes. Works on views and " +
+      "materialized views too -- PK/FK/indexes will simply be empty for a plain view. Use `kind` to " +
+      "disambiguate before assuming you can write to the relation.",
     annotations: {
       title: "Describe table",
       readOnlyHint: true,
@@ -100,6 +104,24 @@ export const schemaTools = [
     }),
     handler: async (input: unknown) => {
       const { schema, table } = input as { schema: string; table: string };
+
+      // Identify the relation kind first so the response signals "this is a
+      // view" -- without this, an LLM sees columns + empty PK/FK/indexes and
+      // can't tell whether it's looking at a real table or a view.
+      const kindQuery = `
+        SELECT
+          CASE c.relkind
+            WHEN 'r' THEN 'table'
+            WHEN 'p' THEN 'partitioned_table'
+            WHEN 'v' THEN 'view'
+            WHEN 'm' THEN 'materialized_view'
+            WHEN 'f' THEN 'foreign_table'
+            ELSE c.relkind::text
+          END AS kind
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2
+      `;
 
       const columnsQuery = `
         SELECT
@@ -169,7 +191,8 @@ export const schemaTools = [
         ORDER BY i.relname
       `;
 
-      const [cols, pk, fks, idxs] = await Promise.all([
+      const [kindRes, cols, pk, fks, idxs] = await Promise.all([
+        runInternal<{ kind: string }>(kindQuery, [schema, table]),
         runInternal(columnsQuery, [schema, table]),
         runInternal<{ column_name: string }>(primaryKeyQuery, [schema, table]),
         runInternal(foreignKeysQuery, [schema, table]),
@@ -180,6 +203,7 @@ export const schemaTools = [
       if (!cols.data || cols.data.length === 0) {
         return { ok: false, error: `Table "${schema}"."${table}" not found.` };
       }
+      const kind = kindRes.ok ? (kindRes.data?.[0]?.kind ?? "table") : "table";
 
       // Surface partial failures instead of collapsing them to empty arrays —
       // an empty `foreign_keys` could mean "no FKs" or "fetch failed", and an
@@ -194,6 +218,7 @@ export const schemaTools = [
         data: {
           schema,
           table,
+          kind,
           columns: cols.data,
           primary_key: pk.ok ? (pk.data ?? []).map((r) => r.column_name) : [],
           foreign_keys: fks.ok ? fks.data : [],

@@ -25,6 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the range bump prevents future installs from sliding back.
 - `@types/pg` bumped from `^8.11.10` to `^8.20.0` to track pg 8.20.0 runtime.
 
+### Added
+- `POSTGRES_CONNECTION_TIMEOUT_MS` env var (default `10000`). Without it, a
+  dead host hangs the first connection attempt until the OS times out
+  (~2 minutes on most platforms), and the agent waits the whole time before
+  surfacing an error.
+- `pg_describe_table` now returns a `kind` field (`table` / `view` /
+  `materialized_view` / `partitioned_table` / `foreign_table`). Previously
+  the tool silently accepted views and matviews and returned columns with
+  empty `primary_key` / `foreign_keys` / `indexes` -- correct, but an LLM
+  couldn't tell whether the relation was writable.
+
+### Changed
+- README now states the supported Postgres versions: tested on 17 and 18,
+  expected to work on 13+.
+
 ### Fixed
 - `pg_table_bloat` now uses `dead / (live + dead)` for `dead_ratio` instead of
   `dead / live`. The previous formula reported `0` for tables with `live = 0`
@@ -42,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/wsl-test-matrix.sh` derives `REPO_SRC` from its own location instead
   of a hardcoded `/mnt/c/Users/jeff/...` path. Anyone other than the original
   author can now run the matrix from their own clone.
+- `release.sh` creates annotated tags (`git tag -a`) and pushes with
+  `--follow-tags` instead of `--tags`. The previous `--tags` form pushed every
+  local tag, including any unrelated experimental ones lying around;
+  `--follow-tags` only pushes the tag(s) reachable from the commits being
+  pushed -- but it ignores lightweight tags, so the tag-creation step had to
+  switch to annotated to keep working.
 
 ## [0.3.2] - 2026-04-24
 

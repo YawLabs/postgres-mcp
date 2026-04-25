@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { getMaxRows, getPoolMax, getSslConfig, isWritesAllowed } from "./api.js";
+import { getConnectionTimeoutMs, getMaxRows, getPoolMax, getSslConfig, isWritesAllowed } from "./api.js";
 
 describe("isWritesAllowed", () => {
   const original = process.env.ALLOW_WRITES;
@@ -88,6 +88,35 @@ describe("getPoolMax", () => {
     for (const v of ["abc", "-5", "0", ""]) {
       process.env.POSTGRES_POOL_MAX = v;
       assert.equal(getPoolMax(), 5, `POSTGRES_POOL_MAX=${JSON.stringify(v)} should default`);
+    }
+  });
+});
+
+describe("getConnectionTimeoutMs", () => {
+  const original = process.env.POSTGRES_CONNECTION_TIMEOUT_MS;
+  afterEach(() => {
+    if (original === undefined) delete process.env.POSTGRES_CONNECTION_TIMEOUT_MS;
+    else process.env.POSTGRES_CONNECTION_TIMEOUT_MS = original;
+  });
+
+  it("defaults to 10000", () => {
+    delete process.env.POSTGRES_CONNECTION_TIMEOUT_MS;
+    assert.equal(getConnectionTimeoutMs(), 10_000);
+  });
+
+  it("accepts positive numbers", () => {
+    process.env.POSTGRES_CONNECTION_TIMEOUT_MS = "2500";
+    assert.equal(getConnectionTimeoutMs(), 2500);
+  });
+
+  it("falls back to 10000 for invalid values", () => {
+    for (const v of ["abc", "-5", "0", ""]) {
+      process.env.POSTGRES_CONNECTION_TIMEOUT_MS = v;
+      assert.equal(
+        getConnectionTimeoutMs(),
+        10_000,
+        `POSTGRES_CONNECTION_TIMEOUT_MS=${JSON.stringify(v)} should default`,
+      );
     }
   });
 });

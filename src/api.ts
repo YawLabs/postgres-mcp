@@ -5,6 +5,9 @@
  *   - DATABASE_URL                         — postgres connection string (required)
  *   - ALLOW_WRITES                         — set to "1" or "true" to allow DML/DDL (default: read-only)
  *   - POSTGRES_STATEMENT_TIMEOUT_MS        — per-statement timeout (default: 30000)
+ *   - POSTGRES_CONNECTION_TIMEOUT_MS       — TCP connect timeout (default: 10000). Without
+ *                                            this, a dead host hangs until the OS gives up
+ *                                            (~2 minutes on most platforms).
  *   - POSTGRES_MAX_ROWS                    — max rows returned by pg_query (default: 1000)
  *   - POSTGRES_POOL_MAX                    — max pool connections (default: 5). Set to 1 for
  *                                            single-threaded backends (pglite-socket, PgBouncer
@@ -50,6 +53,13 @@ function getStatementTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
 }
 
+export function getConnectionTimeoutMs(): number {
+  const raw = process.env.POSTGRES_CONNECTION_TIMEOUT_MS;
+  if (!raw) return 10_000;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+}
+
 export function getMaxRows(): number {
   const raw = process.env.POSTGRES_MAX_ROWS;
   if (!raw) return 1000;
@@ -83,6 +93,7 @@ export function getPool(): pg.Pool {
   pool = new pg.Pool({
     connectionString: getDatabaseUrl(),
     statement_timeout: getStatementTimeoutMs(),
+    connectionTimeoutMillis: getConnectionTimeoutMs(),
     max: getPoolMax(),
     // MCP sessions can have minutes-long gaps between tool calls. A short
     // idleTimeout forces a reconnect on every tool call. 60s keeps the pool

@@ -135,9 +135,14 @@ All env vars are read from the MCP server's environment:
 | `DATABASE_URL` | (required) | PostgreSQL connection string. |
 | `ALLOW_WRITES` | unset | Set to `1` or `true` to allow DML/DDL via `pg_query` and `pg_explain` ANALYZE of writes. |
 | `POSTGRES_STATEMENT_TIMEOUT_MS` | `30000` | Per-statement timeout. |
+| `POSTGRES_CONNECTION_TIMEOUT_MS` | `10000` | TCP connect timeout. Without this, a dead host hangs until the OS gives up (~2 minutes). |
 | `POSTGRES_MAX_ROWS` | `1000` | Cap on rows returned by `pg_query`. |
 | `POSTGRES_POOL_MAX` | `5` | Max pool connections. Set to `1` for single-threaded backends (pglite-socket, PgBouncer transaction mode). |
 | `POSTGRES_SSL_REJECT_UNAUTHORIZED` | unset | Set to `false` to skip TLS cert verification (for managed DBs using private-CA certs). Connection is still encrypted. |
+
+### Supported Postgres versions
+
+Tested on **PostgreSQL 17 and 18** in CI. Should work on PG13+ -- a few tools (`pg_replication_status` reading `wal_status`, `pg_top_queries` reading `*_exec_time`) rely on columns that landed in PG13. PG12 and below are out of upstream support and not exercised here.
 
 ### Connecting to managed Postgres (Supabase, Neon, RDS, etc.)
 

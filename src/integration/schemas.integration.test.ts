@@ -76,10 +76,11 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
   });
 
   describe("pg_describe_table", () => {
-    it("returns columns, PK, FKs, and indexes for posts", async () => {
+    it("returns kind, columns, PK, FKs, and indexes for posts", async () => {
       const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "posts" })) as {
         ok: boolean;
         data?: {
+          kind: string;
           columns: { name: string; type: string; nullable: boolean }[];
           primary_key: string[];
           foreign_keys: { columns: string[]; foreign_table: string; foreign_columns: string[] }[];
@@ -87,6 +88,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         };
       };
       assert.equal(res.ok, true);
+      assert.equal(res.data?.kind, "table");
       const colNames = res.data?.columns.map((c) => c.name).sort();
       assert.deepEqual(colNames, ["body", "id", "title", "user_id"]);
       assert.deepEqual(res.data?.primary_key, ["id"]);
@@ -95,6 +97,17 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.deepEqual(res.data?.foreign_keys[0].columns, ["user_id"]);
       assert.ok((res.data?.indexes ?? []).some((i) => i.is_primary));
       assert.ok((res.data?.indexes ?? []).some((i) => i.name === "posts_user_id_idx"));
+    });
+
+    it("reports kind=view for a view", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "user_post_counts" })) as {
+        ok: boolean;
+        data?: { kind: string; primary_key: string[]; foreign_keys: unknown[] };
+      };
+      assert.equal(res.ok, true);
+      assert.equal(res.data?.kind, "view");
+      assert.deepEqual(res.data?.primary_key, []);
+      assert.deepEqual(res.data?.foreign_keys, []);
     });
 
     it("handles quoted identifiers like 'Odd Table'", async () => {

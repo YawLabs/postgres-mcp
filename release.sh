@@ -153,11 +153,16 @@ else
   if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
     info "Tag v${VERSION} already exists"
   else
-    git tag "v${VERSION}"
+    # Annotated (-a) so --follow-tags below picks it up; lightweight tags are
+    # ignored by --follow-tags and would silently fail to publish.
+    git tag -a "v${VERSION}" -m "v${VERSION}"
     info "Tag v${VERSION} created"
   fi
 
-  git push origin main --tags
+  # --follow-tags pushes only annotated tags reachable from the pushed commits,
+  # not every local tag. Avoids accidentally publishing dangling experimental
+  # tags that happen to be lying around.
+  git push origin main --follow-tags
   info "Pushed to origin"
 fi
 
