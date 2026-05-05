@@ -9,7 +9,7 @@
 # If interrupted, re-run with the same version — each step is idempotent.
 #
 # Prerequisites:
-#   - Node.js 18+ and npm installed
+#   - Node.js 20+ and npm installed
 #   - npm authenticated (npm whoami) or NODE_AUTH_TOKEN set
 #   - gh CLI authenticated (or GITHUB_TOKEN set)
 # =============================================================================

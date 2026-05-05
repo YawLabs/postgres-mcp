@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-04
+
+### Changed
+- **BREAKING:** `engines.node` raised from `>=18` to `>=20`. The CI matrix
+  has been on `[20, 22]` since 0.4.1 and the integration + release jobs
+  ran exclusively on Node 20+, so Node 18 was effectively unsupported in
+  practice; this release makes the declared support match. esbuild
+  `target` and `release.sh` prerequisite comment updated to match.
+
 ## [0.4.1] - 2026-05-04
 
 ### Changed
