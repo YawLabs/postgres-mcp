@@ -241,6 +241,21 @@ async function runUserQueryBounded(
   }
 }
 
+// Type-name resolution is decorative: a failure here must not lose the user's
+// successful query result. Fall back to an empty map so fields still carry
+// dataTypeID, just without the human-readable dataTypeName.
+async function safeResolveTypeNames(
+  client: pg.PoolClient,
+  fields: { dataTypeID: number }[],
+): Promise<Record<number, string>> {
+  try {
+    return await resolveTypeNames(client, [...new Set(fields.map((f) => f.dataTypeID))]);
+  } catch (err) {
+    console.error(`[postgres-mcp] type-name resolution failed: ${err instanceof Error ? err.message : String(err)}`);
+    return {};
+  }
+}
+
 function toQueryResult(result: pg.QueryResult, maxRows: number, typeNames: Record<number, string> = {}): QueryResult {
   const truncated = result.rows.length > maxRows;
   const rows = truncated ? result.rows.slice(0, maxRows) : result.rows;
@@ -289,7 +304,7 @@ export async function runReadOnly(
     if (hooks.setup) await hooks.setup(client);
     const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
-    const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
+    const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
   } catch (err) {
     try {
@@ -324,7 +339,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
     await client.query("BEGIN");
     const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("COMMIT");
-    const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
+    const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
   } catch (err) {
     try {
@@ -363,7 +378,7 @@ export async function runReadWriteRollback(
     if (hooks.setup) await hooks.setup(client);
     const result = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
-    const typeNames = await resolveTypeNames(client, [...new Set(result.fields.map((f) => f.dataTypeID))]);
+    const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
   } catch (err) {
     try {

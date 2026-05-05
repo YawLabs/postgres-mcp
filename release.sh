@@ -121,7 +121,10 @@ info "Unit tests passed"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode -- integration matrix gated by integration.yml workflow, skipping local WSL run"
 elif command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\0' | grep -q Ubuntu; then
-  WSL_REPO="${SCRIPT_DIR/#\/c\//\/mnt\/c\/}"
+  # Translate a Git Bash drive-letter prefix (/c/, /d/, ...) into the WSL
+  # equivalent (/mnt/c/, /mnt/d/, ...). Hardcoding /c/ broke contributors
+  # working from any other drive.
+  WSL_REPO="$(echo "$SCRIPT_DIR" | sed -E 's|^/([a-z])/|/mnt/\1/|')"
   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root bash "${WSL_REPO}/scripts/wsl-test-matrix.sh" \
     || fail "Integration matrix failed against PG17/PG18 -- aborting release"
   info "Integration matrix passed (PG17 + PG18)"
