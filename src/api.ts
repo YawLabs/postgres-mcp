@@ -196,12 +196,20 @@ async function runUserQueryBounded(
   maxRows: number,
 ): Promise<pg.QueryResult> {
   await client.query("SAVEPOINT __pgmcp_sp");
+  // Track where in the pipeline we are. If DECLARE itself fails the user SQL
+  // has not executed yet, so falling through to a direct exec is safe -- it's
+  // either non-cursorable (DDL / DML-without-RETURNING / utility) and will
+  // succeed, or genuinely bad and will surface the same error. If DECLARE
+  // succeeded and a later step (FETCH / CLOSE / RELEASE) threw, the user SQL
+  // already ran; re-running it could double-execute side effects.
+  let declareSucceeded = false;
   try {
     await client.query({
       text: `DECLARE __pgmcp_cur NO SCROLL CURSOR FOR ${sql}`,
       values: params,
       queryMode: "extended",
     } as UserQueryConfig);
+    declareSucceeded = true;
     const fetched = await client.query(`FETCH ${maxRows + 1} FROM __pgmcp_cur`);
     try {
       await client.query("CLOSE __pgmcp_cur");
@@ -212,11 +220,17 @@ async function runUserQueryBounded(
     }
     await client.query("RELEASE SAVEPOINT __pgmcp_sp");
     return fetched;
-  } catch {
-    // Cursorable-or-not is decided at parse/plan time inside DECLARE.
-    // Fall back to a direct execute for the non-cursorable case (DDL,
-    // DML-without-RETURNING, utility commands). The savepoint rollback
-    // is what lets the outer transaction stay alive.
+  } catch (err) {
+    if (declareSucceeded) {
+      // FETCH / CLOSE / RELEASE failed -- the user SQL already executed
+      // inside the cursor. Re-throw so the outer transaction rolls back
+      // instead of silently re-executing the statement.
+      throw err;
+    }
+    // DECLARE failed before any user SQL ran. Roll back the savepoint and
+    // retry on the direct-exec path; postgres rejects DECLARE on DDL with
+    // 0A000 (feature_not_supported) and on DML-without-RETURNING with
+    // 42601 (parse error), so a single broad fallback covers both.
     await client.query("ROLLBACK TO SAVEPOINT __pgmcp_sp");
     await client.query("RELEASE SAVEPOINT __pgmcp_sp");
     return client.query({
@@ -384,6 +398,46 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
     return { ok: true, data: result.rows };
   } catch (err) {
     return { ok: false, error: formatPgError(err) };
+  }
+}
+
+/**
+ * Run multiple internal queries on a single shared connection. Use this in
+ * place of `Promise.all([runInternal(...), runInternal(...), ...])` whenever
+ * a handler issues 3+ catalog queries -- otherwise one tool call's fan-out
+ * can saturate the pool (default max 5) and starve concurrent calls. The
+ * client is shared, so queries inside the callback serialize naturally even
+ * when called via `Promise.all`.
+ *
+ * Behavior note: connect failures (pool exhausted, bad DATABASE_URL) propagate
+ * as exceptions out of this helper, whereas `runInternal` catches the same
+ * failures and returns `{ok: false}`. The MCP wrapper in index.ts handles
+ * both shapes, but don't assume drop-in equivalence between the two.
+ */
+export async function withSharedClient<T>(
+  fn: (
+    runOnClient: <R extends pg.QueryResultRow = pg.QueryResultRow>(
+      sql: string,
+      params?: unknown[],
+    ) => Promise<ApiResponse<R[]>>,
+  ) => Promise<T>,
+): Promise<T> {
+  const client = await getPool().connect();
+  try {
+    const runOnClient = async <R extends pg.QueryResultRow = pg.QueryResultRow>(
+      sql: string,
+      params: unknown[] = [],
+    ): Promise<ApiResponse<R[]>> => {
+      try {
+        const result = await client.query<R>(sql, params);
+        return { ok: true, data: result.rows };
+      } catch (err) {
+        return { ok: false, error: formatPgError(err) };
+      }
+    };
+    return await fn(runOnClient);
+  } finally {
+    client.release();
   }
 }
 

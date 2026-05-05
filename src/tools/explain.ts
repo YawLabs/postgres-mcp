@@ -26,12 +26,37 @@ function quoteIdent(name: string): string {
 }
 
 // Quote `schema.table` if dotted, else just `table`. Each piece quoted
-// independently so `public.users` -> `"public"."users"`.
+// independently so `public.users` -> `"public"."users"`. Names with literal
+// dots or pre-quoting are rejected upstream by validateHypoIndex; we never
+// reach this with adversarial input.
 function quoteQualifiedTable(name: string): string {
   return name
     .split(".")
     .map((p) => quoteIdent(p))
     .join(".");
+}
+
+/**
+ * Pre-flight check on hypothetical_indexes input. Catches pre-quoted names
+ * (`"odd.name"`, `weird"col`) before we open a DB connection, so the user
+ * gets a clear validation error instead of a confusing planner error or a
+ * mis-split on `.`. Returns null on success, or an error string on the
+ * first offending entry.
+ */
+function validateHypoIndex(idx: { table: string; columns: string[] }): string | null {
+  for (const piece of idx.table.split(".")) {
+    if (piece.includes('"')) {
+      // JSON.stringify the offending value so a name containing `"` renders
+      // unambiguously instead of producing a broken nested-quote message.
+      return `Hypothetical index table ${JSON.stringify(idx.table)} contains a double-quote; pass plain identifier names without pre-quoting.`;
+    }
+  }
+  for (const col of idx.columns) {
+    if (col.includes('"')) {
+      return `Hypothetical index column ${JSON.stringify(col)} contains a double-quote; pass plain identifier names without pre-quoting.`;
+    }
+  }
+  return null;
 }
 
 // Build setup/teardown hooks that create HypoPG hypothetical indexes inside
@@ -133,6 +158,16 @@ export const explainTools = [
       const explainSql = flags.length > 0 ? `EXPLAIN (${flags.join(", ")}) ${sql}` : `EXPLAIN ${sql}`;
 
       const hypoIndexes = hypothetical_indexes ?? [];
+
+      // Validate identifier shapes before anything else -- pre-quoted names
+      // (`"odd.name"`, `weird"col`) would split incorrectly on `.` or produce
+      // confusing planner errors. Faster to reject here than to round-trip
+      // a connection acquire and a CREATE INDEX failure.
+      for (const idx of hypoIndexes) {
+        const err = validateHypoIndex(idx);
+        if (err) return { ok: false, error: err };
+      }
+
       const hooks = hypoIndexes.length > 0 ? buildHypopgHooks(hypoIndexes) : {};
 
       // Verify HypoPG is installed before we even start the txn -- otherwise

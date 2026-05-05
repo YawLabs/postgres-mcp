@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isWritesAllowed, runInternal } from "../api.js";
+import { isWritesAllowed, runInternal, withSharedClient } from "../api.js";
 
 export const adminTools = [
   {
@@ -238,68 +238,71 @@ export const adminTools = [
     },
     inputSchema: z.object({}),
     handler: async () => {
-      const [slotsRes, replicasRes, walRes] = await Promise.all([
-        runInternal<{
-          slot_name: string;
-          slot_type: string;
-          active: boolean;
-          restart_lsn: string | null;
-          confirmed_flush_lsn: string | null;
-          wal_status: string | null;
-          database: string | null;
-          plugin: string | null;
-        }>(
-          `SELECT
-             slot_name, slot_type, active,
-             restart_lsn::text AS restart_lsn,
-             confirmed_flush_lsn::text AS confirmed_flush_lsn,
-             wal_status, database, plugin
-           FROM pg_catalog.pg_replication_slots
-           ORDER BY slot_name`,
-        ),
-        runInternal<{
-          application_name: string;
-          client_addr: string | null;
-          state: string;
-          sync_state: string;
-          write_lag_seconds: number | null;
-          flush_lag_seconds: number | null;
-          replay_lag_seconds: number | null;
-        }>(
-          `SELECT
-             application_name,
-             client_addr::text AS client_addr,
-             state,
-             sync_state,
-             EXTRACT(EPOCH FROM write_lag)::numeric(10, 2)::float8 AS write_lag_seconds,
-             EXTRACT(EPOCH FROM flush_lag)::numeric(10, 2)::float8 AS flush_lag_seconds,
-             EXTRACT(EPOCH FROM replay_lag)::numeric(10, 2)::float8 AS replay_lag_seconds
-           FROM pg_catalog.pg_stat_replication
-           ORDER BY application_name`,
-        ),
-        runInternal<{ is_in_recovery: boolean; wal_position: string | null }>(
-          `SELECT
-             pg_is_in_recovery() AS is_in_recovery,
-             CASE
-               WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()::text
-               ELSE pg_current_wal_lsn()::text
-             END AS wal_position`,
-        ),
-      ]);
+      // 3-way fanout sharing one connection -- see api.ts:withSharedClient.
+      return withSharedClient(async (run) => {
+        const [slotsRes, replicasRes, walRes] = await Promise.all([
+          run<{
+            slot_name: string;
+            slot_type: string;
+            active: boolean;
+            restart_lsn: string | null;
+            confirmed_flush_lsn: string | null;
+            wal_status: string | null;
+            database: string | null;
+            plugin: string | null;
+          }>(
+            `SELECT
+               slot_name, slot_type, active,
+               restart_lsn::text AS restart_lsn,
+               confirmed_flush_lsn::text AS confirmed_flush_lsn,
+               wal_status, database, plugin
+             FROM pg_catalog.pg_replication_slots
+             ORDER BY slot_name`,
+          ),
+          run<{
+            application_name: string;
+            client_addr: string | null;
+            state: string;
+            sync_state: string;
+            write_lag_seconds: number | null;
+            flush_lag_seconds: number | null;
+            replay_lag_seconds: number | null;
+          }>(
+            `SELECT
+               application_name,
+               client_addr::text AS client_addr,
+               state,
+               sync_state,
+               EXTRACT(EPOCH FROM write_lag)::numeric(10, 2)::float8 AS write_lag_seconds,
+               EXTRACT(EPOCH FROM flush_lag)::numeric(10, 2)::float8 AS flush_lag_seconds,
+               EXTRACT(EPOCH FROM replay_lag)::numeric(10, 2)::float8 AS replay_lag_seconds
+             FROM pg_catalog.pg_stat_replication
+             ORDER BY application_name`,
+          ),
+          run<{ is_in_recovery: boolean; wal_position: string | null }>(
+            `SELECT
+               pg_is_in_recovery() AS is_in_recovery,
+               CASE
+                 WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()::text
+                 ELSE pg_current_wal_lsn()::text
+               END AS wal_position`,
+          ),
+        ]);
 
-      if (!slotsRes.ok) return slotsRes;
-      if (!replicasRes.ok) return replicasRes;
-      if (!walRes.ok) return walRes;
+        if (!slotsRes.ok) return slotsRes;
+        if (!replicasRes.ok) return replicasRes;
+        if (!walRes.ok) return walRes;
 
-      return {
-        ok: true,
-        data: {
-          is_replica: walRes.data?.[0]?.is_in_recovery ?? false,
-          wal_position: walRes.data?.[0]?.wal_position ?? null,
-          slots: slotsRes.data ?? [],
-          replicas: replicasRes.data ?? [],
-        },
-      };
+        return {
+          ok: true,
+          data: {
+            is_replica: walRes.data?.[0]?.is_in_recovery ?? false,
+            wal_position: walRes.data?.[0]?.wal_position ?? null,
+            slots: slotsRes.data ?? [],
+            replicas: replicasRes.data ?? [],
+          },
+        };
+      });
     },
   },
 
@@ -342,76 +345,82 @@ export const adminTools = [
         limit: number;
       };
 
-      const [seqRes, noPkRes, rlsRes] = await Promise.all([
-        runInternal<{
-          schema: string;
-          sequence: string;
-          last_value: string;
-          max_value: string;
-          pct_used: number;
-        }>(
-          // pg_sequences was added in PG10. last_value can be NULL on a never-
-          // touched sequence; we filter those out (nothing to report yet).
-          `SELECT
-             schemaname AS schema,
-             sequencename AS sequence,
-             last_value::text AS last_value,
-             max_value::text AS max_value,
-             (last_value::float8 / NULLIF(max_value::float8, 0))::numeric(6, 4)::float8 AS pct_used
-           FROM pg_catalog.pg_sequences
-           WHERE last_value IS NOT NULL
-             AND max_value > 0
-             AND (last_value::float8 / max_value::float8) >= $1
-           ORDER BY pct_used DESC NULLS LAST
-           LIMIT $2`,
-          [seqExhaustionThreshold, limit],
-        ),
-        runInternal<{ schema: string; table: string }>(
-          `SELECT
-             n.nspname AS schema,
-             c.relname AS "table"
-           FROM pg_catalog.pg_class c
-           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-           WHERE c.relkind = 'r'
-             AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-             AND n.nspname NOT LIKE 'pg_%'
-             AND NOT EXISTS (
-               SELECT 1 FROM pg_catalog.pg_index i
-               WHERE i.indrelid = c.oid AND i.indisprimary
-             )
-           ORDER BY n.nspname, c.relname
-           LIMIT $1`,
-          [limit],
-        ),
-        runInternal<{ schema: string; table: string }>(
-          `SELECT
-             n.nspname AS schema,
-             c.relname AS "table"
-           FROM pg_catalog.pg_class c
-           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-           WHERE c.relkind IN ('r', 'p')
-             AND n.nspname = ANY($1)
-             AND NOT c.relrowsecurity
-           ORDER BY n.nspname, c.relname
-           LIMIT $2`,
-          [rlsSchemas, limit],
-        ),
-      ]);
+      // 3-way fanout sharing one connection -- see api.ts:withSharedClient.
+      return withSharedClient(async (run) => {
+        const [seqRes, noPkRes, rlsRes] = await Promise.all([
+          run<{
+            schema: string;
+            sequence: string;
+            last_value: string;
+            max_value: string;
+            pct_used: number;
+          }>(
+            // pg_sequences was added in PG10. last_value can be NULL on a never-
+            // touched sequence; we filter those out (nothing to report yet).
+            `SELECT
+               schemaname AS schema,
+               sequencename AS sequence,
+               last_value::text AS last_value,
+               max_value::text AS max_value,
+               (last_value::float8 / NULLIF(max_value::float8, 0))::numeric(6, 4)::float8 AS pct_used
+             FROM pg_catalog.pg_sequences
+             WHERE last_value IS NOT NULL
+               AND max_value > 0
+               AND (last_value::float8 / max_value::float8) >= $1
+             ORDER BY pct_used DESC NULLS LAST
+             LIMIT $2`,
+            [seqExhaustionThreshold, limit],
+          ),
+          run<{ schema: string; table: string }>(
+            // Declarative-partition children inherit the parent's primary key
+            // as an indisprimary index, so the NOT EXISTS clause already
+            // excludes them. Nothing extra needed for partitioned schemas.
+            `SELECT
+               n.nspname AS schema,
+               c.relname AS "table"
+             FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relkind = 'r'
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+               AND n.nspname NOT LIKE 'pg_%'
+               AND NOT EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_index i
+                 WHERE i.indrelid = c.oid AND i.indisprimary
+               )
+             ORDER BY n.nspname, c.relname
+             LIMIT $1`,
+            [limit],
+          ),
+          run<{ schema: string; table: string }>(
+            `SELECT
+               n.nspname AS schema,
+               c.relname AS "table"
+             FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relkind IN ('r', 'p')
+               AND n.nspname = ANY($1)
+               AND NOT c.relrowsecurity
+             ORDER BY n.nspname, c.relname
+             LIMIT $2`,
+            [rlsSchemas, limit],
+          ),
+        ]);
 
-      const warnings: string[] = [];
-      if (!seqRes.ok) warnings.push(`sequence_exhaustion fetch failed: ${seqRes.error}`);
-      if (!noPkRes.ok) warnings.push(`tables_without_primary_key fetch failed: ${noPkRes.error}`);
-      if (!rlsRes.ok) warnings.push(`public_tables_without_rls fetch failed: ${rlsRes.error}`);
+        const warnings: string[] = [];
+        if (!seqRes.ok) warnings.push(`sequence_exhaustion fetch failed: ${seqRes.error}`);
+        if (!noPkRes.ok) warnings.push(`tables_without_primary_key fetch failed: ${noPkRes.error}`);
+        if (!rlsRes.ok) warnings.push(`public_tables_without_rls fetch failed: ${rlsRes.error}`);
 
-      return {
-        ok: true,
-        data: {
-          sequence_exhaustion: seqRes.ok ? seqRes.data : [],
-          tables_without_primary_key: noPkRes.ok ? noPkRes.data : [],
-          public_tables_without_rls: rlsRes.ok ? rlsRes.data : [],
-          ...(warnings.length > 0 ? { _warnings: warnings } : {}),
-        },
-      };
+        return {
+          ok: true,
+          data: {
+            sequence_exhaustion: seqRes.ok ? seqRes.data : [],
+            tables_without_primary_key: noPkRes.ok ? noPkRes.data : [],
+            public_tables_without_rls: rlsRes.ok ? rlsRes.data : [],
+            ...(warnings.length > 0 ? { _warnings: warnings } : {}),
+          },
+        };
+      });
     },
   },
 

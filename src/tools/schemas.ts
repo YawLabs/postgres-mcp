@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { runInternal } from "../api.js";
+import { runInternal, withSharedClient } from "../api.js";
 
 // Postgres identifier max length is 63 bytes. Quoted identifiers (e.g. "My Table",
 // "weird-name") are legal, so no regex restriction — inputs are parameter-bound
@@ -276,58 +276,71 @@ export const schemaTools = [
         ORDER BY childn.nspname, child.relname
       `;
 
-      const [kindRes, cols, pk, fks, idxs, constraints, referencedBy, partitionParent, partitionChildren] =
-        await Promise.all([
-          runInternal<{ kind: string }>(kindQuery, [schema, table]),
-          runInternal(columnsQuery, [schema, table]),
-          runInternal<{ column_name: string }>(primaryKeyQuery, [schema, table]),
-          runInternal(foreignKeysQuery, [schema, table]),
-          runInternal(indexesQuery, [schema, table]),
-          runInternal(constraintsQuery, [schema, table]),
-          runInternal(referencedByQuery, [schema, table]),
-          runInternal<{ schema: string; table: string }>(partitionParentQuery, [schema, table]),
-          runInternal(partitionChildrenQuery, [schema, table]),
-        ]);
+      // 9-way fanout against pg_catalog. We share one connection so this
+      // single tool call cannot saturate the pool (default max 5) and starve
+      // a concurrent call. pg's PoolClient serializes queries internally, so
+      // `Promise.all` here serializes too -- the structure is preserved for
+      // readability, not for parallelism.
+      return withSharedClient(async (run) => {
+        const [kindRes, cols, pk, fks, idxs, constraints, referencedBy, partitionParent, partitionChildren] =
+          await Promise.all([
+            run<{ kind: string }>(kindQuery, [schema, table]),
+            run(columnsQuery, [schema, table]),
+            run<{ column_name: string }>(primaryKeyQuery, [schema, table]),
+            run(foreignKeysQuery, [schema, table]),
+            run(indexesQuery, [schema, table]),
+            run(constraintsQuery, [schema, table]),
+            run(referencedByQuery, [schema, table]),
+            run<{ schema: string; table: string }>(partitionParentQuery, [schema, table]),
+            run(partitionChildrenQuery, [schema, table]),
+          ]);
 
-      if (!cols.ok) return cols;
-      if (!cols.data || cols.data.length === 0) {
-        return { ok: false, error: `Table "${schema}"."${table}" not found.` };
-      }
-      const kind = kindRes.ok ? (kindRes.data?.[0]?.kind ?? "table") : "table";
+        if (!cols.ok) return cols;
+        if (!cols.data || cols.data.length === 0) {
+          // JSON.stringify each piece so a name containing `"` or other
+          // odd chars renders unambiguously rather than producing a broken
+          // `Table "evil"name"."x" not found` message.
+          return {
+            ok: false,
+            error: `Table ${JSON.stringify(schema)}.${JSON.stringify(table)} not found.`,
+          };
+        }
+        const kind = kindRes.ok ? (kindRes.data?.[0]?.kind ?? "table") : "table";
 
-      // Surface partial failures instead of collapsing them to empty arrays —
-      // an empty `foreign_keys` could mean "no FKs" or "fetch failed", and an
-      // LLM will treat the former and the latter identically without this hint.
-      const warnings: string[] = [];
-      if (!pk.ok) warnings.push(`primary_key fetch failed: ${pk.error}`);
-      if (!fks.ok) warnings.push(`foreign_keys fetch failed: ${fks.error}`);
-      if (!idxs.ok) warnings.push(`indexes fetch failed: ${idxs.error}`);
-      if (!constraints.ok) warnings.push(`constraints fetch failed: ${constraints.error}`);
-      if (!referencedBy.ok) warnings.push(`referenced_by fetch failed: ${referencedBy.error}`);
-      if (!partitionParent.ok) warnings.push(`partition_of fetch failed: ${partitionParent.error}`);
-      if (!partitionChildren.ok) warnings.push(`partitions fetch failed: ${partitionChildren.error}`);
+        // Surface partial failures instead of collapsing them to empty arrays --
+        // an empty `foreign_keys` could mean "no FKs" or "fetch failed", and an
+        // LLM will treat the former and the latter identically without this hint.
+        const warnings: string[] = [];
+        if (!pk.ok) warnings.push(`primary_key fetch failed: ${pk.error}`);
+        if (!fks.ok) warnings.push(`foreign_keys fetch failed: ${fks.error}`);
+        if (!idxs.ok) warnings.push(`indexes fetch failed: ${idxs.error}`);
+        if (!constraints.ok) warnings.push(`constraints fetch failed: ${constraints.error}`);
+        if (!referencedBy.ok) warnings.push(`referenced_by fetch failed: ${referencedBy.error}`);
+        if (!partitionParent.ok) warnings.push(`partition_of fetch failed: ${partitionParent.error}`);
+        if (!partitionChildren.ok) warnings.push(`partitions fetch failed: ${partitionChildren.error}`);
 
-      const parentRow = partitionParent.ok ? partitionParent.data?.[0] : undefined;
+        const parentRow = partitionParent.ok ? partitionParent.data?.[0] : undefined;
 
-      return {
-        ok: true,
-        data: {
-          schema,
-          table,
-          kind,
-          columns: cols.data,
-          primary_key: pk.ok ? (pk.data ?? []).map((r) => r.column_name) : [],
-          foreign_keys: fks.ok ? fks.data : [],
-          referenced_by: referencedBy.ok ? referencedBy.data : [],
-          constraints: constraints.ok ? constraints.data : [],
-          indexes: idxs.ok ? idxs.data : [],
-          ...(parentRow ? { partition_of: parentRow } : {}),
-          ...(partitionChildren.ok && (partitionChildren.data ?? []).length > 0
-            ? { partitions: partitionChildren.data }
-            : {}),
-          ...(warnings.length > 0 ? { _warnings: warnings } : {}),
-        },
-      };
+        return {
+          ok: true,
+          data: {
+            schema,
+            table,
+            kind,
+            columns: cols.data,
+            primary_key: pk.ok ? (pk.data ?? []).map((r) => r.column_name) : [],
+            foreign_keys: fks.ok ? fks.data : [],
+            referenced_by: referencedBy.ok ? referencedBy.data : [],
+            constraints: constraints.ok ? constraints.data : [],
+            indexes: idxs.ok ? idxs.data : [],
+            ...(parentRow ? { partition_of: parentRow } : {}),
+            ...(partitionChildren.ok && (partitionChildren.data ?? []).length > 0
+              ? { partitions: partitionChildren.data }
+              : {}),
+            ...(warnings.length > 0 ? { _warnings: warnings } : {}),
+          },
+        };
+      });
     },
   },
 

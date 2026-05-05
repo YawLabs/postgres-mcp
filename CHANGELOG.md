@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-04
+
+### Changed
+- Multi-query handlers (`pg_describe_table`, `pg_health`, `pg_advisor`,
+  `pg_replication_status`) now share a single connection across their
+  internal catalog fan-out via a new `withSharedClient` helper, so one
+  tool call's 3-9 query fan-out can no longer saturate the pool (default
+  max 5) and starve concurrent calls. Previously, a single
+  `pg_describe_table` issued 9 parallel `Promise.all` queries against the
+  pool; under concurrent load this could block other tool calls until
+  the describe drained.
+- `pg_top_queries` now returns `calls` and `rows` as text strings,
+  matching the bigint serialization of `pg_seq_scan_tables`,
+  `pg_unused_indexes`, and `pg_table_bloat`. Timing fields stay as JSON
+  numbers since they are inherently fractional milliseconds.
+
+### Fixed
+- `runUserQueryBounded` now distinguishes "DECLARE failed" (re-running
+  on the direct-exec path is safe -- the user SQL never executed) from
+  "FETCH/CLOSE/RELEASE failed" (re-running could double-execute side
+  effects). Previously, a transient FETCH-time failure on a
+  RETURNING-DML statement would silently re-run the mutation.
+- `pg_top_queries` `orderBy: "calls"` now sorts numerically rather than
+  lexically. The 0.4.1 change to return `calls` as `text` shadowed the
+  source bigint column with a text output alias in the ORDER BY, so
+  "9" beat "10". The fix qualifies the ORDER BY expression with the
+  source table. Caught in the post-implementation review before tagging.
+- `pg_describe_table` "not found" error message now escapes user-supplied
+  schema/table names via `JSON.stringify`, so a name containing `"` no
+  longer renders as broken-looking nested quotes.
+- `pg_explain` `hypothetical_indexes` now pre-flight rejects pre-quoted
+  identifiers (`"odd.name"`, `weird"col`) with a clear validation error
+  before opening a database connection, instead of producing a confusing
+  planner error after the fact.
+
+### Added
+- New CI release plumbing mirroring `@yawlabs/tailscale-mcp`:
+  `.github/workflows/ci.yml` (lint + build + test on push/PR across
+  Node 18/20/22), `.github/workflows/integration.yml` (PG17 + PG18
+  service-container matrix, scheduled nightly + on-demand), and
+  `.github/workflows/release.yml` (tag-pushes-trigger-publish gated
+  on integration). `npm publish` now runs in CI with `--provenance`
+  via the org-level `NPM_TOKEN`; `release.sh` retains a local-dev
+  path that runs the WSL integration matrix as a pre-flight when
+  cutting a release from a workstation.
+- New regression tests:
+  - `compareVersions` unit tests covering pre-release tags,
+    missing/longer segments, and the actual `1.8` boundary used by
+    `pg_top_queries`.
+  - Integration guard that partition children inheriting a parent's
+    primary key are correctly excluded from `pg_advisor`'s
+    `tables_without_primary_key` list.
+  - Integration coverage for the cursor-fallback path on both DDL
+    (`CREATE TABLE`) and DML-without-RETURNING (`INSERT`).
+
 ## [0.4.0] - 2026-04-25
 
 ### Security

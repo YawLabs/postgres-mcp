@@ -138,6 +138,14 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "no_pk_table"),
         `expected no_pk_table in tables_without_primary_key, got ${JSON.stringify(noPk)}`,
       );
+      // events_2026 is a partition child of `events` (which has a PK on
+      // (id, occurred_at)); the inherited PK index has indisprimary=true on
+      // the child, so the no-PK query's NOT EXISTS clause must filter it out.
+      // Regression guard against a future schema change that breaks this.
+      assert.ok(
+        !noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "events_2026"),
+        `events_2026 inherits a PK from events; should not appear, got ${JSON.stringify(noPk)}`,
+      );
       assert.ok(Array.isArray(res.data?.sequence_exhaustion));
       assert.ok(Array.isArray(res.data?.public_tables_without_rls));
     });

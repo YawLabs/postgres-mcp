@@ -1,0 +1,78 @@
+name: Integration Tests
+
+# Runs the integration test suite (src/integration/*.integration.test.ts)
+# against a real Postgres service container. Triggers:
+#   - schedule: nightly at 06:23 UTC
+#   - workflow_call: invoked by release.yml on every tag push, gating publish
+#   - workflow_dispatch: manual trigger
+#
+# Mirrors the local WSL matrix in scripts/wsl-test-matrix.sh -- runs against
+# PG17 and PG18 in parallel. The integration suite's HypoPG-positive test
+# self-skips when the extension is absent (PGDG ships HypoPG separately
+# and it's not in the official postgres image), so this CI path exercises
+# the negative branch; the local WSL matrix covers the positive branch.
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Enable pg_stat_statements
+        # pg_stat_statements requires shared_preload_libraries set BEFORE
+        # postgres starts. ALTER SYSTEM persists the GUC; the container
+        # restart picks it up. Done as a one-shot step so the integration
+        # tests can exercise pg_top_queries' positive path.
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements'"
+          CID=$(docker ps -q --filter "ancestor=postgres:${{ matrix.pg }}" | head -1)
+          if [ -z "$CID" ]; then
+            echo "::error::could not locate postgres service container"
+            exit 1
+          fi
+          docker restart "$CID"
+          for i in $(seq 1 30); do
+            if PGPASSWORD=postgres psql -h localhost -U postgres -c 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+
+      - name: Run integration tests
+        env:
+          POSTGRES_MCP_INTEGRATION: "1"
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: npm run test:integration

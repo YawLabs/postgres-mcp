@@ -113,7 +113,14 @@ info "Unit tests passed"
 # Integration matrix against PG17 + PG18, run inside WSL Ubuntu (Windows-only
 # until the matrix runner is portable to native Linux/Mac). Aborts the release
 # on failure -- it's the only place the matrix has a real consumer.
-if command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\0' | grep -q Ubuntu; then
+#
+# In CI, this step is intentionally skipped: the github-actions release.yml
+# workflow gates the publish on integration.yml (PG17/18 service containers)
+# completing successfully, so we don't need a redundant local-equivalent run
+# inside the runner.
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode -- integration matrix gated by integration.yml workflow, skipping local WSL run"
+elif command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\0' | grep -q Ubuntu; then
   WSL_REPO="${SCRIPT_DIR/#\/c\//\/mnt\/c\/}"
   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root bash "${WSL_REPO}/scripts/wsl-test-matrix.sh" \
     || fail "Integration matrix failed against PG17/PG18 -- aborting release"

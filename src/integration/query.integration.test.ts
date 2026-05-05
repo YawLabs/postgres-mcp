@@ -107,6 +107,48 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /syntax|42601/i);
     });
 
+    it("non-cursorable DDL falls back to direct exec from the DECLARE-failure path", async () => {
+      // DECLARE rejects DDL (feature_not_supported, 0A000) and DML-without-
+      // RETURNING (parse error, 42601). The runUserQueryBounded catch must
+      // distinguish these "DECLARE failed" cases (safe to re-run) from a
+      // FETCH-time failure (re-running could double-execute side effects).
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        const create = (await pgQuery.handler({
+          sql: `CREATE TABLE ${FIXTURE_SCHEMA}.cursor_fallback_canary (id INT)`,
+        })) as { ok: boolean; error?: string };
+        assert.equal(create.ok, true, `expected DDL to succeed via fallback, got error: ${create.error}`);
+        // Tidy up so re-runs of the matrix stay green.
+        await pgQuery.handler({ sql: `DROP TABLE ${FIXTURE_SCHEMA}.cursor_fallback_canary` });
+
+        // DML without RETURNING -- DECLARE fails with 42601, fallback runs
+        // the INSERT directly. Two-row count survives the round-trip.
+        const insert = (await pgQuery.handler({
+          sql: `INSERT INTO ${FIXTURE_SCHEMA}.posts (user_id, title) VALUES (1, 'fallback-canary')`,
+        })) as { ok: boolean; data?: { rowCount: number | null } };
+        assert.equal(insert.ok, true);
+        assert.equal(insert.data?.rowCount, 1);
+        await pgQuery.handler({
+          sql: `DELETE FROM ${FIXTURE_SCHEMA}.posts WHERE title = 'fallback-canary'`,
+        });
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
+    });
+
+    it("a bad reference in user SQL surfaces postgres's error message", async () => {
+      // A reference to a non-existent table fails DECLARE with SQLSTATE 42P01.
+      // The fallback re-runs the SELECT directly, which surfaces the same
+      // 42P01 -- safe because DECLARE never executed the user SQL.
+      const res = (await pgQuery.handler({
+        sql: `SELECT * FROM ${FIXTURE_SCHEMA}.does_not_exist_at_all`,
+      })) as { ok: boolean; error?: string };
+      assert.equal(res.ok, false);
+      assert.match(res.error ?? "", /does_not_exist_at_all|42P01|relation/i);
+    });
+
     it("rejects $1 reference when no params array is passed", async () => {
       const res = (await pgQuery.handler({
         sql: `SELECT email FROM ${FIXTURE_SCHEMA}.users WHERE id = $1`,

@@ -60,29 +60,37 @@ export const statsTools = [
       const minCol = useExecSuffix ? "min_exec_time" : "min_time";
       const maxCol = useExecSuffix ? "max_exec_time" : "max_time";
 
-      const orderCol = orderBy === "total_time" ? totalCol : orderBy === "mean_time" ? meanCol : "calls";
+      // The ORDER BY expression has to dodge an alias-shadowing trap: the
+      // SELECT below aliases `calls::text AS calls`, and postgres resolves
+      // `ORDER BY calls` to the output alias FIRST. Sorting text would mean
+      // "9" beats "10" lexically. Qualify with the table name so postgres
+      // routes to the source bigint column. The timing columns aren't aliased
+      // back to themselves (they become *_ms), so they need no qualification.
+      const orderCol =
+        orderBy === "total_time" ? totalCol : orderBy === "mean_time" ? meanCol : "pg_stat_statements.calls";
 
       return runInternal<{
         query: string;
-        calls: number;
+        calls: string;
         total_time_ms: number;
         mean_time_ms: number;
         min_time_ms: number;
         max_time_ms: number;
-        rows: number;
+        rows: string;
         hit_percent: number | null;
       }>(
-        // calls and rows are bigint counters; cast to float8 so node-pg returns
-        // them as JS numbers (matches the timing fields). Precision is fine --
-        // 2^53 is ~9e15, well above any realistic call/row count.
+        // bigint counters (calls, rows) come back as `.text` for lossless
+        // serialization, matching pg_seq_scan_tables / pg_unused_indexes /
+        // pg_table_bloat. Timing fields stay as float8 because they are
+        // inherently fractional milliseconds.
         `SELECT
            query,
-           calls::float8 AS calls,
+           calls::text AS calls,
            ${totalCol}::numeric(18, 2)::float8 AS total_time_ms,
            ${meanCol}::numeric(18, 2)::float8 AS mean_time_ms,
            ${minCol}::numeric(18, 2)::float8 AS min_time_ms,
            ${maxCol}::numeric(18, 2)::float8 AS max_time_ms,
-           rows::float8 AS rows,
+           rows::text AS rows,
            CASE
              WHEN (shared_blks_hit + shared_blks_read) > 0
              THEN (shared_blks_hit::float8 / (shared_blks_hit + shared_blks_read) * 100)::numeric(5, 2)::float8
@@ -219,8 +227,24 @@ export const statsTools = [
   },
 ] as const;
 
-function compareVersions(a: string, b: string): number {
-  const parse = (v: string) => v.split(".").map((n) => Number.parseInt(n, 10) || 0);
+/**
+ * Compare semver-like version strings. Returns negative, zero, or positive
+ * for `a < b`, `a === b`, `a > b`. Exported for unit testing.
+ *
+ * Handles common pg-extension version oddities:
+ *   - missing segments (`1.8` vs `1.8.0` -> 0)
+ *   - longer suffixes (`1.7.99` vs `1.8` -> negative)
+ *   - pre-release tags (`1.10-beta` parses leading digits per segment, so
+ *     `1.10-beta` vs `1.8` -> positive, matching numeric intent)
+ */
+export function compareVersions(a: string, b: string): number {
+  const parse = (v: string) =>
+    v.split(".").map((seg) => {
+      // Pull the leading run of digits from each segment so trailing tags
+      // like `-beta`, `rc1`, `dev` don't poison the comparison with NaN.
+      const m = seg.match(/^\d+/);
+      return m ? Number.parseInt(m[0], 10) : 0;
+    });
   const aa = parse(a);
   const bb = parse(b);
   const len = Math.max(aa.length, bb.length);
