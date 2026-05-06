@@ -181,7 +181,7 @@ fi
 # =============================================================================
 step 5 "Publish to npm"
 
-PUBLISHED_VERSION=$(npm view @yawlabs/postgres-mcp version 2>/dev/null || echo "")
+PUBLISHED_VERSION=$(npm view "@yawlabs/postgres-mcp@${VERSION}" version 2>/dev/null || echo "")
 
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm — skipping"
@@ -222,7 +222,7 @@ step 7 "Verify"
 
 sleep 3
 
-NPM_VERSION=$(npm view @yawlabs/postgres-mcp version 2>/dev/null || echo "")
+NPM_VERSION=$(npm view "@yawlabs/postgres-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "npm: @yawlabs/postgres-mcp@${NPM_VERSION}"
 else
