@@ -24,7 +24,10 @@ if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
 fi
 apt-get update -qq
 
-# Purge the Ubuntu-default PG16 if present so port 5432 is free for PG17.
+# DEV/CI ONLY: this WSL setup script is purpose-built for the integration test
+# matrix. Purges the Ubuntu-default PG16 if present so port 5432 is free for
+# PG17. Do NOT run this on a host that uses PG16 for anything you care about --
+# the apt purge takes the cluster, its config, and /var/lib/postgresql/16 with it.
 if dpkg -l | grep -q '^ii  postgresql-16 '; then
   service postgresql stop || true
   DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq postgresql-16 postgresql-contrib-16
@@ -56,6 +59,9 @@ for V in "${PG_VERSIONS[@]}"; do
   PGCONF=/etc/postgresql/${V}/main/postgresql.conf
   HBACONF=/etc/postgresql/${V}/main/pg_hba.conf
 
+  # DEV/CI ONLY: bind to all interfaces and accept md5 password auth from any
+  # source. Safe inside WSL (the network namespace is host-local) but lethal as
+  # a production template -- do not copy this stanza outside this matrix script.
   sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" "$PGCONF"
   grep -q '0.0.0.0/0' "$HBACONF" || echo 'host all all 0.0.0.0/0 md5' >> "$HBACONF"
 

@@ -357,16 +357,19 @@ export const adminTools = [
           }>(
             // pg_sequences was added in PG10. last_value can be NULL on a never-
             // touched sequence; we filter those out (nothing to report yet).
+            // Divide in `numeric`, not `float8`: BIGINT sequences past 2^53 lose
+            // precision in float8, and the danger zone (>= threshold) is exactly
+            // where the reported pct_used must stay accurate.
             `SELECT
                schemaname AS schema,
                sequencename AS sequence,
                last_value::text AS last_value,
                max_value::text AS max_value,
-               (last_value::float8 / NULLIF(max_value::float8, 0))::numeric(6, 4)::float8 AS pct_used
+               (last_value::numeric / NULLIF(max_value::numeric, 0))::numeric(6, 4)::float8 AS pct_used
              FROM pg_catalog.pg_sequences
              WHERE last_value IS NOT NULL
                AND max_value > 0
-               AND (last_value::float8 / max_value::float8) >= $1
+               AND (last_value::numeric / max_value::numeric) >= $1
              ORDER BY pct_used DESC NULLS LAST
              LIMIT $2`,
             [seqExhaustionThreshold, limit],

@@ -299,6 +299,28 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /HypoPG|CREATE EXTENSION hypopg/i);
     });
 
+    it("hypothetical_indexes defaults using=btree when the field is omitted", async () => {
+      // Regression test: a unit-test-style direct handler call bypasses the
+      // MCP framework's Zod parse, so `using` arrives as undefined. The
+      // defensive default in buildHypopgHooks must turn that back into "btree"
+      // -- otherwise the generated SQL is `USING undefined` and hypopg returns
+      // a confusing syntax error.
+      const check = (await runInternal<{ installed: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
+      )) as { ok: boolean; data?: { installed: boolean }[] };
+      const installed = check.ok && check.data?.[0]?.installed === true;
+      if (!installed) return; // negative-path test already covers the absent case
+
+      const res = (await pgExplain.handler({
+        sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE body = 'world'`,
+        analyze: false,
+        format: "text",
+        hypothetical_indexes: [{ table: `${FIXTURE_SCHEMA}.posts`, columns: ["body"] }],
+      })) as { ok: boolean; data?: { plan: string }; error?: string };
+      assert.equal(res.ok, true, `expected ok with omitted using, got error: ${res.error}`);
+      assert.match(res.data?.plan ?? "", /Index|Bitmap/i);
+    });
+
     it("hypothetical_indexes flips a seq scan to an index scan when HypoPG is installed", async () => {
       const check = (await runInternal<{ installed: boolean }>(
         `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,

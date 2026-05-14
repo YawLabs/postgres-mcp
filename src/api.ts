@@ -87,6 +87,17 @@ export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
   return undefined;
 }
 
+/**
+ * Returns the singleton pool, creating it on first call.
+ *
+ * Env-var snapshot semantics: every option below is read ONCE, when the pool
+ * is constructed. Changing `DATABASE_URL`, `POSTGRES_STATEMENT_TIMEOUT_MS`,
+ * `POSTGRES_CONNECTION_TIMEOUT_MS`, `POSTGRES_POOL_MAX`, or
+ * `POSTGRES_SSL_REJECT_UNAUTHORIZED` after the first tool call has no effect
+ * until `shutdown()` runs and a subsequent call rebuilds the pool. The values
+ * that ARE re-read per request live on `getMaxRows()` and `isWritesAllowed()`,
+ * which are invoked inside the request path.
+ */
 export function getPool(): pg.Pool {
   if (pool) return pool;
   const ssl = getSslConfig();
@@ -120,6 +131,13 @@ export interface QueryResult {
 // pg_type oid -> typname. Bootstrapped on first user query, then miss-filled
 // for any new oid (e.g. a CREATE TYPE during the session). Cleared on
 // shutdown(). The cache is small (a few hundred rows on a stock cluster).
+//
+// Staleness: postgres only reuses a pg_type oid after the cluster-wide 32-bit
+// OID counter wraps -- billions of catalog inserts. A DROP TYPE / CREATE TYPE
+// with the same name within a session gets a NEW oid, which the miss-fill path
+// picks up. The stale entry under the old oid stays in the map until shutdown
+// but is never read back (no result row references the dead oid), so it's
+// wasted memory, not a correctness bug.
 let typeNameCache: Map<number, string> | null = null;
 
 async function resolveTypeNames(client: pg.PoolClient, oids: number[]): Promise<Record<number, string>> {

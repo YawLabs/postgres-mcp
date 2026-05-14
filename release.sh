@@ -220,9 +220,18 @@ fi
 # =============================================================================
 step 7 "Verify"
 
-sleep 3
+# Registry propagation can lag a few seconds after publish succeeds. Mirror the
+# CI smoke-test retry loop in release.yml (five attempts, 5s apart) instead of
+# a single sleep-then-check that flakes on a slow registry.
+NPM_VERSION=""
+for i in 1 2 3 4 5; do
+  NPM_VERSION=$(npm view "@yawlabs/postgres-mcp@${VERSION}" version 2>/dev/null || echo "")
+  if [ "$NPM_VERSION" = "$VERSION" ]; then
+    break
+  fi
+  sleep 5
+done
 
-NPM_VERSION=$(npm view "@yawlabs/postgres-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "npm: @yawlabs/postgres-mcp@${NPM_VERSION}"
 else

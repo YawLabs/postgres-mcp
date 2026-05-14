@@ -64,7 +64,7 @@ function validateHypoIndex(idx: { table: string; columns: string[] }): string | 
 // are session-scoped (not transaction-scoped), so the teardown is essential
 // even though the transaction is going to ROLLBACK -- otherwise indexes
 // from one call leak into the next.
-function buildHypopgHooks(indexes: { table: string; columns: string[]; using: string }[]): {
+function buildHypopgHooks(indexes: { table: string; columns: string[]; using?: string }[]): {
   setup: (client: import("pg").PoolClient) => Promise<void>;
   teardown: (c: import("pg").PoolClient) => Promise<void>;
 } {
@@ -73,12 +73,17 @@ function buildHypopgHooks(indexes: { table: string; columns: string[]; using: st
       for (const idx of indexes) {
         const cols = idx.columns.map(quoteIdent).join(", ");
         const tbl = quoteQualifiedTable(idx.table);
+        // `using` has a Zod default of "btree", but unit tests that call the
+        // handler directly bypass Zod -- so re-apply the default here. Without
+        // this guard, an omitted `using` would render as `USING undefined` and
+        // hypopg_create_index would surface a confusing syntax error.
+        const using = idx.using ?? "btree";
         // The CREATE INDEX text is passed as a parameter to hypopg_create_index;
         // identifiers inside the text are double-quoted by us so the function
         // parses them as already-quoted ident tokens. The whole call still uses
         // the extended query protocol (queryMode default for runInternal-style),
         // so multi-statement injection is impossible.
-        const createSql = `CREATE INDEX ON ${tbl} USING ${idx.using} (${cols})`;
+        const createSql = `CREATE INDEX ON ${tbl} USING ${using} (${cols})`;
         const r = await client.query<{ indexname: string | null }>(
           "SELECT (hypopg_create_index($1)).indexname AS indexname",
           [createSql],
@@ -137,7 +142,7 @@ export const explainTools = [
         analyze: boolean;
         format: "text" | "json";
         params?: unknown[];
-        hypothetical_indexes?: { table: string; columns: string[]; using: string }[];
+        hypothetical_indexes?: { table: string; columns: string[]; using?: string }[];
       };
 
       // LLMs often pass pre-wrapped SQL like "EXPLAIN ANALYZE SELECT ..." which

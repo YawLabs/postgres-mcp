@@ -311,6 +311,10 @@ export const schemaTools = [
         // an empty `foreign_keys` could mean "no FKs" or "fetch failed", and an
         // LLM will treat the former and the latter identically without this hint.
         const warnings: string[] = [];
+        // `kind` is reported as a top-level field, so a silent default to
+        // "table" would mislabel a view or materialized view. Emit a warning
+        // when the fetch failed so the caller sees the kind isn't trustworthy.
+        if (!kindRes.ok) warnings.push(`kind fetch failed, reported as "table": ${kindRes.error}`);
         if (!pk.ok) warnings.push(`primary_key fetch failed: ${pk.error}`);
         if (!fks.ok) warnings.push(`foreign_keys fetch failed: ${fks.error}`);
         if (!idxs.ok) warnings.push(`indexes fetch failed: ${idxs.error}`);
