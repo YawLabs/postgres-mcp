@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# Release Script — Build, tag, publish to npm, create GitHub release
+# Release Script - Build, tag, publish to npm, create GitHub release
 # =============================================================================
 # Usage:
-#   ./release.sh <new-version>    — full release from local machine
-#   ./release.sh                  — CI mode (derives version from git tag)
+#   ./release.sh <new-version>    - full release from local machine
+#   ./release.sh                  - CI mode (derives version from git tag)
 #
-# If interrupted, re-run with the same version — each step is idempotent.
+# If interrupted, re-run with the same version - each step is idempotent.
 #
 # Prerequisites:
 #   - Node.js 20+ and npm installed
@@ -38,7 +38,7 @@ IS_CI="${CI:-false}"
 if [ -z "$VERSION" ]; then
   if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
     VERSION="${GITHUB_REF_NAME#v}"
-    info "CI mode — version $VERSION from tag $GITHUB_REF_NAME"
+    info "CI mode - version $VERSION from tag $GITHUB_REF_NAME"
   else
     echo "Usage: ./release.sh <version>"
     echo "  e.g. ./release.sh 0.1.0"
@@ -64,7 +64,7 @@ RESUMING=false
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   RESUMING=true
-  info "Already at v${VERSION} — resuming"
+  info "Already at v${VERSION} - resuming"
 else
   if [ "$IS_CI" != "true" ]; then
     if [ -n "$(git status --porcelain)" ]; then
@@ -138,7 +138,7 @@ fi
 step 3 "Bump version to $VERSION"
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
-  info "Already at v${VERSION} — skipping"
+  info "Already at v${VERSION} - skipping"
 else
   npm version "$VERSION" --no-git-tag-version
   info "Version bumped"
@@ -150,7 +150,7 @@ fi
 step 4 "Commit, tag, and push"
 
 if [ "$IS_CI" = "true" ]; then
-  info "CI mode — skipping commit/tag/push (already tagged)"
+  info "CI mode - skipping commit/tag/push (already tagged)"
 else
   if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
     git add package.json package-lock.json
@@ -184,7 +184,7 @@ step 5 "Publish to npm"
 PUBLISHED_VERSION=$(npm view "@yawlabs/postgres-mcp@${VERSION}" version 2>/dev/null || echo "")
 
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
-  info "v${VERSION} already published on npm — skipping"
+  info "v${VERSION} already published on npm - skipping"
 else
   if [ "$IS_CI" = "true" ]; then
     npm publish --access public --provenance
@@ -200,7 +200,7 @@ fi
 step 6 "Create GitHub release"
 
 if gh release view "v${VERSION}" >/dev/null 2>&1; then
-  info "GitHub release v${VERSION} already exists — skipping"
+  info "GitHub release v${VERSION} already exists - skipping"
 else
   PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^v${VERSION}$" | tail -1)
   if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "v${VERSION}" ]; then
@@ -235,7 +235,7 @@ done
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "npm: @yawlabs/postgres-mcp@${NPM_VERSION}"
 else
-  warn "npm shows ${NPM_VERSION:-nothing} (expected $VERSION — may still be propagating)"
+  warn "npm shows ${NPM_VERSION:-nothing} (expected $VERSION - may still be propagating)"
 fi
 
 PKG_VERSION=$(node -p "require('./package.json').version")

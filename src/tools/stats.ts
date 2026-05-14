@@ -29,7 +29,7 @@ export const statsTools = [
     handler: async (input: unknown) => {
       const { orderBy, limit } = input as { orderBy: "total_time" | "mean_time" | "calls"; limit: number };
 
-      // First check the extension is present — without it the query below fails
+      // First check the extension is present - without it the query below fails
       // with a confusing "relation does not exist" error.
       const check = await runInternal<{ installed: boolean }>(
         `SELECT EXISTS (
@@ -107,7 +107,7 @@ export const statsTools = [
   {
     name: "pg_seq_scan_tables",
     description:
-      "Tables with high sequential-scan counts relative to index scans — the first place to " +
+      "Tables with high sequential-scan counts relative to index scans - the first place to " +
       "look for missing-index candidates. Returns seq_scans, idx_scans, live tuples, and the " +
       "ratio. A high ratio on a large table usually means a query is reading the whole table " +
       "where an index would suffice. Pair with `pg_top_queries` to find which query is doing it.",
@@ -171,7 +171,7 @@ export const statsTools = [
       "Indexes that have never been scanned or have very low usage. Each unused index costs " +
       "write amplification (every INSERT/UPDATE maintains it) and disk space. Excludes primary " +
       "keys and unique constraints (which are load-bearing even with zero scans). Use this " +
-      "before adding new indexes — sometimes the fix is to drop a dead one.",
+      "before adding new indexes - sometimes the fix is to drop a dead one.",
     annotations: {
       title: "Find unused indexes",
       readOnlyHint: true,

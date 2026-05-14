@@ -7,7 +7,7 @@ export const adminTools = [
     description:
       "Show current lock contention: which sessions are blocked and who is blocking them. " +
       "Returns blocked PID, blocking PID, lock types, relation being contested, and the queries " +
-      "involved. Use this first when a tool call hangs or the app feels stuck — it's the fastest " +
+      "involved. Use this first when a tool call hangs or the app feels stuck - it's the fastest " +
       "way to identify a long-held transaction holding a lock.",
     annotations: {
       title: "Inspect blocking locks",
@@ -87,7 +87,7 @@ export const adminTools = [
     handler: async (input: unknown) => {
       const { includeSystem } = input as { includeSystem: boolean };
       // `starts_with` (pg 11+) is cleaner than LIKE for a literal-underscore
-      // prefix match — LIKE requires escaping _ and the escape clause itself
+      // prefix match - LIKE requires escaping _ and the escape clause itself
       // needs careful backslash handling through JS -> SQL.
       const filter = includeSystem ? "" : "WHERE NOT starts_with(r.rolname, 'pg_')";
       return runInternal<{
@@ -178,7 +178,7 @@ export const adminTools = [
       "Cancel a running query (SIGINT-equivalent) or terminate a backend connection (SIGTERM-" +
       "equivalent) by PID. Find the PID via `pg_health` active_queries or `pg_inspect_locks`. " +
       "Requires ALLOW_WRITES=1 since this changes database session state. The role in " +
-      "DATABASE_URL must have permission — cancelling another user's query needs the " +
+      "DATABASE_URL must have permission - cancelling another user's query needs the " +
       "`pg_signal_backend` role or superuser. Cancel is graceful; terminate is forceful.",
     annotations: {
       title: "Cancel or terminate a backend",
@@ -216,7 +216,7 @@ export const adminTools = [
           signaled,
           note: signaled
             ? `Sent ${mode === "terminate" ? "SIGTERM" : "SIGINT"} to backend ${pid}.`
-            : `Signal returned false — PID ${pid} may not exist, may already be gone, or the current role lacks permission.`,
+            : `Signal returned false - PID ${pid} may not exist, may already be gone, or the current role lacks permission.`,
         },
       };
     },
@@ -433,7 +433,7 @@ export const adminTools = [
       "Estimate table bloat (dead tuples + free space) for tables in a schema. Returns live " +
       "tuples, dead tuples, dead-tuple ratio, last_vacuum / last_autovacuum timestamps, and " +
       "total relation size. A high dead_ratio with a stale last_autovacuum is a sign a table " +
-      "needs VACUUM. Cheap — uses `pg_stat_user_tables`, no extensions required.",
+      "needs VACUUM. Cheap - uses `pg_stat_user_tables`, no extensions required.",
     annotations: {
       title: "Estimate table bloat",
       readOnlyHint: true,
@@ -453,7 +453,7 @@ export const adminTools = [
         .min(0)
         .max(1)
         .default(0.1)
-        .describe("Minimum dead-tuple fraction to include — dead / (live + dead). Default 0.1 = 10%."),
+        .describe("Minimum dead-tuple fraction to include - dead / (live + dead). Default 0.1 = 10%."),
       limit: z.number().int().min(1).max(200).default(50).describe("Max rows to return (default 50)."),
     }),
     handler: async (input: unknown) => {

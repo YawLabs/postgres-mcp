@@ -12,7 +12,7 @@ const advisor = adminTools.find((t) => t.name === "pg_advisor")!;
 const seqScanTables = statsTools.find((t) => t.name === "pg_seq_scan_tables")!;
 const unusedIndexes = statsTools.find((t) => t.name === "pg_unused_indexes")!;
 
-// One setup/teardown for the whole file — every describe below shares the
+// One setup/teardown for the whole file - every describe below shares the
 // same fixture schema, so running DROP/CREATE per-describe is wasted work.
 describe("integration: admin + stats tools", { skip: !integrationEnabled() }, () => {
   before(setupFixtures);
@@ -171,7 +171,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       };
       assert.equal(res.ok, true);
       assert.ok(Array.isArray(res.data));
-      // posts_user_id_idx is a non-unique, non-primary index — should be eligible
+      // posts_user_id_idx is a non-unique, non-primary index - should be eligible
       // to appear at some maxScans threshold.
     });
   });

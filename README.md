@@ -3,37 +3,37 @@
 [![npm version](https://img.shields.io/npm/v/@yawlabs/postgres-mcp)](https://www.npmjs.com/package/@yawlabs/postgres-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**Query a PostgreSQL database from Claude Code, Cursor, and any MCP client.** Read-only by default — writes opt in via a single env var — so an agent can't silently drop your tables.
+**Query a PostgreSQL database from Claude Code, Cursor, and any MCP client.** Read-only by default - writes opt in via a single env var - so an agent can't silently drop your tables.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
 ## Backstory
 
-Anthropic's reference Postgres MCP server, `@modelcontextprotocol/server-postgres`, was [archived in May 2025](https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres) and [marked deprecated on npm](https://www.npmjs.com/package/@modelcontextprotocol/server-postgres) in July 2025. Anthropic has not shipped a replacement. Despite the deprecation, the last published version (v0.6.2) is still pulled ~20,000 times per week — a lot of agents are pointed at an unmaintained package.
+Anthropic's reference Postgres MCP server, `@modelcontextprotocol/server-postgres`, was [archived in May 2025](https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres) and [marked deprecated on npm](https://www.npmjs.com/package/@modelcontextprotocol/server-postgres) in July 2025. Anthropic has not shipped a replacement. Despite the deprecation, the last published version (v0.6.2) is still pulled ~20,000 times per week - a lot of agents are pointed at an unmaintained package.
 
 That unmaintained package also has a known, [publicly documented stacked-query SQL injection](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (Datadog Security Labs) that bypasses its `BEGIN READ ONLY` wrapper with input like `COMMIT; DROP SCHEMA public CASCADE;`. It has never been patched at npm.
 
 A handful of community forks have appeared, but each fills a narrow slice:
 
-- [`@zeddotdev/postgres-context-server`](https://www.npmjs.com/package/@zeddotdev/postgres-context-server) — Zed's fork, primarily a security patch on the original shape.
-- **Postgres MCP Pro** (Crystal DBA) — focused on index tuning and hypothetical-index / buffer-cache diagnostics.
-- **AWS Labs Postgres MCP** — tied to Aurora / RDS Data API + Secrets Manager.
+- [`@zeddotdev/postgres-context-server`](https://www.npmjs.com/package/@zeddotdev/postgres-context-server) - Zed's fork, primarily a security patch on the original shape.
+- **Postgres MCP Pro** (Crystal DBA) - focused on index tuning and hypothetical-index / buffer-cache diagnostics.
+- **AWS Labs Postgres MCP** - tied to Aurora / RDS Data API + Secrets Manager.
 
 None of them position themselves as a general-purpose daily driver you'd hand to Claude Code or Cursor against an arbitrary Postgres: modern introspection, perf helpers, role/privilege awareness, and a write-safety posture out of the box. That's the gap `@yawlabs/postgres-mcp` fills.
 
 ## Why this one?
 
-- **Read-only by default** — user SQL runs in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes. Opt in with `ALLOW_WRITES=1`.
-- **Extended query protocol for all user SQL** — `pg_query` sends user input with `queryMode: 'extended'`, which restricts each request to a single statement. This closes the [stacked-query injection class](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (`COMMIT; DROP SCHEMA x CASCADE;`) that defeated the reference server's `BEGIN READ ONLY` wrapper. Integration test asserts the rejection.
-- **Parameterized queries** — `pg_query` takes a `params` array for `$1`, `$2`, etc. No string-interpolated SQL in our code path.
-- **Written from scratch, actively maintained** — not a fork of the deprecated code. Unit + integration tests (`npm test`, `npm run test:integration`) run against a real Postgres; releases cut via `release.sh`.
-- **Schema introspection built in** — `pg_list_schemas`, `pg_list_tables`, `pg_describe_table` return columns, primary keys, foreign keys, and indexes without the agent having to remember `pg_catalog` joins.
-- **`EXPLAIN` as a first-class tool** — text or JSON format, with optional `ANALYZE`. ANALYZE for non-SELECT statements requires `ALLOW_WRITES=1` and always rolls back, so the plan is real but the write doesn't persist.
-- **Perf diagnostics the deprecated server never had** — `pg_top_queries` (from `pg_stat_statements`), `pg_seq_scan_tables`, `pg_unused_indexes`, `pg_table_bloat`, `pg_inspect_locks`, `pg_replication_status`. Answer "why is this slow?" in one tool call.
-- **Health snapshot** — `pg_health` returns version, db size, connection counts, and the 10 longest-running active queries in one call.
-- **Role and privilege awareness** — `pg_list_roles` and `pg_table_privileges` for the common "who can touch what?" questions.
-- **Instant startup** — ships as a single bundled file with zero runtime dependencies. No multi-minute `node_modules` install on every `npx` cold start.
-- **Result truncation** — large result sets are capped at `POSTGRES_MAX_ROWS` (default 1000) with a `truncated: true` flag, so a stray `SELECT * FROM events` doesn't blow out the model context.
+- **Read-only by default** - user SQL runs in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes. Opt in with `ALLOW_WRITES=1`.
+- **Extended query protocol for all user SQL** - `pg_query` sends user input with `queryMode: 'extended'`, which restricts each request to a single statement. This closes the [stacked-query injection class](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (`COMMIT; DROP SCHEMA x CASCADE;`) that defeated the reference server's `BEGIN READ ONLY` wrapper. Integration test asserts the rejection.
+- **Parameterized queries** - `pg_query` takes a `params` array for `$1`, `$2`, etc. No string-interpolated SQL in our code path.
+- **Written from scratch, actively maintained** - not a fork of the deprecated code. Unit + integration tests (`npm test`, `npm run test:integration`) run against a real Postgres; releases cut via `release.sh`.
+- **Schema introspection built in** - `pg_list_schemas`, `pg_list_tables`, `pg_describe_table` return columns, primary keys, foreign keys, and indexes without the agent having to remember `pg_catalog` joins.
+- **`EXPLAIN` as a first-class tool** - text or JSON format, with optional `ANALYZE`. ANALYZE for non-SELECT statements requires `ALLOW_WRITES=1` and always rolls back, so the plan is real but the write doesn't persist.
+- **Perf diagnostics the deprecated server never had** - `pg_top_queries` (from `pg_stat_statements`), `pg_seq_scan_tables`, `pg_unused_indexes`, `pg_table_bloat`, `pg_inspect_locks`, `pg_replication_status`. Answer "why is this slow?" in one tool call.
+- **Health snapshot** - `pg_health` returns version, db size, connection counts, and the 10 longest-running active queries in one call.
+- **Role and privilege awareness** - `pg_list_roles` and `pg_table_privileges` for the common "who can touch what?" questions.
+- **Instant startup** - ships as a single bundled file with zero runtime dependencies. No multi-minute `node_modules` install on every `npx` cold start.
+- **Result truncation** - large result sets are capped at `POSTGRES_MAX_ROWS` (default 1000) with a `truncated: true` flag, so a stray `SELECT * FROM events` doesn't blow out the model context.
 
 ## Quick start
 
@@ -88,7 +88,7 @@ Read-only is the default. If you want the agent to be able to `INSERT`, `UPDATE`
 }
 ```
 
-Prefer scoping this to dev/test databases — for production, leave writes off and use migration tools out-of-band.
+Prefer scoping this to dev/test databases - for production, leave writes off and use migration tools out-of-band.
 
 ## What can an agent do with this?
 
@@ -103,7 +103,7 @@ Once connected, the agent picks tools automatically based on what you ask. A few
 
 The bigger leverage is multi-tool reasoning. A few real workflows:
 
-- **Unstick a hung app.** `pg_inspect_locks` returns blocked PID + blocking PID + the offending query, then `pg_kill` (`ALLOW_WRITES=1` required) cancels the blocker. The agent can run both in one turn — it's the fastest path from "the app is frozen" to "back up."
+- **Unstick a hung app.** `pg_inspect_locks` returns blocked PID + blocking PID + the offending query, then `pg_kill` (`ALLOW_WRITES=1` required) cancels the blocker. The agent can run both in one turn - it's the fastest path from "the app is frozen" to "back up."
 - **Chase a slow page.** `pg_top_queries` ranks the worst queries, `pg_explain` with `analyze: true` shows the plan for the top hit, `pg_seq_scan_tables` and `pg_unused_indexes` say whether the answer is "add an index here" or "drop a dead one there."
 - **Oncall triage.** `pg_health` checks connectivity + active-query count + database size; `pg_inspect_locks` and `pg_replication_status` confirm whether contention or replication lag is in play before paging the on-call DBA.
 
@@ -122,12 +122,12 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 | `pg_explain` | `EXPLAIN` or `EXPLAIN ANALYZE` for a SQL statement. Text or JSON output. Optional `hypothetical_indexes` (requires the [HypoPG](https://github.com/HypoPG/hypopg) extension) lets you ask "what would the plan be with these indexes?" without creating them on disk. |
 | `pg_health` | Server version, database size, connection count, active queries, table count. |
 | `pg_top_queries` | Top N queries by total/mean execution time. Requires the `pg_stat_statements` extension. |
-| `pg_seq_scan_tables` | Tables with heavy sequential scans — missing-index candidates. |
-| `pg_unused_indexes` | Non-unique, non-primary indexes with low scan counts — drop candidates. |
+| `pg_seq_scan_tables` | Tables with heavy sequential scans - missing-index candidates. |
+| `pg_unused_indexes` | Non-unique, non-primary indexes with low scan counts - drop candidates. |
 | `pg_inspect_locks` | Who is blocking whom right now (blocked PID, blocker PID, lock type, queries). |
 | `pg_list_roles` | Database roles with login/superuser/createdb flags and group memberships. |
 | `pg_table_privileges` | Who has SELECT/INSERT/UPDATE/DELETE/etc. on a table or whole schema. |
-| `pg_table_bloat` | Tables with high dead-tuple ratios — VACUUM candidates. |
+| `pg_table_bloat` | Tables with high dead-tuple ratios - VACUUM candidates. |
 | `pg_replication_status` | Replication slots, connected replicas, and current WAL position. |
 | `pg_advisor` | Rolled-up DBA lints in one call: sequence-exhaustion candidates, tables without a primary key, and (configurable) public tables with RLS disabled. The "what should I be looking at?" starting point. |
 | `pg_kill` | Cancel a running query or terminate a backend connection. Requires `ALLOW_WRITES=1`. |
@@ -171,19 +171,19 @@ This disables certificate chain verification only -- the TCP connection is still
 
 ## Troubleshooting
 
-**`DATABASE_URL is not set`** — Your MCP client is launching the server without the env var. On Windows especially, env vars set in bash / PowerShell profiles are not inherited by MCP servers launched via `cmd`. Put `DATABASE_URL` directly in the `env` block of `.mcp.json`.
+**`DATABASE_URL is not set`** - Your MCP client is launching the server without the env var. On Windows especially, env vars set in bash / PowerShell profiles are not inherited by MCP servers launched via `cmd`. Put `DATABASE_URL` directly in the `env` block of `.mcp.json`.
 
-**`password authentication failed`** — Check the username, password, and that the user has `CONNECT` privilege on the database. URL-encode special characters in the password (`@` → `%40`, `#` → `%23`, `/` → `%2F`).
+**`password authentication failed`** - Check the username, password, and that the user has `CONNECT` privilege on the database. URL-encode special characters in the password (`@` → `%40`, `#` → `%23`, `/` → `%2F`).
 
-**`SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string`** — The password in your connection string is empty or became `null` after URL decoding. Re-check your connection string.
+**`SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string`** - The password in your connection string is empty or became `null` after URL decoding. Re-check your connection string.
 
-**`canceling statement due to statement timeout`** — A single query exceeded `POSTGRES_STATEMENT_TIMEOUT_MS` (default 30s). Increase it, narrow the query with `WHERE`, or add an index. This is working as designed -- the timeout exists so a runaway query cannot hang the agent.
+**`canceling statement due to statement timeout`** - A single query exceeded `POSTGRES_STATEMENT_TIMEOUT_MS` (default 30s). Increase it, narrow the query with `WHERE`, or add an index. This is working as designed -- the timeout exists so a runaway query cannot hang the agent.
 
-**`Write blocked: this server is in read-only mode`** — You asked the agent to write but `ALLOW_WRITES` is not set. Add `ALLOW_WRITES=1` to the `env` block of `.mcp.json` and restart your MCP client. Only do this for dev/test DBs.
+**`Write blocked: this server is in read-only mode`** - You asked the agent to write but `ALLOW_WRITES` is not set. Add `ALLOW_WRITES=1` to the `env` block of `.mcp.json` and restart your MCP client. Only do this for dev/test DBs.
 
-**Connection pool exhaustion with PgBouncer transaction mode or pglite-socket** — These backends don't support concurrent queries on a single connection. Set `POSTGRES_POOL_MAX=1` in the env block.
+**Connection pool exhaustion with PgBouncer transaction mode or pglite-socket** - These backends don't support concurrent queries on a single connection. Set `POSTGRES_POOL_MAX=1` in the env block.
 
-**First query is slow, subsequent queries are fast** — Expected. The pg driver lazily establishes the first connection; subsequent queries reuse the pool.
+**First query is slow, subsequent queries are fast** - Expected. The pg driver lazily establishes the first connection; subsequent queries reuse the pool.
 
 ## Development
 

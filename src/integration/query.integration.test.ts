@@ -12,7 +12,7 @@ const pgExplain = explainTools[0];
 const pgHealth = healthTools[0];
 const pgTopQueries = statsTools[0];
 
-// One setup/teardown for the whole file — every describe below shares the
+// One setup/teardown for the whole file - every describe below shares the
 // same fixture schema, so running DROP/CREATE per-describe is wasted work.
 describe("integration: query / explain / health / top_queries", { skip: !integrationEnabled() }, () => {
   before(setupFixtures);
@@ -205,7 +205,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     // The attack ends the READ ONLY transaction early with `COMMIT;` then runs
     // a destructive statement. Our defense is that pg_query always calls
     // client.query(sql, params) with a values array, which forces the extended
-    // query protocol — and the extended protocol rejects multi-statement SQL.
+    // query protocol - and the extended protocol rejects multi-statement SQL.
     it("rejects stacked-query injection that defeated the reference server", async () => {
       const payload = `SELECT 1; COMMIT; DROP SCHEMA ${FIXTURE_SCHEMA} CASCADE;`;
       const res = (await pgQuery.handler({ sql: payload })) as { ok: boolean; error?: string };
@@ -218,7 +218,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       );
 
       // Belt-and-suspenders: even if the rejection message ever changes, the
-      // schema must still exist — no DROP landed.
+      // schema must still exist - no DROP landed.
       const check = (await pgQuery.handler({
         sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.users`,
       })) as { ok: boolean; data?: { rows: { c: number }[] } };
@@ -226,7 +226,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.ok((check.data?.rows[0]?.c ?? 0) > 0);
     });
 
-    // Same defense, verified with ALLOW_WRITES=1 on — the extended-protocol
+    // Same defense, verified with ALLOW_WRITES=1 on - the extended-protocol
     // guard is upstream of the READ ONLY wrapper, so it must still block even
     // when the READ ONLY guard is lifted.
     it("rejects stacked-query injection even when ALLOW_WRITES=1", async () => {
@@ -459,7 +459,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         return;
       }
       assert.ok(Array.isArray(res.data));
-      // The fixture setup ran a handful of queries — there should be at least one row.
+      // The fixture setup ran a handful of queries - there should be at least one row.
       assert.ok((res.data ?? []).length > 0);
       assert.ok(res.data?.[0].query);
     });
@@ -470,7 +470,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           ok: boolean;
           error?: string;
         };
-        // Either installed-and-ok, or extension missing — both acceptable.
+        // Either installed-and-ok, or extension missing - both acceptable.
         if (!res.ok) {
           assert.match(res.error ?? "", /pg_stat_statements/);
         }

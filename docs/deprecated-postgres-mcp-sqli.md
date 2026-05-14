@@ -1,6 +1,6 @@
 # The Postgres MCP everyone's still using has a known SQLi
 
-In May 2025, Anthropic archived `@modelcontextprotocol/server-postgres`. In July, they marked it deprecated on npm. They haven't shipped a replacement. A year later, the deprecated package is still pulling roughly 500,000 downloads per month — a lot of agents pointed at code that's known-broken and isn't going to get fixed.
+In May 2025, Anthropic archived `@modelcontextprotocol/server-postgres`. In July, they marked it deprecated on npm. They haven't shipped a replacement. A year later, the deprecated package is still pulling roughly 500,000 downloads per month - a lot of agents pointed at code that's known-broken and isn't going to get fixed.
 
 The break in question is a stacked-query SQL injection. Datadog Security Labs published [the case study](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) in 2025. The reference server's defense was a `BEGIN READ ONLY` transaction wrapper around user SQL. The defense doesn't work, because the simple query protocol the server uses accepts multi-statement strings. A payload like:
 
@@ -8,19 +8,19 @@ The break in question is a stacked-query SQL injection. Datadog Security Labs pu
 SELECT 1; COMMIT; DROP SCHEMA public CASCADE;
 ```
 
-closes the wrapping transaction with the embedded `COMMIT;`, then runs the `DROP` in autocommit, outside the read-only guard. Postgres has no idea anything is wrong — you sent it a multi-statement string, it ran the statements in order.
+closes the wrapping transaction with the embedded `COMMIT;`, then runs the `DROP` in autocommit, outside the read-only guard. Postgres has no idea anything is wrong - you sent it a multi-statement string, it ran the statements in order.
 
 ## Why this matters even if your agent is trustworthy
 
-The attack surface isn't the LLM. It's the SQL string the LLM constructs. Any path that lets an attacker influence that string — prompt injection via a retrieved document, malicious content in a row the agent reads back, a poisoned tool description from another MCP server — becomes a path to the database. The MCP server is the last layer before the database; its job is to refuse to execute multi-statement SQL, not to trust the agent's judgment.
+The attack surface isn't the LLM. It's the SQL string the LLM constructs. Any path that lets an attacker influence that string - prompt injection via a retrieved document, malicious content in a row the agent reads back, a poisoned tool description from another MCP server - becomes a path to the database. The MCP server is the last layer before the database; its job is to refuse to execute multi-statement SQL, not to trust the agent's judgment.
 
-A few of the popular community forks paper over this with string parsers ("split on semicolons; reject anything with more than one statement"). String parsers against Postgres's lexer are a losing game. Dollar-quoted strings, escape sequences, comment handling, identifier quoting — reproducing it correctly is a multi-year project that every fork has to redo. There's a better fix.
+A few of the popular community forks paper over this with string parsers ("split on semicolons; reject anything with more than one statement"). String parsers against Postgres's lexer are a losing game. Dollar-quoted strings, escape sequences, comment handling, identifier quoting - reproducing it correctly is a multi-year project that every fork has to redo. There's a better fix.
 
 ## The structural fix
 
 Send user SQL through the extended query protocol.
 
-The extended protocol — the one node-pg uses when you pass `values` to `client.query()` — limits each request to a single statement at the wire level. Postgres itself rejects multi-statement payloads with `42601: cannot insert multiple commands into a prepared statement`. This is a property of the protocol, not a parser anyone has to maintain.
+The extended protocol - the one node-pg uses when you pass `values` to `client.query()` - limits each request to a single statement at the wire level. Postgres itself rejects multi-statement payloads with `42601: cannot insert multiple commands into a prepared statement`. This is a property of the protocol, not a parser anyone has to maintain.
 
 [`@yawlabs/postgres-mcp`](https://www.npmjs.com/package/@yawlabs/postgres-mcp) does exactly this:
 
@@ -33,7 +33,7 @@ await client.query({
 });
 ```
 
-`queryMode: 'extended'` forces the extended protocol even when `params` is an empty array. (In pg versions before 8.14, the driver would silently fall back to the simple protocol on empty `values`, defeating the guard — the project pins `pg ^8.14.0` for exactly this reason.)
+`queryMode: 'extended'` forces the extended protocol even when `params` is an empty array. (In pg versions before 8.14, the driver would silently fall back to the simple protocol on empty `values`, defeating the guard - the project pins `pg ^8.14.0` for exactly this reason.)
 
 The regression test asserts both halves: the payload is rejected, and the schema survives the attempt:
 
@@ -54,7 +54,7 @@ it("rejects stacked-query injection that defeated the reference server", async (
 });
 ```
 
-The same test runs with `ALLOW_WRITES=1` on too, verifying the extended-protocol guard sits upstream of the read-only wrapper — so even when reads-only is lifted, the injection is still blocked.
+The same test runs with `ALLOW_WRITES=1` on too, verifying the extended-protocol guard sits upstream of the read-only wrapper - so even when reads-only is lifted, the injection is still blocked.
 
 ## What else changes if you migrate
 
@@ -70,7 +70,7 @@ A few other things worth knowing:
 
 **HypoPG integration.** Ask the planner "what would the plan be if these indexes existed?" without creating them on disk. Requires the HypoPG extension.
 
-**Reverse foreign keys.** `pg_describe_table` returns `referenced_by` — other tables whose FKs point at this one. None of the surveyed forks expose this; in psql you'd run `\d+` on every candidate and squint.
+**Reverse foreign keys.** `pg_describe_table` returns `referenced_by` - other tables whose FKs point at this one. None of the surveyed forks expose this; in psql you'd run `\d+` on every candidate and squint.
 
 ## Migration
 

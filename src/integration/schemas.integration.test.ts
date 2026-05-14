@@ -11,7 +11,7 @@ const listFunctions = schemaTools.find((t) => t.name === "pg_list_functions")!;
 const listExtensions = schemaTools.find((t) => t.name === "pg_list_extensions")!;
 const searchColumns = schemaTools.find((t) => t.name === "pg_search_columns")!;
 
-// One setup/teardown for the whole file — every describe below shares the
+// One setup/teardown for the whole file - every describe below shares the
 // same fixture schema, so running DROP/CREATE per-describe is wasted work.
 describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
   before(setupFixtures);
@@ -265,7 +265,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         data?: { schema: string }[];
       };
       assert.equal(res.ok, true);
-      // Should find at least the fixture — may find more if other test schemas linger.
+      // Should find at least the fixture - may find more if other test schemas linger.
       assert.ok((res.data ?? []).some((r) => r.schema === FIXTURE_SCHEMA));
     });
   });

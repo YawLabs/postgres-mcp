@@ -26,7 +26,7 @@ if (subcommand === "version" || subcommand === "--version") {
   process.exit(0);
 }
 
-// ─── No subcommand — start the MCP server ───
+// ─── No subcommand - start the MCP server ───
 
 const allTools = [...queryTools, ...schemaTools, ...explainTools, ...healthTools, ...statsTools, ...adminTools];
 
@@ -76,7 +76,7 @@ for (const tool of allTools) {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
-// Startup banner on stderr — stdio MCP protocol uses stdout, so stderr is free for logs.
+// Startup banner on stderr - stdio MCP protocol uses stdout, so stderr is free for logs.
 const writesNote = isWritesAllowed() ? "writes ENABLED" : "read-only";
 console.error(`@yawlabs/postgres-mcp v${version} ready (${allTools.length} tools, ${writesNote})`);
 
@@ -85,7 +85,7 @@ const cleanup = async () => {
   try {
     await shutdown();
   } catch {
-    // Best-effort — process is exiting.
+    // Best-effort - process is exiting.
   }
 };
 process.on("SIGINT", () => {

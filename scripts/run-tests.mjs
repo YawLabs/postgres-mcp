@@ -2,12 +2,12 @@
 /**
  * Cross-platform test runner. Passing a directory to `node --test` hangs on
  * Windows (works on Linux) and globs like `dist/**\/*.test.js` only expand
- * in bash with globstar — PowerShell leaves them as literal paths. This
+ * in bash with globstar - PowerShell leaves them as literal paths. This
  * script enumerates test files with Node's stdlib and passes explicit paths.
  *
  * Usage:
- *   node scripts/run-tests.mjs [dir]        — all *.test.js under dir
- *   node scripts/run-tests.mjs [dir] --integration  — only *.integration.test.js, serialized
+ *   node scripts/run-tests.mjs [dir]        - all *.test.js under dir
+ *   node scripts/run-tests.mjs [dir] --integration  - only *.integration.test.js, serialized
  */
 
 import { spawn } from "node:child_process";

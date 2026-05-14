@@ -4,7 +4,7 @@ name: Deprecate
 # we don't depend on a local WebAuthn session in ~/.npmrc. Run via:
 #   gh workflow run deprecate.yml \
 #     -f versionRange='<0.7.0' \
-#     -f message='outdated — install @yawlabs/postgres-mcp@latest'
+#     -f message='outdated - install @yawlabs/postgres-mcp@latest'
 #
 # Inputs are passed to npm via env vars (not ${{ }} interpolation inside the
 # run: script) so a malicious / typo'd input can't escape the argv and run

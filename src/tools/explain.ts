@@ -107,7 +107,7 @@ export const explainTools = [
     name: "pg_explain",
     description:
       "Get the query plan for a SQL statement. By default, this uses plain EXPLAIN (no execution). " +
-      "Set `analyze: true` to run the query with EXPLAIN ANALYZE — for non-SELECT statements, " +
+      "Set `analyze: true` to run the query with EXPLAIN ANALYZE - for non-SELECT statements, " +
       "ALLOW_WRITES=1 is required (since ANALYZE actually executes the statement). Writes " +
       "executed during EXPLAIN ANALYZE are always rolled back, so you can inspect a plan for " +
       "an INSERT/UPDATE/DELETE without persisting the mutation. Format is `text` (default) or " +
@@ -146,7 +146,7 @@ export const explainTools = [
       };
 
       // LLMs often pass pre-wrapped SQL like "EXPLAIN ANALYZE SELECT ..." which
-      // would become "EXPLAIN (ANALYZE) EXPLAIN ANALYZE SELECT ..." below —
+      // would become "EXPLAIN (ANALYZE) EXPLAIN ANALYZE SELECT ..." below -
       // a syntax error. Reject with a clear hint so the next call is correct.
       if (/^\s*EXPLAIN\b/i.test(sql)) {
         return {
@@ -191,7 +191,7 @@ export const explainTools = [
             error:
               "hypothetical_indexes requires the HypoPG extension. Install with " +
               "`CREATE EXTENSION hypopg;` (a superuser-equivalent role usually). " +
-              "HypoPG is read-only at the disk level — it lives entirely in shared memory.",
+              "HypoPG is read-only at the disk level - it lives entirely in shared memory.",
           };
         }
       }

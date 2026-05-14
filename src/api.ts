@@ -2,23 +2,23 @@
  * PostgreSQL connection pool with read-only enforcement.
  *
  * Config:
- *   - DATABASE_URL                         — postgres connection string (required)
- *   - ALLOW_WRITES                         — set to "1" or "true" to allow DML/DDL (default: read-only)
- *   - POSTGRES_STATEMENT_TIMEOUT_MS        — per-statement timeout (default: 30000)
- *   - POSTGRES_CONNECTION_TIMEOUT_MS       — TCP connect timeout (default: 10000). Without
+ *   - DATABASE_URL                         - postgres connection string (required)
+ *   - ALLOW_WRITES                         - set to "1" or "true" to allow DML/DDL (default: read-only)
+ *   - POSTGRES_STATEMENT_TIMEOUT_MS        - per-statement timeout (default: 30000)
+ *   - POSTGRES_CONNECTION_TIMEOUT_MS       - TCP connect timeout (default: 10000). Without
  *                                            this, a dead host hangs until the OS gives up
  *                                            (~2 minutes on most platforms).
- *   - POSTGRES_MAX_ROWS                    — max rows returned by pg_query (default: 1000)
- *   - POSTGRES_POOL_MAX                    — max pool connections (default: 5). Set to 1 for
+ *   - POSTGRES_MAX_ROWS                    - max rows returned by pg_query (default: 1000)
+ *   - POSTGRES_POOL_MAX                    - max pool connections (default: 5). Set to 1 for
  *                                            single-threaded backends (pglite-socket, PgBouncer
  *                                            transaction mode) that can't handle concurrent queries.
- *   - POSTGRES_SSL_REJECT_UNAUTHORIZED     — "false" to disable TLS cert verification (for managed
+ *   - POSTGRES_SSL_REJECT_UNAUTHORIZED     - "false" to disable TLS cert verification (for managed
  *                                            databases using private-CA certs: Supabase, Neon,
  *                                            RDS with a custom CA). Connection is still encrypted.
  *
  * Safety model:
  *   User-provided SQL runs in a `BEGIN READ ONLY` transaction by default, so
- *   postgres itself rejects any write. Enable writes via ALLOW_WRITES=1 — the
+ *   postgres itself rejects any write. Enable writes via ALLOW_WRITES=1 - the
  *   tool handlers also surface this hint in their descriptions/errors so an
  *   LLM doesn't blindly retry a blocked write.
  */
@@ -328,7 +328,7 @@ export async function runReadOnly(
     try {
       await client.query("ROLLBACK");
     } catch {
-      // Already rolled back or connection broken — swallow.
+      // Already rolled back or connection broken - swallow.
     }
     return { ok: false, error: formatPgError(err) };
   } finally {
@@ -336,7 +336,7 @@ export async function runReadOnly(
       try {
         await hooks.teardown(client);
       } catch {
-        // Teardown is best-effort — never let it shadow a real error.
+        // Teardown is best-effort - never let it shadow a real error.
       }
     }
     client.release();
@@ -363,7 +363,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
     try {
       await client.query("ROLLBACK");
     } catch {
-      // Ignore — best effort.
+      // Ignore - best effort.
     }
     return { ok: false, error: formatPgError(err) };
   } finally {
@@ -375,7 +375,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
  * Run SQL in a read-write transaction that always rolls back. Used by
  * EXPLAIN ANALYZE on write statements: postgres needs the write to execute
  * so ANALYZE can report actual row counts and timing, but the user asked
- * for a plan — not to commit the mutation. Requires ALLOW_WRITES=1 because
+ * for a plan - not to commit the mutation. Requires ALLOW_WRITES=1 because
  * we still need to lift the READ ONLY guard to let the write run at all.
  */
 export async function runReadWriteRollback(
@@ -402,7 +402,7 @@ export async function runReadWriteRollback(
     try {
       await client.query("ROLLBACK");
     } catch {
-      // Already rolled back or connection broken — swallow.
+      // Already rolled back or connection broken - swallow.
     }
     return { ok: false, error: formatPgError(err) };
   } finally {

@@ -53,7 +53,7 @@ jobs:
       # Catches packaging regressions (missing bin shebang, bad "files" entry,
       # broken esbuild output) before they hit real users.
       - name: Smoke test published package
-        # Run npx from a temp dir — if run from the checkout root, npx sees our
+        # Run npx from a temp dir - if run from the checkout root, npx sees our
         # own package.json `bin` entry and tries to resolve the local (unbuilt)
         # path instead of installing the published tarball.
         working-directory: ${{ runner.temp }}

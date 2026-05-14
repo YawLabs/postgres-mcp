@@ -322,7 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes executed by `EXPLAIN ANALYZE`. Previously the write ran inside a
   `BEGIN; ... COMMIT` transaction, so `pg_explain { analyze: true, sql:
   "INSERT ..." }` would actually insert the row. Now writes run inside a
-  `BEGIN; ... ROLLBACK` transaction — the plan (with real row counts and
+  `BEGIN; ... ROLLBACK` transaction - the plan (with real row counts and
   timing) comes back but the mutation is rolled back. This matches the user
   expectation when asking for a plan, and the tool description has been
   updated to reflect it.
@@ -354,7 +354,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pg_list_roles` with `includeSystem: false` (the default) now actually
   excludes built-in `pg_*` roles. The previous `LIKE 'pg\_%' ESCAPE '\\'`
   filter ended up as SQL `ESCAPE '\\'` (two backslashes), which Postgres
-  rejects since `ESCAPE` requires a single character — so the whole filter
+  rejects since `ESCAPE` requires a single character - so the whole filter
   was silently being dropped. Replaced with `starts_with(rolname, 'pg_')`.
 - `pg_describe_table` foreign-key `columns` and `foreign_columns` are now
   proper JSON arrays. They were previously returned as the raw postgres
@@ -378,11 +378,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-04-22
 
 ### Added
-- `pg_list_views` — list views and materialized views with SQL definitions.
-- `pg_list_functions` — list functions, procedures, and aggregates with signatures.
-- `pg_list_extensions` — list installed extensions (pgvector, postgis, etc.) with versions.
-- `pg_search_columns` — find columns by name pattern across all user schemas.
-- `pg_top_queries` — top N queries by total/mean execution time from
+- `pg_list_views` - list views and materialized views with SQL definitions.
+- `pg_list_functions` - list functions, procedures, and aggregates with signatures.
+- `pg_list_extensions` - list installed extensions (pgvector, postgis, etc.) with versions.
+- `pg_search_columns` - find columns by name pattern across all user schemas.
+- `pg_top_queries` - top N queries by total/mean execution time from
   `pg_stat_statements`. Detects extension version and picks the right column
   names (v1.8+ uses `total_exec_time`, older uses `total_time`). Returns clear
   setup instructions if the extension is not installed.
@@ -404,23 +404,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool against a real Postgres instance. Gated on `POSTGRES_MCP_INTEGRATION=1`
   so local `npm test` stays fast with no DB required. CI runs it on Linux via
   a `postgres:16` service container with `pg_stat_statements` preloaded.
-- `pg_inspect_locks` — show current blocking locks (blocked PID, blocker PID,
+- `pg_inspect_locks` - show current blocking locks (blocked PID, blocker PID,
   relation, lock type, both queries). First tool to reach for when a session
   hangs or the app feels stuck.
-- `pg_list_roles` — database roles with login/superuser/createdb/createrole
+- `pg_list_roles` - database roles with login/superuser/createdb/createrole
   flags and inherited group memberships.
-- `pg_table_privileges` — who has SELECT/INSERT/UPDATE/DELETE/etc. on a table,
+- `pg_table_privileges` - who has SELECT/INSERT/UPDATE/DELETE/etc. on a table,
   or on all tables in a schema. Useful for pre-migration audits.
-- `pg_seq_scan_tables` — tables with heavy sequential scans relative to index
+- `pg_seq_scan_tables` - tables with heavy sequential scans relative to index
   scans. Missing-index candidates.
-- `pg_unused_indexes` — non-unique, non-primary indexes with low/zero scan
+- `pg_unused_indexes` - non-unique, non-primary indexes with low/zero scan
   counts. Drop candidates (each unused index costs write amplification).
-- `pg_kill` — cancel a running query or terminate a backend by PID. Requires
+- `pg_kill` - cancel a running query or terminate a backend by PID. Requires
   `ALLOW_WRITES=1` since it changes session state. Distinguishes `cancel`
   (SIGINT-equivalent, graceful) from `terminate` (SIGTERM, forceful).
-- `pg_table_bloat` — estimate dead tuples and vacuum-candidate tables from
+- `pg_table_bloat` - estimate dead tuples and vacuum-candidate tables from
   `pg_stat_user_tables`. No extensions required.
-- `pg_replication_status` — replication slots, connected replicas with lag,
+- `pg_replication_status` - replication slots, connected replicas with lag,
   and current WAL position. Returns empty arrays on a standalone DB rather
   than erroring, so it's safe to call unconditionally.
 - New "What can an agent do with this?" README section with concrete example
@@ -452,12 +452,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Initial release.
 
 ### Added
-- `pg_query` — run SQL with read-only-by-default safety. Writes opt in via `ALLOW_WRITES=1`.
-- `pg_list_schemas` — list non-system schemas.
-- `pg_list_tables` — list tables (and optionally views) with estimated row counts.
-- `pg_describe_table` — columns, PK, FKs, indexes.
-- `pg_explain` — `EXPLAIN` / `EXPLAIN ANALYZE` with text or JSON output.
-- `pg_health` — server version, db size, connections, active queries, table count.
+- `pg_query` - run SQL with read-only-by-default safety. Writes opt in via `ALLOW_WRITES=1`.
+- `pg_list_schemas` - list non-system schemas.
+- `pg_list_tables` - list tables (and optionally views) with estimated row counts.
+- `pg_describe_table` - columns, PK, FKs, indexes.
+- `pg_explain` - `EXPLAIN` / `EXPLAIN ANALYZE` with text or JSON output.
+- `pg_health` - server version, db size, connections, active queries, table count.
 - Single-file bundled distribution (zero runtime deps) for fast `npx` cold starts.
 - Result row truncation at `POSTGRES_MAX_ROWS` (default 1000).
 - Parameterized queries via `params` on `pg_query` and `pg_explain`.

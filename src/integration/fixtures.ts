@@ -35,7 +35,7 @@ export async function setupFixtures(): Promise<void> {
      )`,
     `CREATE INDEX posts_user_id_idx ON ${FIXTURE_SCHEMA}.posts(user_id)`,
 
-    // A quoted/awkward identifier — proves the validateIdent loosening works.
+    // A quoted/awkward identifier - proves the validateIdent loosening works.
     `CREATE TABLE ${FIXTURE_SCHEMA}."Odd Table" (
        id SERIAL PRIMARY KEY,
        "weird-col" TEXT
