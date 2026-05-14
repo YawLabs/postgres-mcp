@@ -63,41 +63,38 @@ jobs:
           # behind a deprecate write by 10-30s -- the first attempt of the
           # initial run showed every version as still "active" even though
           # the deprecation had actually landed. Retry until at least one
-          # version we expected to deprecate reflects the new message, or
-          # the budget runs out. Budget is generous (~3 min) because the
-          # alternative is a green run with misleading output.
+          # version reflects the new message, or the budget runs out (~3 min).
+          #
+          # Sample by "did ANY version end up with $MESSAGE," not by
+          # checking a specific version slot. A narrow-range input (e.g.
+          # '0.5.x') doesn't touch the highest version at all, so a
+          # highest-version sampler would warn "did not propagate" even on
+          # a successful deprecate. Pulling the full package doc once per
+          # iteration and counting matches locally also collapses the prior
+          # N+1 `npm view ... deprecated` calls into a single registry hit.
           ATTEMPTS=18
           SLEEP_SECONDS=10
           PROPAGATED=0
+          DOC=""
           for i in $(seq 1 $ATTEMPTS); do
-            # Sample the highest non-current version (0.6.0 today). If npm
-            # view shows our message there, the deprecate has propagated
-            # for the whole range.
-            VERSIONS=$(npm view @yawlabs/postgres-mcp versions --json | jq -r '.[]')
-            HIGHEST=$(echo "$VERSIONS" | sort -V | sed '$d' | tail -1)
-            if [ -z "$HIGHEST" ]; then
-              echo "No prior versions found; nothing to verify."
+            DOC=$(npm view @yawlabs/postgres-mcp --json)
+            MATCHES=$(echo "$DOC" | jq -r --arg msg "$MESSAGE" \
+              '[.versions | to_entries[] | select(.value.deprecated == $msg)] | length')
+            if [ "$MATCHES" -gt 0 ]; then
               PROPAGATED=1
               break
             fi
-            CURRENT=$(npm view "@yawlabs/postgres-mcp@${HIGHEST}" deprecated 2>/dev/null || echo "")
-            if [ "$CURRENT" = "$MESSAGE" ]; then
-              PROPAGATED=1
-              break
-            fi
-            echo "Waiting for registry propagation (attempt $i/$ATTEMPTS, last seen on ${HIGHEST}: '${CURRENT}')..."
+            echo "Waiting for registry propagation (attempt $i/$ATTEMPTS, $MATCHES versions reflect new message)..."
             sleep $SLEEP_SECONDS
           done
+
           echo ""
           echo "Per-version deprecation state:"
-          for v in $(npm view @yawlabs/postgres-mcp versions --json | jq -r '.[]'); do
-            dep=$(npm view "@yawlabs/postgres-mcp@${v}" deprecated 2>/dev/null || echo "")
-            if [ -n "$dep" ]; then
-              echo "  ${v}: DEPRECATED -- ${dep}"
-            else
-              echo "  ${v}: active"
-            fi
-          done
+          echo "$DOC" | jq -r '.versions | to_entries[] |
+            if .value.deprecated then "  \(.key): DEPRECATED -- \(.value.deprecated)"
+            else "  \(.key): active"
+            end'
+
           if [ "$PROPAGATED" -eq 0 ]; then
             echo ""
             echo "::warning::Deprecate command succeeded but registry did not reflect the new message within ${ATTEMPTS} x ${SLEEP_SECONDS}s. The change is likely still propagating; verify manually via 'npm view @yawlabs/postgres-mcp@<v> deprecated' in a few minutes."
