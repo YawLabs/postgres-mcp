@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-05-14
+
+### Security
+- Transitive deps patched via `npm audit fix`: in-range bumps to `hono`,
+  `fast-uri`, `express-rate-limit`, and `ip-address`. All four reach us
+  only through `@modelcontextprotocol/sdk`'s HTTP-transport path, which
+  this server doesn't use (stdio only) and which esbuild tree-shakes out
+  of `dist/index.js`. Practical exposure was already nil; this clears the
+  audit noise on future `npm install` runs.
+
+### Infrastructure
+- `release.yml` smoke test now retries the `npx -y --version` call itself
+  (6 x 10s) instead of probing `npm view` once and trusting the result.
+  Registry propagation has two desynchronized CDN cache layers --
+  `npm view` (metadata) and `npx -y` (tarball) can land on different
+  edges and return inconsistent results. Observed on the v0.5.2 publish
+  (2026-05-14): `npm view` returned 0.5.2 immediately but the subsequent
+  `npx -y` got `ETARGET` and turned the Release workflow red despite a
+  successful publish. The retry now covers both layers.
+
+### Changed
+- Dev dependencies bumped via Dependabot (`@biomejs/biome`, `zod`, plus
+  transitives) -- in-range, dev-only.
+
 ## [0.5.2] - 2026-05-14
 
 ### Fixed
@@ -48,13 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slow registry.
 
 ### Infrastructure
-- `release.yml` smoke test retries the `npx -y --version` call itself
-  (6 x 10s) instead of probing `npm view` once and trusting the result.
-  Registry propagation has two desynchronized CDN cache layers --
-  `npm view` (metadata) and `npx -y` (tarball) can land on different
-  edges and return inconsistent results. Observed on v0.5.2 publish
-  where `npm view` returned immediately but the subsequent `npx` got
-  `ETARGET`. The retry now covers both layers.
 - `release.yml` concurrency group locked to the literal string
   `release-npm` instead of an interpolated `${{ github.workflow }}` /
   `${{ github.ref }}`. The interpolated form fragmented across different
