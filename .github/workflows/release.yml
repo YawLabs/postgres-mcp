@@ -59,17 +59,26 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          # Registry propagation can lag a few seconds after publish succeeds.
-          for i in 1 2 3 4 5; do
-            if npm view "@yawlabs/postgres-mcp@${VERSION}" version >/dev/null 2>&1; then
-              break
+          # Registry propagation has two cache layers that desynchronize across
+          # CDN edges: `npm view` reads metadata, `npx -y` fetches the tarball.
+          # Seeing the version on one edge via `npm view` does not guarantee
+          # the tarball is reachable from the edge `npx` hits a moment later --
+          # observed ETARGET on v0.5.2 (2026-05-14) where npm view succeeded
+          # immediately but the subsequent npx hit a stale edge. Retry the
+          # whole smoke check, not just a metadata probe.
+          LAST_ERR=""
+          for i in 1 2 3 4 5 6; do
+            if OUTPUT=$(npx -y "@yawlabs/postgres-mcp@${VERSION}" --version 2>&1); then
+              if [ "$OUTPUT" = "$VERSION" ]; then
+                echo "Smoke test passed on attempt $i: $OUTPUT"
+                exit 0
+              fi
+              LAST_ERR="version mismatch: expected $VERSION, got $OUTPUT"
+            else
+              LAST_ERR="$OUTPUT"
             fi
-            echo "Waiting for @yawlabs/postgres-mcp@${VERSION} to appear on the registry (attempt $i)..."
-            sleep 5
+            echo "Smoke attempt $i failed: $LAST_ERR"
+            sleep 10
           done
-          OUTPUT=$(npx -y "@yawlabs/postgres-mcp@${VERSION}" --version)
-          echo "npx output: $OUTPUT"
-          if [ "$OUTPUT" != "$VERSION" ]; then
-            echo "Expected $VERSION, got $OUTPUT" >&2
-            exit 1
-          fi
+          echo "Smoke test failed after 6 attempts. Last error: $LAST_ERR" >&2
+          exit 1
