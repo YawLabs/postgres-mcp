@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-14
+
+### Fixed
+- `pg_describe_table` now emits a `kind fetch failed, reported as "table"`
+  warning instead of silently defaulting to `"table"` when the kind query
+  fails. The other partial-failure fields already followed this pattern; the
+  `kind` field is reported at the top level so a silent default could
+  mislabel a view or materialized view as a regular table.
+- `pg_advisor` `sequence_exhaustion` divides `last_value / max_value` in
+  `numeric` rather than `float8`. BIGINT sequences past 2^53 lose precision
+  in `float8`, and the danger zone (>= threshold) is exactly where the
+  reported `pct_used` needs to stay accurate. The WHERE filter and the
+  reported value both switched.
+- `pg_explain` `hypothetical_indexes` handler defaults `using` to `"btree"`
+  defensively. The Zod schema already applies this default on the protocol
+  path, but a unit-test-style direct handler call bypasses Zod -- so a
+  missing `using` would render as `USING undefined` in the generated SQL and
+  hypopg_create_index would surface a confusing syntax error. New
+  integration regression test covers the omitted-`using` path against a real
+  HypoPG-installed database.
+
+### Changed
+- `api.ts` `getPool()` docstring spells out the env-var snapshot semantics --
+  which vars are bake-on-first-call (`DATABASE_URL`,
+  `POSTGRES_STATEMENT_TIMEOUT_MS`, `POSTGRES_CONNECTION_TIMEOUT_MS`,
+  `POSTGRES_POOL_MAX`, `POSTGRES_SSL_REJECT_UNAUTHORIZED`) and which are
+  read per-request (`POSTGRES_MAX_ROWS`, `ALLOW_WRITES`). Previously a
+  hidden assumption.
+- `api.ts` `typeNameCache` comment now explains the OID-wraparound staleness
+  bound: a `DROP TYPE` / `CREATE TYPE` in-session gets a new OID and the
+  miss-fill path picks it up; the dead entry under the old OID is wasted
+  memory, not a correctness bug.
+- `scripts/wsl-pg-setup.sh` now carries DEV/CI ONLY warnings on the PG16
+  purge and on the `0.0.0.0/0 md5` pg_hba stanza. Both are safe inside WSL
+  but lethal as a production template -- the warnings prevent silent
+  copy-paste into a real host config.
+- `release.sh` Verify step uses the same 5x5s retry loop as the CI
+  smoke test, instead of a one-shot `sleep 3 && npm view` that flaked on a
+  slow registry.
+
+### Infrastructure
+- `release.yml` smoke test retries the `npx -y --version` call itself
+  (6 x 10s) instead of probing `npm view` once and trusting the result.
+  Registry propagation has two desynchronized CDN cache layers --
+  `npm view` (metadata) and `npx -y` (tarball) can land on different
+  edges and return inconsistent results. Observed on v0.5.2 publish
+  where `npm view` returned immediately but the subsequent `npx` got
+  `ETARGET`. The retry now covers both layers.
+- `release.yml` concurrency group locked to the literal string
+  `release-npm` instead of an interpolated `${{ github.workflow }}` /
+  `${{ github.ref }}`. The interpolated form fragmented across different
+  tags (each ref-name got its own queue, defeating the serialization the
+  group was meant to provide) and could silently re-fragment on a workflow
+  rename. The literal key serializes all release runs into one queue.
+- `release.yml` integration build step de-duplicated -- the redundant
+  pre-publish `npm run build` was rebuilding the same artifact the
+  `prepublishOnly` hook would build moments later. Removed.
+- `release.sh` now creates annotated tags (`git tag -a`) and the workflow
+  uses `git push --follow-tags`; lightweight tags are silently skipped by
+  `--follow-tags`, which previously left `release.yml` un-triggered on
+  manual tags.
+
+## [0.5.1] - 2026-05-05
+
+### Fixed
+- Type-name lookup failures no longer drop the user's successful query
+  rows. `runReadOnly` / `runReadWrite` / `runReadWriteRollback` now route
+  catalog lookups through a `safeResolveTypeNames` wrapper that logs to
+  stderr and falls back to `{}` on a transient `pg_type` error, instead
+  of letting the catalog failure throw past the user's already-successful
+  result.
+- `release.sh` WSL matrix step uses a sed regex to translate Git Bash
+  drive prefixes (`/c/`, `/d/`, ...) into the WSL form (`/mnt/c/`,
+  `/mnt/d/`, ...). The previous hardcoded `/c/` broke contributors
+  working from any other drive.
+
 ## [0.5.0] - 2026-05-04
 
 ### Changed
