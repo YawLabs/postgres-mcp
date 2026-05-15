@@ -10,6 +10,12 @@ import { runInternal, shutdown } from "../api.js";
 
 export const FIXTURE_SCHEMA = "test_fixture";
 
+// Cluster-scoped role names used by pg_list_roles.member_of regression
+// coverage. Roles can't live inside a schema, so they're cleaned up in
+// teardownFixtures rather than dropped along with the schema CASCADE.
+export const FIXTURE_GROUP_ROLE = "mcp_test_group";
+export const FIXTURE_MEMBER_ROLE = "mcp_test_member";
+
 export function integrationEnabled(): boolean {
   return process.env.POSTGRES_MCP_INTEGRATION === "1";
 }
@@ -83,6 +89,22 @@ export async function setupFixtures(): Promise<void> {
     `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_partitioned (id INT, occurred_at DATE)
        PARTITION BY RANGE (occurred_at)`,
 
+    // Materialized view fixture: covers the `includeMaterialized` true /
+    // false branches of pg_list_views and the relkind='m' bucket of
+    // pg_list_tables (when includeViews is true).
+    `CREATE MATERIALIZED VIEW ${FIXTURE_SCHEMA}.user_post_counts_mv AS
+       SELECT u.id, u.email, COUNT(p.id) AS post_count
+       FROM ${FIXTURE_SCHEMA}.users u
+       LEFT JOIN ${FIXTURE_SCHEMA}.posts p ON p.user_id = u.id
+       GROUP BY u.id, u.email`,
+
+    // Advisor fixture: a sequence advanced to 80% of its max so pg_advisor
+    // sequence_exhaustion has a positive case to flag. MAXVALUE 1000 keeps
+    // the arithmetic obvious; setval(800) puts it well past the 50% default
+    // threshold and tests the numeric-precision formula 0.5.2 introduced.
+    `CREATE SEQUENCE ${FIXTURE_SCHEMA}.near_full_seq MAXVALUE 1000`,
+    `SELECT setval('${FIXTURE_SCHEMA}.near_full_seq', 800)`,
+
     `INSERT INTO ${FIXTURE_SCHEMA}.users (email, metadata) VALUES
        ('a@example.com', '{"role":"admin"}'::jsonb),
        ('b@example.com', '{"role":"user"}'::jsonb),
@@ -91,6 +113,17 @@ export async function setupFixtures(): Promise<void> {
        (1, 'hello', 'world'),
        (1, 'second', NULL),
        (2, 'another', 'post body')`,
+
+    // Roles fixture for pg_list_roles.member_of regression test. The 0.3.1
+    // fix cast member_of to text[] so node-pg returns a JS string[] instead
+    // of the raw postgres text form `{a,b}`. Without an actual membership in
+    // the cluster, every member_of is `[]` and the cast is never exercised.
+    // Drops are idempotent so reruns stay green even after a prior crash.
+    `DROP ROLE IF EXISTS ${FIXTURE_MEMBER_ROLE}`,
+    `DROP ROLE IF EXISTS ${FIXTURE_GROUP_ROLE}`,
+    `CREATE ROLE ${FIXTURE_GROUP_ROLE} NOLOGIN`,
+    `CREATE ROLE ${FIXTURE_MEMBER_ROLE} NOLOGIN`,
+    `GRANT ${FIXTURE_GROUP_ROLE} TO ${FIXTURE_MEMBER_ROLE}`,
   ];
 
   for (const sql of statements) {
@@ -107,10 +140,14 @@ export async function setupFixtures(): Promise<void> {
   await runInternal(`CREATE EXTENSION IF NOT EXISTS hypopg`);
 }
 
-/** Clean up the fixture schema and close the pool. */
+/** Clean up the fixture schema, drop cluster-scoped roles, close the pool. */
 export async function teardownFixtures(): Promise<void> {
   try {
     await runInternal(`DROP SCHEMA IF EXISTS ${FIXTURE_SCHEMA} CASCADE`);
+    // Order matters: drop the member before the group it belongs to so
+    // there's no dangling role-membership row.
+    await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_MEMBER_ROLE}`);
+    await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_GROUP_ROLE}`);
   } finally {
     await shutdown();
   }

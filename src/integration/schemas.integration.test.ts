@@ -205,7 +205,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
   });
 
   describe("pg_list_views", () => {
-    it("returns the user_post_counts view with a definition", async () => {
+    it("returns the user_post_counts view AND the materialized view when includeMaterialized=true", async () => {
       const res = (await listViews.handler({ schema: FIXTURE_SCHEMA, includeMaterialized: true })) as {
         ok: boolean;
         data?: { name: string; type: string; definition: string }[];
@@ -216,6 +216,30 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(view.type, "view");
       assert.match(view.definition, /SELECT/i);
       assert.match(view.definition, /users/);
+      // The materialized view should also be returned with type='materialized_view'.
+      const mv = res.data?.find((v) => v.name === "user_post_counts_mv");
+      assert.ok(mv, "expected user_post_counts_mv to appear when includeMaterialized=true");
+      assert.equal(mv.type, "materialized_view");
+    });
+
+    // Locks the false branch of the conditional `('v', 'm')` vs `('v')` SQL
+    // filter. A regression that drops the filter would silently surface
+    // materialized views to a caller who asked for plain views only.
+    it("excludes materialized views when includeMaterialized=false", async () => {
+      const res = (await listViews.handler({ schema: FIXTURE_SCHEMA, includeMaterialized: false })) as {
+        ok: boolean;
+        data?: { name: string; type: string }[];
+      };
+      assert.equal(res.ok, true);
+      const names = (res.data ?? []).map((v) => v.name);
+      assert.ok(names.includes("user_post_counts"), `expected plain view, got ${JSON.stringify(names)}`);
+      assert.ok(
+        !names.includes("user_post_counts_mv"),
+        `materialized view must NOT appear when includeMaterialized=false, got ${JSON.stringify(names)}`,
+      );
+      // Every returned row should be type='view', never 'materialized_view'.
+      const types = new Set((res.data ?? []).map((v) => v.type));
+      assert.ok(!types.has("materialized_view"));
     });
   });
 
@@ -276,6 +300,36 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(res.ok, true);
       // Should find at least the fixture - may find more if other test schemas linger.
       assert.ok((res.data ?? []).some((r) => r.schema === FIXTURE_SCHEMA));
+    });
+
+    // The description advertises case-insensitive matching via ILIKE. A
+    // regression to plain LIKE would silently miss every uppercase / mixed-
+    // case query, and the tool would look like it returns no results for
+    // perfectly reasonable patterns.
+    it("matches case-insensitively (ILIKE, not LIKE)", async () => {
+      // Fixture column is `user_id` lowercase. Upper-case pattern must match.
+      const upperRes = (await searchColumns.handler({
+        pattern: "USER_ID",
+        schema: FIXTURE_SCHEMA,
+        limit: 100,
+      })) as { ok: boolean; data?: { table: string; column: string }[] };
+      assert.equal(upperRes.ok, true);
+      assert.ok(
+        (upperRes.data ?? []).some((r) => r.table === "posts" && r.column === "user_id"),
+        `case-insensitive match should find posts.user_id with pattern "USER_ID", got ${JSON.stringify(upperRes.data)}`,
+      );
+
+      // Mixed-case wildcard with `%` should also match.
+      const mixedRes = (await searchColumns.handler({
+        pattern: "%EMAIL%",
+        schema: FIXTURE_SCHEMA,
+        limit: 100,
+      })) as { ok: boolean; data?: { column: string }[] };
+      assert.equal(mixedRes.ok, true);
+      assert.ok(
+        (mixedRes.data ?? []).map((r) => r.column).includes("email"),
+        `case-insensitive wildcard should match 'email', got ${JSON.stringify(mixedRes.data)}`,
+      );
     });
   });
 });

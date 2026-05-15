@@ -271,7 +271,13 @@ async function runUserQueryBounded(
 // Type-name resolution is decorative: a failure here must not lose the user's
 // successful query result. Fall back to an empty map so fields still carry
 // dataTypeID, just without the human-readable dataTypeName.
-async function safeResolveTypeNames(
+//
+// Exported only for unit-test access -- the failure mode (pg_type query
+// throws) is hard to engineer against a real database without
+// permission-restricted roles, so a unit test passes a stub client that
+// rejects. Not part of the public API; do not rely on this from outside
+// the package.
+export async function safeResolveTypeNames(
   client: pg.PoolClient,
   fields: { dataTypeID: number }[],
 ): Promise<Record<number, string>> {

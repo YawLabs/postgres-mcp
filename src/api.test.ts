@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { getConnectionTimeoutMs, getMaxRows, getPoolMax, getSslConfig, isWritesAllowed } from "./api.js";
+import type pg from "pg";
+import {
+  getConnectionTimeoutMs,
+  getMaxRows,
+  getPoolMax,
+  getSslConfig,
+  isWritesAllowed,
+  safeResolveTypeNames,
+  shutdown,
+} from "./api.js";
 
 describe("isWritesAllowed", () => {
   const original = process.env.ALLOW_WRITES;
@@ -221,5 +230,57 @@ describe("getSslConfig stderr warning on unrecognized values", () => {
     delete process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
     getSslConfig();
     assert.equal(stderrCalls.length, 0);
+  });
+});
+
+// safeResolveTypeNames is the wrapper around resolveTypeNames whose entire
+// reason for existing is: a pg_type lookup failure must not lose the user's
+// successful query rows. Engineering that failure against a real DB
+// requires a permission-restricted role; a stub client whose .query rejects
+// is the cleaner path here, and is the only place we cross the "no mocks"
+// boundary in the codebase. The helper is exported from api.ts solely for
+// this test.
+describe("safeResolveTypeNames fallback on pg_type failure", () => {
+  it("returns {} without throwing when the bootstrap pg_type query rejects", async () => {
+    // Reset typeNameCache (held inside api.ts as module-scoped state) so
+    // the bootstrap branch is forced. Otherwise a prior test in this
+    // process may have populated the cache and resolveTypeNames would
+    // short-circuit out before reaching the throwing query.
+    await shutdown();
+
+    const stubClient = {
+      query: () => Promise.reject(new Error("simulated pg_type failure")),
+    } as unknown as pg.PoolClient;
+
+    const originalErr = console.error;
+    const stderrCalls: string[] = [];
+    console.error = (msg?: unknown) => {
+      stderrCalls.push(String(msg));
+    };
+    try {
+      // dataTypeID=23 is the int4 oid; the value doesn't matter for this
+      // test, only that the field list is non-empty so the wrapper actually
+      // attempts a lookup instead of short-circuiting on the empty-input
+      // fast path.
+      const result = await safeResolveTypeNames(stubClient, [{ dataTypeID: 23 }]);
+      assert.deepEqual(result, {}, "wrapper must swallow the error and return an empty map");
+      assert.ok(stderrCalls.length > 0, "expected a stderr warning on lookup failure");
+      assert.match(stderrCalls[0]!, /type-name resolution failed/i);
+      assert.match(stderrCalls[0]!, /simulated pg_type failure/);
+    } finally {
+      console.error = originalErr;
+    }
+  });
+
+  it("returns {} (no work, no throw) when called with an empty field list", async () => {
+    // No client interaction expected -- helper must short-circuit. Stub
+    // throws if anyone touches it, which would surface as a rejection.
+    const stubClient = {
+      query: () => {
+        throw new Error("safeResolveTypeNames should not have called .query on empty input");
+      },
+    } as unknown as pg.PoolClient;
+    const result = await safeResolveTypeNames(stubClient, []);
+    assert.deepEqual(result, {});
   });
 });

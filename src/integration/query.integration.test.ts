@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { runInternal } from "../api.js";
+import { runInternal, shutdown } from "../api.js";
 import { explainTools } from "../tools/explain.js";
 import { healthTools } from "../tools/health.js";
 import { queryTools } from "../tools/query.js";
@@ -45,6 +45,67 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.equal(byName.id?.dataTypeName, "int4");
       assert.equal(byName.email?.dataTypeName, "text");
       assert.equal(byName.metadata?.dataTypeName, "jsonb");
+    });
+
+    // typeNameCache miss-fill regression. The cache is process-global and
+    // populated on the first user query via a bootstrap of pg_type. A type
+    // CREATEd AFTER the bootstrap won't be in the cache, so the next query
+    // that returns a column of that type must trigger the miss-fill path
+    // (WHERE oid = ANY($1) -> add to cache -> render dataTypeName).
+    //
+    // We reset the cache explicitly via shutdown() so the path runs the
+    // same way regardless of where this test lands in the file order.
+    it("resolves dataTypeName for a CREATE TYPE issued mid-session (miss-fill path)", async () => {
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        // Clear the cache + pool so the bootstrap re-runs and captures only
+        // the types existing at this moment.
+        await shutdown();
+
+        // Bootstrap the cache with the existing types via any user query.
+        const warmup = (await pgQuery.handler({
+          sql: `SELECT id FROM ${FIXTURE_SCHEMA}.users ORDER BY id LIMIT 1`,
+        })) as { ok: boolean };
+        assert.equal(warmup.ok, true, "cache-bootstrap query should succeed");
+
+        // CREATE TYPE introduces a new oid that the bootstrap above could
+        // not have seen. Use a name unique to this test so reruns stay
+        // green.
+        const createType = (await pgQuery.handler({
+          sql: `CREATE TYPE ${FIXTURE_SCHEMA}.color_kind AS ENUM ('red', 'green', 'blue')`,
+        })) as { ok: boolean; error?: string };
+        assert.equal(createType.ok, true, `CREATE TYPE failed: ${createType.error}`);
+
+        try {
+          // SELECT a value of the new type. The miss-fill branch in
+          // resolveTypeNames must populate dataTypeName="color_kind".
+          const res = (await pgQuery.handler({
+            sql: `SELECT 'red'::${FIXTURE_SCHEMA}.color_kind AS tag`,
+          })) as {
+            ok: boolean;
+            data?: {
+              fields: { name: string; dataTypeID: number; dataTypeName?: string }[];
+              rows: Record<string, unknown>[];
+            };
+            error?: string;
+          };
+          assert.equal(res.ok, true, `SELECT custom enum failed: ${res.error}`);
+          assert.equal(res.data?.rows[0]?.tag, "red");
+          const tagField = res.data?.fields.find((f) => f.name === "tag");
+          assert.ok(tagField, "expected `tag` field in response");
+          assert.equal(
+            tagField.dataTypeName,
+            "color_kind",
+            `miss-fill must resolve newly-created enum oid; got ${JSON.stringify(tagField)}`,
+          );
+        } finally {
+          await pgQuery.handler({ sql: `DROP TYPE ${FIXTURE_SCHEMA}.color_kind` });
+        }
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
     });
 
     it("supports parameterized queries", async () => {
