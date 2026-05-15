@@ -76,6 +76,13 @@ export async function setupFixtures(): Promise<void> {
     // pg_advisor tables_without_primary_key check.
     `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_table (id INT, label TEXT)`,
 
+    // Advisor fixture: a partitioned table parent with NO primary key.
+    // pg_advisor must flag this (relkind='p' coverage). The negative case
+    // is covered by `events` above, which is also partitioned but DOES
+    // have a PK.
+    `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_partitioned (id INT, occurred_at DATE)
+       PARTITION BY RANGE (occurred_at)`,
+
     `INSERT INTO ${FIXTURE_SCHEMA}.users (email, metadata) VALUES
        ('a@example.com', '{"role":"admin"}'::jsonb),
        ('b@example.com', '{"role":"user"}'::jsonb),

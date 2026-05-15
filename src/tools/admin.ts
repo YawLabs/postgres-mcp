@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { isWritesAllowed, runInternal, withSharedClient } from "../api.js";
+import { identSchema } from "./params.js";
 
 export const adminTools = [
   {
@@ -139,13 +140,8 @@ export const adminTools = [
       openWorldHint: true,
     },
     inputSchema: z.object({
-      schema: z.string().min(1).max(63).default("public").describe("Schema name (defaults to 'public')."),
-      table: z
-        .string()
-        .min(1)
-        .max(63)
-        .optional()
-        .describe("Table name. Omit to list privileges for all tables in the schema."),
+      schema: identSchema.default("public").describe("Schema name (defaults to 'public')."),
+      table: identSchema.optional().describe("Table name. Omit to list privileges for all tables in the schema."),
     }),
     handler: async (input: unknown) => {
       const { schema, table } = input as { schema: string; table?: string };
@@ -289,17 +285,29 @@ export const adminTools = [
           ),
         ]);
 
-        if (!slotsRes.ok) return slotsRes;
-        if (!replicasRes.ok) return replicasRes;
-        if (!walRes.ok) return walRes;
+        // Partial-failure surfacing matches pg_health / pg_describe_table /
+        // pg_advisor: collect failed sub-queries in a top-level _warnings array
+        // and return the readable portion of the response. Previously we
+        // short-circuited on the first failure, which meant a permission-
+        // restricted view (e.g. pg_replication_slots is superuser-only on some
+        // managed providers) hid the still-readable parts.
+        //
+        // is_replica / wal_position go null (not false / null) when walRes
+        // fails. `false` would falsely claim "this is a primary" when we
+        // couldn't actually check.
+        const warnings: string[] = [];
+        if (!slotsRes.ok) warnings.push(`slots fetch failed: ${slotsRes.error}`);
+        if (!replicasRes.ok) warnings.push(`replicas fetch failed: ${replicasRes.error}`);
+        if (!walRes.ok) warnings.push(`wal_position fetch failed: ${walRes.error}`);
 
         return {
           ok: true,
           data: {
-            is_replica: walRes.data?.[0]?.is_in_recovery ?? false,
-            wal_position: walRes.data?.[0]?.wal_position ?? null,
-            slots: slotsRes.data ?? [],
-            replicas: replicasRes.data ?? [],
+            is_replica: walRes.ok ? (walRes.data?.[0]?.is_in_recovery ?? false) : null,
+            wal_position: walRes.ok ? (walRes.data?.[0]?.wal_position ?? null) : null,
+            slots: slotsRes.ok ? (slotsRes.data ?? []) : [],
+            replicas: replicasRes.ok ? (replicasRes.data ?? []) : [],
+            ...(warnings.length > 0 ? { _warnings: warnings } : {}),
           },
         };
       });
@@ -333,7 +341,7 @@ export const adminTools = [
         .default(0.5)
         .describe("Minimum used-fraction (last_value / max_value) to flag a sequence (default 0.5 = 50%)."),
       rlsSchemas: z
-        .array(z.string().min(1).max(63))
+        .array(identSchema)
         .default(["public"])
         .describe("Schemas where RLS-missing should be flagged. Defaults to ['public']."),
       limit: z.number().int().min(1).max(500).default(50).describe("Max rows per category (default 50)."),
@@ -375,15 +383,22 @@ export const adminTools = [
             [seqExhaustionThreshold, limit],
           ),
           run<{ schema: string; table: string }>(
-            // Declarative-partition children inherit the parent's primary key
-            // as an indisprimary index, so the NOT EXISTS clause already
-            // excludes them. Nothing extra needed for partitioned schemas.
+            // Includes partitioned parents (relkind='p') alongside plain heap
+            // tables ('r'). A partitioned table with no PK is a real design-
+            // drift signal -- if a PK exists on a partitioned table it must
+            // include the partition key columns, but having no PK at all is
+            // legal and usually unintended. Matches the relkind filter used
+            // by public_tables_without_rls below.
+            //
+            // Partition children (relkind='r') inherit the parent's PK as an
+            // indisprimary index on the child, so the NOT EXISTS clause keeps
+            // already filtering them out.
             `SELECT
                n.nspname AS schema,
                c.relname AS "table"
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relkind = 'r'
+             WHERE c.relkind IN ('r', 'p')
                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
                AND n.nspname NOT LIKE 'pg_%'
                AND NOT EXISTS (
@@ -442,12 +457,7 @@ export const adminTools = [
       openWorldHint: true,
     },
     inputSchema: z.object({
-      schema: z
-        .string()
-        .min(1)
-        .max(63)
-        .optional()
-        .describe("Limit to one schema. If omitted, all user schemas are included."),
+      schema: identSchema.optional().describe("Limit to one schema. If omitted, all user schemas are included."),
       minDeadRatio: z
         .number()
         .min(0)

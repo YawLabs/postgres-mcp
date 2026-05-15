@@ -9,6 +9,7 @@ const listRoles = adminTools.find((t) => t.name === "pg_list_roles")!;
 const tablePrivileges = adminTools.find((t) => t.name === "pg_table_privileges")!;
 const tableBloat = adminTools.find((t) => t.name === "pg_table_bloat")!;
 const advisor = adminTools.find((t) => t.name === "pg_advisor")!;
+const replicationStatus = adminTools.find((t) => t.name === "pg_replication_status")!;
 const seqScanTables = statsTools.find((t) => t.name === "pg_seq_scan_tables")!;
 const unusedIndexes = statsTools.find((t) => t.name === "pg_unused_indexes")!;
 
@@ -138,6 +139,21 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "no_pk_table"),
         `expected no_pk_table in tables_without_primary_key, got ${JSON.stringify(noPk)}`,
       );
+      // Partitioned-parent coverage: no_pk_partitioned has relkind='p' and
+      // no PK -- must be flagged now that the query includes ('r', 'p').
+      // This is the regression guard for the relkind expansion landed in
+      // this change.
+      assert.ok(
+        noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "no_pk_partitioned"),
+        `expected no_pk_partitioned (partitioned parent, no PK) in tables_without_primary_key, got ${JSON.stringify(noPk)}`,
+      );
+      // Negative: `events` is a partitioned parent WITH a composite PK; the
+      // indisprimary index lives on the parent oid, so NOT EXISTS filters
+      // it out. Locks down the false-positive boundary.
+      assert.ok(
+        !noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "events"),
+        `events has PK (id, occurred_at); should not appear, got ${JSON.stringify(noPk)}`,
+      );
       // events_2026 is a partition child of `events` (which has a PK on
       // (id, occurred_at)); the inherited PK index has indisprimary=true on
       // the child, so the no-PK query's NOT EXISTS clause must filter it out.
@@ -160,6 +176,32 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       // Fresh sequences in the fixture are nowhere near max_value, so a 99%
       // threshold should produce an empty list.
       assert.deepEqual(res.data?.sequence_exhaustion, []);
+    });
+  });
+
+  describe("pg_replication_status", () => {
+    it("returns the standalone-DB shape with no slots, no replicas, and no warnings", async () => {
+      // The integration cluster is a single standalone instance -- no slots,
+      // no replicas, is_replica=false, wal_position non-null. The shape
+      // matters because the partial-failure refactor now drives all four
+      // fields and an _warnings array; this test locks the success-case
+      // shape so future regressions can't quietly insert nulls or warnings.
+      const res = (await replicationStatus.handler()) as {
+        ok: boolean;
+        data?: {
+          is_replica: boolean | null;
+          wal_position: string | null;
+          slots: unknown[];
+          replicas: unknown[];
+          _warnings?: string[];
+        };
+      };
+      assert.equal(res.ok, true);
+      assert.equal(res.data?.is_replica, false);
+      assert.ok(typeof res.data?.wal_position === "string" && res.data.wal_position.length > 0);
+      assert.ok(Array.isArray(res.data?.slots));
+      assert.ok(Array.isArray(res.data?.replicas));
+      assert.equal(res.data?._warnings, undefined, "no warnings expected on a healthy standalone instance");
     });
   });
 

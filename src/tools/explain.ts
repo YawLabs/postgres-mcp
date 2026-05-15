@@ -1,17 +1,21 @@
 import { z } from "zod";
 import { type ApiResponse, isWritesAllowed, runInternal, runReadOnly, runReadWriteRollback } from "../api.js";
-import { paramValue } from "./params.js";
+import { identSchema, paramValue } from "./params.js";
 
 const indexAccessMethod = z.enum(["btree", "hash", "gin", "gist", "brin", "spgist"]);
 
 const hypotheticalIndex = z.object({
+  // `table` is `schema.table` or `table`. The 127-char ceiling is a generous
+  // upper bound on the combined form -- the actual NAMEDATALEN (63-byte)
+  // limit on each piece after the split is enforced in validateHypoIndex,
+  // since splitting and per-piece byte-checking is awkward in Zod.
   table: z
     .string()
     .min(1)
     .max(127)
     .describe("Target table. Use `schema.table` (e.g. `public.users`) or just `table` for the search_path."),
   columns: z
-    .array(z.string().min(1).max(63))
+    .array(identSchema)
     .min(1)
     .describe("Column names in index order. Quoted identifiers are not supported here -- pass plain names."),
   using: indexAccessMethod
@@ -38,10 +42,19 @@ function quoteQualifiedTable(name: string): string {
 
 /**
  * Pre-flight check on hypothetical_indexes input. Catches pre-quoted names
- * (`"odd.name"`, `weird"col`) before we open a DB connection, so the user
- * gets a clear validation error instead of a confusing planner error or a
- * mis-split on `.`. Returns null on success, or an error string on the
- * first offending entry.
+ * (`"odd.name"`, `weird"col`) and per-identifier byte-length overflow before
+ * we open a DB connection, so the user gets a clear validation error instead
+ * of a confusing planner error or a mis-split on `.`. Returns null on
+ * success, or an error string on the first offending entry.
+ *
+ * The byte cap mirrors `identSchema` in params.ts: postgres caps each
+ * identifier at NAMEDATALEN-1 = 63 BYTES, and a multi-byte name (e.g.
+ * `pré.café_logs`) can pass the Zod char ceiling while each piece exceeds
+ * the byte limit. The `columns` array element is already guarded by
+ * `identSchema` on the MCP-protocol path; we duplicate the byte check here
+ * so direct handler calls (unit tests, library consumers) that bypass Zod
+ * still get the same protection -- matches the precedent set by the `using`
+ * default re-application in buildHypopgHooks.
  */
 function validateHypoIndex(idx: { table: string; columns: string[] }): string | null {
   for (const piece of idx.table.split(".")) {
@@ -50,10 +63,16 @@ function validateHypoIndex(idx: { table: string; columns: string[] }): string | 
       // unambiguously instead of producing a broken nested-quote message.
       return `Hypothetical index table ${JSON.stringify(idx.table)} contains a double-quote; pass plain identifier names without pre-quoting.`;
     }
+    if (Buffer.byteLength(piece, "utf8") > 63) {
+      return `Hypothetical index table piece ${JSON.stringify(piece)} exceeds PostgreSQL's 63-byte NAMEDATALEN limit (multi-byte characters count as multiple bytes).`;
+    }
   }
   for (const col of idx.columns) {
     if (col.includes('"')) {
       return `Hypothetical index column ${JSON.stringify(col)} contains a double-quote; pass plain identifier names without pre-quoting.`;
+    }
+    if (Buffer.byteLength(col, "utf8") > 63) {
+      return `Hypothetical index column ${JSON.stringify(col)} exceeds PostgreSQL's 63-byte NAMEDATALEN limit (multi-byte characters count as multiple bytes).`;
     }
   }
   return null;

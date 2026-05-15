@@ -38,9 +38,18 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       })) as { ok: boolean; data?: { name: string; type: string }[] };
       assert.equal(res.ok, true);
       const names = (res.data ?? []).map((r) => r.name).sort();
-      // Includes plain tables, the partition parent (relkind='p'), and the
-      // partition child (which is also relkind='r'). Order alphabetical.
-      assert.deepEqual(names, ["Odd Table", "events", "events_2026", "no_pk_table", "posts", "products", "users"]);
+      // Includes plain tables, both partition parents (relkind='p'), and
+      // the partition child (relkind='r'). Order alphabetical.
+      assert.deepEqual(names, [
+        "Odd Table",
+        "events",
+        "events_2026",
+        "no_pk_partitioned",
+        "no_pk_table",
+        "posts",
+        "products",
+        "users",
+      ]);
       const events = (res.data ?? []).find((r) => r.name === "events");
       assert.equal(events?.type, "partitioned_table");
     });

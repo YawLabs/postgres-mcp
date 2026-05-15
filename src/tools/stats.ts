@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { runInternal } from "../api.js";
-
-const identSchema = z.string().min(1).max(63);
+import { identSchema } from "./params.js";
 
 export const statsTools = [
   {
@@ -29,15 +28,20 @@ export const statsTools = [
     handler: async (input: unknown) => {
       const { orderBy, limit } = input as { orderBy: "total_time" | "mean_time" | "calls"; limit: number };
 
-      // First check the extension is present - without it the query below fails
-      // with a confusing "relation does not exist" error.
-      const check = await runInternal<{ installed: boolean }>(
-        `SELECT EXISTS (
-           SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'
-         ) AS installed`,
+      // Single probe answers BOTH "is the extension installed?" (no rows -> no)
+      // AND "what's the extversion?" (used to pick column names below). Saves
+      // a round-trip vs. issuing EXISTS and SELECT extversion separately --
+      // the actual stats query is still a second round-trip, but it has to be
+      // since the column names are dynamic.
+      //
+      // Column names changed in Postgres 13 (pg_stat_statements 1.8):
+      // `total_time` -> `total_exec_time`, `mean_time` -> `mean_exec_time`,
+      // etc. We pick the right column names from the version below.
+      const versionRes = await runInternal<{ version: string }>(
+        `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
       );
-      if (!check.ok) return check;
-      if (!check.data?.[0]?.installed) {
+      if (!versionRes.ok) return versionRes;
+      if (!versionRes.data || versionRes.data.length === 0) {
         return {
           ok: false,
           error:
@@ -46,14 +50,7 @@ export const statsTools = [
             "`pg_stat_statements` to `shared_preload_libraries` in postgresql.conf, then restart.",
         };
       }
-
-      // Column names changed in Postgres 13 (pg_stat_statements 1.8): `total_time`
-      // became `total_exec_time`, `mean_time` became `mean_exec_time`. We query
-      // the extension version and pick the right column names.
-      const versionRes = await runInternal<{ version: string }>(
-        `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
-      );
-      const extVersion = versionRes.ok ? (versionRes.data?.[0]?.version ?? "0") : "0";
+      const extVersion = versionRes.data[0]?.version ?? "0";
       const useExecSuffix = compareVersions(extVersion, "1.8") >= 0;
       const totalCol = useExecSuffix ? "total_exec_time" : "total_time";
       const meanCol = useExecSuffix ? "mean_exec_time" : "mean_time";

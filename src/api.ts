@@ -84,6 +84,15 @@ export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
   if (raw === undefined) return undefined;
   if (raw === "0" || raw === "false") return { rejectUnauthorized: false };
   if (raw === "1" || raw === "true") return { rejectUnauthorized: true };
+  // Env var IS set but doesn't match a recognized form (e.g. `Flase`, `yes`,
+  // empty string). Returning undefined here would silently fall through to
+  // pg's default behavior, which is indistinguishable from "env var unset"
+  // and lets a typo connect with unintended TLS posture. Surface the
+  // misconfiguration on stderr (stdio MCP uses stdout for protocol, so
+  // stderr is safe for logs).
+  console.error(
+    `[postgres-mcp] POSTGRES_SSL_REJECT_UNAUTHORIZED=${JSON.stringify(raw)} not recognized; expected "0", "false", "1", or "true". Deferring to the pg driver / connection-string default.`,
+  );
   return undefined;
 }
 

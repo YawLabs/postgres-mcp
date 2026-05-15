@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `pg_advisor` `tables_without_primary_key` now includes partitioned-table
+  parents (`relkind='p'`) alongside plain heap tables. A partitioned table
+  with no PK is a real design-drift signal -- and the neighboring
+  `public_tables_without_rls` check already covered both relkinds, so the
+  inconsistency was an oversight. Partition children still inherit the
+  parent's PK as an `indisprimary` index, so they remain filtered out by
+  the existing `NOT EXISTS` clause.
+- `pg_replication_status` now surfaces partial failures via a top-level
+  `_warnings` array instead of short-circuiting on the first sub-query
+  failure. Matches the convention already used by `pg_health`,
+  `pg_describe_table`, and `pg_advisor`. When the WAL position lookup
+  fails, `is_replica` is now `null` rather than `false` so a permission
+  error can't be mistaken for "this is a primary."
+- `identSchema` (shared schema/table/column-name validator) now enforces
+  postgres's 63-byte `NAMEDATALEN` limit on byte length, not JS char
+  length. A multi-byte identifier like 32x `é` (64 UTF-8 bytes) used to
+  pass validation but postgres would silently truncate it; now it fails
+  at the call boundary with a clear message. Centralized in `params.ts`
+  so `schemas.ts`, `stats.ts`, `admin.ts`, and `explain.ts` share one
+  definition. `pg_explain.hypothetical_indexes` validates the same byte
+  limit per-piece on the `schema.table` form and per-column inside
+  `validateHypoIndex`, so direct handler calls that bypass Zod still
+  get the protection.
+- `getSslConfig` now logs a one-shot stderr warning when
+  `POSTGRES_SSL_REJECT_UNAUTHORIZED` is set to an unrecognized value
+  (typo, empty string, ...). Previously the typo silently fell through
+  to pg's default, indistinguishable from "env var unset" -- a connection
+  with unintended TLS posture could land without any signal.
+
+### Changed
+- `pg_top_queries` extension-presence and version probes consolidated
+  into a single catalog round-trip (was two). The actual stats query
+  remains a second round-trip since the column names are version-dynamic.
+
 ## [0.6.0] - 2026-05-14
 
 ### Added

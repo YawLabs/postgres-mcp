@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import { getConnectionTimeoutMs, getMaxRows, getPoolMax, getSslConfig, isWritesAllowed } from "./api.js";
 
 describe("isWritesAllowed", () => {
@@ -154,13 +154,72 @@ describe("getSslConfig", () => {
   });
 
   it("returns undefined for unrecognized values (defers to pg driver)", () => {
-    for (const v of ["yes", "no", "TRUE", "False", "", "maybe"]) {
-      process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = v;
-      assert.equal(
-        getSslConfig(),
-        undefined,
-        `POSTGRES_SSL_REJECT_UNAUTHORIZED=${JSON.stringify(v)} should return undefined`,
-      );
+    // Stub console.error so the warning written by the unrecognized-value
+    // path doesn't fill the test output. The warning itself is asserted in
+    // the dedicated describe below.
+    const originalErr = console.error;
+    console.error = () => {};
+    try {
+      for (const v of ["yes", "no", "TRUE", "False", "", "maybe"]) {
+        process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = v;
+        assert.equal(
+          getSslConfig(),
+          undefined,
+          `POSTGRES_SSL_REJECT_UNAUTHORIZED=${JSON.stringify(v)} should return undefined`,
+        );
+      }
+    } finally {
+      console.error = originalErr;
     }
+  });
+});
+
+describe("getSslConfig stderr warning on unrecognized values", () => {
+  const original = process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
+  const originalErr = console.error;
+  let stderrCalls: string[] = [];
+
+  beforeEach(() => {
+    stderrCalls = [];
+    console.error = (msg?: unknown) => {
+      stderrCalls.push(String(msg));
+    };
+  });
+  afterEach(() => {
+    console.error = originalErr;
+    if (original === undefined) delete process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
+    else process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = original;
+  });
+
+  it("warns once on an unrecognized value (typo, e.g. 'Flase')", () => {
+    process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = "Flase";
+    getSslConfig();
+    assert.equal(stderrCalls.length, 1, `expected one stderr line, got ${JSON.stringify(stderrCalls)}`);
+    assert.match(stderrCalls[0]!, /POSTGRES_SSL_REJECT_UNAUTHORIZED/);
+    assert.match(stderrCalls[0]!, /not recognized/i);
+    // Echoes the offending value so the user can find the typo quickly.
+    assert.match(stderrCalls[0]!, /Flase/);
+  });
+
+  it("warns on an empty string (assignment without value is still a misconfiguration)", () => {
+    process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = "";
+    getSslConfig();
+    assert.equal(stderrCalls.length, 1);
+    assert.match(stderrCalls[0]!, /not recognized/i);
+  });
+
+  it("does NOT warn for the recognized values 'true', 'false', '0', '1'", () => {
+    for (const v of ["true", "false", "0", "1"]) {
+      stderrCalls = [];
+      process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = v;
+      getSslConfig();
+      assert.equal(stderrCalls.length, 0, `unexpected warning for recognized value ${JSON.stringify(v)}`);
+    }
+  });
+
+  it("does NOT warn when the env var is unset", () => {
+    delete process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
+    getSslConfig();
+    assert.equal(stderrCalls.length, 0);
   });
 });

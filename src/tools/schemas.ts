@@ -1,10 +1,6 @@
 import { z } from "zod";
 import { runInternal, withSharedClient } from "../api.js";
-
-// Postgres identifier max length is 63 bytes. Quoted identifiers (e.g. "My Table",
-// "weird-name") are legal, so no regex restriction - inputs are parameter-bound
-// via $1/$2 in every query below, which makes arbitrary-string values safe.
-const identSchema = z.string().min(1).max(63);
+import { identSchema } from "./params.js";
 
 export const schemaTools = [
   {
