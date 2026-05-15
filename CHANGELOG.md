@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-05-15
+
+### Infrastructure
+- Closed integration / unit coverage gaps surfaced by the coverage audit:
+  `pg_kill` positive paths (cancel + terminate against an out-of-band
+  `pg.Client` backend) and `signaled=false` on a non-postgres PID;
+  `pg_advisor.public_tables_without_rls` and `sequence_exhaustion`
+  positive cases (the latter pins the post-0.5.2 numeric-precision
+  formula via a fixture sequence at 80%); `pg_unused_indexes` excluding
+  unique + primary indexes (data-integrity hazard if regressed);
+  `pg_search_columns` case-insensitive ILIKE; `pg_list_views` with
+  `includeMaterialized=false`; `pg_list_roles.member_of` as a real
+  JS `string[]` (0.3.1 regression guard via grouped fixture roles);
+  `typeNameCache` miss-fill on a CREATE TYPE issued mid-session;
+  `safeResolveTypeNames` fallback contract via a stub `PoolClient`
+  whose `.query` rejects (helper exported with an
+  `@internal -- for testing` note). Fixtures grew a materialized view,
+  a `near_full_seq` sequence, and two cluster-scoped roles; teardown
+  drops the roles in member-before-group order.
+- No behavior changes for tool consumers.
+
+## [0.6.1] - 2026-05-15
+
 ### Fixed
 - `pg_advisor` `tables_without_primary_key` now includes partitioned-table
   parents (`relkind='p'`) alongside plain heap tables. A partitioned table
