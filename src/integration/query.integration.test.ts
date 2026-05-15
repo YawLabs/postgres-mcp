@@ -7,7 +7,9 @@ import { queryTools } from "../tools/query.js";
 import { statsTools } from "../tools/stats.js";
 import { FIXTURE_SCHEMA, integrationEnabled, setupFixtures, teardownFixtures } from "./fixtures.js";
 
-const pgQuery = queryTools[0];
+const pgReadonly = queryTools.find((t) => t.name === "pg_readonly");
+const pgQuery = queryTools.find((t) => t.name === "pg_query");
+if (!pgReadonly || !pgQuery) throw new Error("pg_readonly and pg_query must be defined");
 const pgExplain = explainTools[0];
 const pgHealth = healthTools[0];
 const pgTopQueries = statsTools[0];
@@ -239,6 +241,67 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         assert.match(res.error ?? "", /cannot insert multiple commands|multiple commands|42601/i);
 
         const check = (await pgQuery.handler({
+          sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.users`,
+        })) as { ok: boolean; data?: { rows: { c: number }[] } };
+        assert.equal(check.ok, true);
+        assert.ok((check.data?.rows[0]?.c ?? 0) > 0);
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
+    });
+  });
+
+  describe("pg_readonly (unconditional read-only)", () => {
+    it("runs a SELECT and returns rows", async () => {
+      const res = (await pgReadonly.handler({
+        sql: `SELECT email FROM ${FIXTURE_SCHEMA}.users ORDER BY email`,
+      })) as { ok: boolean; data?: { rows: { email: string }[] } };
+      assert.equal(res.ok, true);
+      assert.deepEqual(
+        res.data?.rows.map((r) => r.email),
+        ["a@example.com", "b@example.com", "c@example.com"],
+      );
+    });
+
+    it("supports parameterized queries", async () => {
+      const res = (await pgReadonly.handler({
+        sql: `SELECT email FROM ${FIXTURE_SCHEMA}.users WHERE id = $1`,
+        params: [1],
+      })) as { ok: boolean; data?: { rows: { email: string }[] } };
+      assert.equal(res.ok, true);
+      assert.equal(res.data?.rows.length, 1);
+      assert.equal(res.data?.rows[0].email, "a@example.com");
+    });
+
+    // The load-bearing assertion: pg_readonly stays read-only regardless of
+    // ALLOW_WRITES. This is the whole reason the tool exists -- hosts can
+    // auto-allow it knowing no server-side env knob can turn it destructive.
+    it("blocks writes even when ALLOW_WRITES=1 is set", async () => {
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        const res = (await pgReadonly.handler({
+          sql: `INSERT INTO ${FIXTURE_SCHEMA}.users (email) VALUES ('readonly-bypass@example.com')`,
+        })) as { ok: boolean; error?: string };
+        assert.equal(res.ok, false, "pg_readonly must reject writes regardless of ALLOW_WRITES");
+        assert.match(res.error ?? "", /read-only|25006/i);
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
+    });
+
+    it("rejects stacked-query injection even with ALLOW_WRITES=1", async () => {
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        const payload = `SELECT 1; DROP SCHEMA ${FIXTURE_SCHEMA} CASCADE;`;
+        const res = (await pgReadonly.handler({ sql: payload })) as { ok: boolean; error?: string };
+        assert.equal(res.ok, false);
+        assert.match(res.error ?? "", /cannot insert multiple commands|multiple commands|42601/i);
+
+        const check = (await pgReadonly.handler({
           sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.users`,
         })) as { ok: boolean; data?: { rows: { c: number }[] } };
         assert.equal(check.ok, true);

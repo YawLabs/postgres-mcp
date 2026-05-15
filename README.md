@@ -27,7 +27,8 @@ None of them position themselves as a general-purpose daily driver you'd hand to
 
 ## Why this one?
 
-- **Read-only by default** - user SQL runs in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes. Opt in with `ALLOW_WRITES=1`.
+- **Read-only by default, with an unconditional read-only tool too** - `pg_query` runs user SQL in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes; opt in to writes with `ALLOW_WRITES=1`. `pg_readonly` is a separate tool that stays read-only regardless of `ALLOW_WRITES`, so hosts that gate tools individually (Claude Code permissions, mcp.hosting) can safely auto-allow it.
+- **Role-based access as the primary control** - the recommended posture is to use a least-privileged postgres role in `DATABASE_URL` (e.g. one with `GRANT pg_read_all_data`); postgres itself then enforces the boundary, no env var needed. See [Configuring access](#configuring-access).
 - **Extended query protocol for all user SQL** - `pg_query` sends user input with `queryMode: 'extended'`, which restricts each request to a single statement. This closes the [stacked-query injection class](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (`COMMIT; DROP SCHEMA x CASCADE;`) that defeated the reference server's `BEGIN READ ONLY` wrapper. Integration test asserts the rejection.
 - **Parameterized queries** - `pg_query` takes a `params` array for `$1`, `$2`, etc. No string-interpolated SQL in our code path.
 - **Written from scratch, actively maintained** - not a fork of the deprecated code. Unit + integration tests (`npm test`, `npm run test:integration`) run against a real Postgres; releases cut via `release.sh`.
@@ -94,6 +95,51 @@ Read-only is the default. If you want the agent to be able to `INSERT`, `UPDATE`
 
 Prefer scoping this to dev/test databases - for production, leave writes off and use migration tools out-of-band.
 
+## Configuring access
+
+The role in `DATABASE_URL` is the primary access control. Postgres has had a battle-tested permission system for 30 years; lean on it instead of relying on `ALLOW_WRITES` alone. A least-privileged role makes writes server-rejected no matter what tools or env vars are configured.
+
+**Read-only agent (recommended default):**
+
+```sql
+CREATE ROLE mcp_reader LOGIN PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE your_db TO mcp_reader;
+GRANT USAGE ON SCHEMA public TO mcp_reader;
+GRANT pg_read_all_data TO mcp_reader;
+```
+
+Point `DATABASE_URL` at `mcp_reader`. Postgres rejects every write, every DDL, every privilege change - regardless of `ALLOW_WRITES`. No app-level guard to bypass; the database is the boundary.
+
+**Scoped write agent (dev/test or narrow production use):**
+
+```sql
+CREATE ROLE mcp_writer LOGIN PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE your_db TO mcp_writer;
+GRANT USAGE ON SCHEMA public TO mcp_writer;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mcp_writer;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO mcp_writer;
+-- DDL not granted -- the agent can change data but not schema.
+```
+
+Set `ALLOW_WRITES=1` so `pg_query` will issue writes, and rely on the role to keep the agent away from DDL and other schemas.
+
+**Per-tool gating in the host:**
+
+Tools split cleanly across two authority classes:
+
+- **Auto-allow:** `pg_readonly` (server-side `BEGIN READ ONLY`, unconditional), plus the introspection tools (`pg_list_*`, `pg_describe_table`, `pg_search_columns`, `pg_explain` without ANALYZE-of-write, `pg_health`, `pg_inspect_locks`, `pg_table_bloat`, `pg_unused_indexes`, `pg_top_queries`, `pg_replication_status`, `pg_advisor`, `pg_table_privileges`, `pg_list_roles`).
+- **Always prompt:** `pg_query` (can write when the role allows it), `pg_kill` (changes session state).
+
+Claude Code's `permissions` block and mcp.hosting's per-tool toggle both honor this split.
+
+**`ALLOW_WRITES` as defense-in-depth:**
+
+`ALLOW_WRITES` is a secondary belt-and-braces gate. Useful when:
+- You're on a managed database where creating a second role is awkward (some Supabase/Neon plans).
+- You want a single role that can write, but want the MCP server to refuse writes anyway during normal operation.
+
+Otherwise, configure the role and stop relying on `ALLOW_WRITES`.
+
 ## What can an agent do with this?
 
 Once connected, the agent picks tools automatically based on what you ask. A few single-tool examples:
@@ -115,7 +161,8 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 
 | Tool | Description |
 |------|-------------|
-| `pg_query` | Run a SQL query. Read-only by default; writes require `ALLOW_WRITES=1`. Supports parameterized queries via `params`. Result fields include `dataTypeName` (e.g. `int4`, `jsonb`) alongside `dataTypeID`. |
+| `pg_readonly` | Run a SQL statement guaranteed read-only - always inside `BEGIN READ ONLY`, regardless of `ALLOW_WRITES`. The recommended tool for read access; safe for hosts to auto-allow. |
+| `pg_query` | Run a SQL query. Writes gated by the role in `DATABASE_URL` first, `ALLOW_WRITES` second. Supports parameterized queries via `params`. Result fields include `dataTypeName` (e.g. `int4`, `jsonb`) alongside `dataTypeID`. |
 | `pg_list_schemas` | List non-system schemas. |
 | `pg_list_tables` | List tables (and optionally views) in a schema with estimated row counts. Paginated via `limit`/`offset`. |
 | `pg_describe_table` | Kind, columns, PK, outgoing FKs, incoming FKs (`referenced_by`), CHECK / UNIQUE / EXCLUDE constraints, indexes, and partition parent/children for a relation. |
@@ -143,7 +190,7 @@ All env vars are read from the MCP server's environment:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DATABASE_URL` | (required) | PostgreSQL connection string. |
-| `ALLOW_WRITES` | unset | Set to `1` or `true` to allow DML/DDL via `pg_query` and `pg_explain` ANALYZE of writes. |
+| `ALLOW_WRITES` | unset | Secondary write gate for `pg_query` and `pg_explain` ANALYZE-of-writes. Set to `1` or `true` to lift the `BEGIN READ ONLY` wrapper. The role in `DATABASE_URL` is the primary control - see [Configuring access](#configuring-access). Does not affect `pg_readonly`, which is unconditional. |
 | `POSTGRES_STATEMENT_TIMEOUT_MS` | `30000` | Per-statement timeout. |
 | `POSTGRES_CONNECTION_TIMEOUT_MS` | `10000` | TCP connect timeout. Without this, a dead host hangs until the OS gives up (~2 minutes). |
 | `POSTGRES_MAX_ROWS` | `1000` | Cap on rows returned by `pg_query`. |
@@ -183,7 +230,7 @@ This disables certificate chain verification only -- the TCP connection is still
 
 **`canceling statement due to statement timeout`** - A single query exceeded `POSTGRES_STATEMENT_TIMEOUT_MS` (default 30s). Increase it, narrow the query with `WHERE`, or add an index. This is working as designed -- the timeout exists so a runaway query cannot hang the agent.
 
-**`Write blocked: this server is in read-only mode`** - You asked the agent to write but `ALLOW_WRITES` is not set. Add `ALLOW_WRITES=1` to the `env` block of `.mcp.json` and restart your MCP client. Only do this for dev/test DBs.
+**`Write blocked: this server is in read-only mode`** - You asked the agent to write via `pg_query` but `ALLOW_WRITES` is not set. Either add `ALLOW_WRITES=1` to the `env` block of `.mcp.json` and restart your MCP client (dev/test DBs), or - cleaner for production - use a role with `INSERT/UPDATE/DELETE` grants in `DATABASE_URL` and keep `ALLOW_WRITES` unset. See [Configuring access](#configuring-access). Note that `pg_readonly` always rejects writes; if you want writes, the call has to go through `pg_query`.
 
 **Connection pool exhaustion with PgBouncer transaction mode or pglite-socket** - These backends don't support concurrent queries on a single connection. Set `POSTGRES_POOL_MAX=1` in the env block.
 

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-14
+
+### Added
+- New `pg_readonly` tool. Always runs inside `BEGIN READ ONLY` regardless of
+  `ALLOW_WRITES`, so postgres itself rejects any write attempt. The point is
+  to give hosts that gate tools individually (Claude Code permissions,
+  mcp.hosting per-tool toggles) a stable always-safe target to auto-allow,
+  independent of how the server is configured. Same input shape as `pg_query`
+  (`sql` + `params`).
+- New "Configuring access" README section walking through the recommended
+  least-privileged-role posture: `CREATE ROLE mcp_reader ... GRANT
+  pg_read_all_data` for read-only agents, and a `mcp_writer` example with
+  table-level grants for scoped writes. The role is the primary access
+  control; `ALLOW_WRITES` is positioned as secondary belt-and-braces.
+
+### Changed
+- `pg_query` description leads with role-based access control. `ALLOW_WRITES`
+  is now framed as a secondary gate, with the role in `DATABASE_URL` as the
+  authoritative one. No behavior change.
+- README "Why this one?" read-only bullet expanded: `pg_query` continues to
+  default to read-only via `BEGIN READ ONLY`, and `pg_readonly` is the new
+  unconditional read tool. Configuration table and troubleshooting entry
+  for `ALLOW_WRITES` updated to point at the Configuring access section.
+
 ## [0.5.3] - 2026-05-14
 
 ### Security
