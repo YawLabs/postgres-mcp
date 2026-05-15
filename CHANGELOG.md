@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-05-15
+
+### Infrastructure
+- Closed the partial-failure coverage gap deferred in 0.6.2:
+  `pg_replication_status` `_warnings`-populated path is now exercised
+  by an integration test that REVOKEs `EXECUTE` on
+  `pg_current_wal_lsn()` from PUBLIC, swaps `DATABASE_URL` to a
+  fixture LOGIN role (`mcp_test_restricted`, CONNECT-only), rebuilds
+  the pool, and asserts `ok=true` with `_warnings` populated,
+  `is_replica: null` (not `false`), `wal_position: null`, and a
+  42501-tagged `wal_position fetch failed` entry. The grant is
+  restored unconditionally outside `finally` so the primary assertion
+  error (if any) isn't shadowed by a cleanup throw.
+- `pg_health`, `pg_describe_table`, and `pg_advisor` share the same
+  partial-failure pattern but query catalogs PUBLIC can read;
+  engineering a realistic partial failure for them would require
+  revoking grants on catalog views, which would break the rest of the
+  suite. The success-case shape assertions already in their tests
+  protect the construction code from regression.
+- No behavior changes for tool consumers.
+
 ## [0.6.2] - 2026-05-15
 
 ### Infrastructure
