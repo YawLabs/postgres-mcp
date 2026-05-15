@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
+import { runInternal, shutdown } from "../api.js";
 import { adminTools } from "../tools/admin.js";
 import { statsTools } from "../tools/stats.js";
 import {
   FIXTURE_GROUP_ROLE,
+  FIXTURE_LIMITED_PASSWORD,
+  FIXTURE_LIMITED_ROLE,
   FIXTURE_MEMBER_ROLE,
   FIXTURE_SCHEMA,
   integrationEnabled,
@@ -284,6 +287,19 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
   });
 
   describe("pg_replication_status", () => {
+    // pg_health, pg_describe_table, and pg_advisor share the same `_warnings`
+    // partial-failure pattern but their sub-queries all hit catalog views
+    // readable by PUBLIC (pg_class, pg_namespace, pg_stat_user_tables,
+    // information_schema.*). Engineering a realistic partial failure for
+    // them would require revoking grants from PUBLIC, which would break
+    // the rest of the suite. The success-case shape (no `_warnings` key
+    // present) is already pinned in each of their own tests, and a
+    // construction-side regression would corrupt the success case too --
+    // so direct partial-failure coverage is limited to pg_replication_status
+    // here, where pg_current_wal_lsn() and pg_replication_slots are
+    // genuinely permission-gated and a non-pg_monitor role realistically
+    // hits them in managed-DB deployments.
+
     it("returns the standalone-DB shape with no slots, no replicas, and no warnings", async () => {
       // The integration cluster is a single standalone instance -- no slots,
       // no replicas, is_replica=false, wal_position non-null. The shape
@@ -306,6 +322,82 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.ok(Array.isArray(res.data?.slots));
       assert.ok(Array.isArray(res.data?.replicas));
       assert.equal(res.data?._warnings, undefined, "no warnings expected on a healthy standalone instance");
+    });
+
+    // Populated-`_warnings` path. The handler's three sub-queries (slots,
+    // replicas, wal_position) only one of which has a privilege gate that
+    // bites on a standalone cluster: on an instance with no slots / no
+    // replicas, pg_replication_slots and pg_stat_replication return empty
+    // rows even for non-pg_monitor roles. To force a real permission-
+    // denied we REVOKE EXECUTE on pg_current_wal_lsn() from PUBLIC for
+    // the duration of the test, then swap to a fixture role that lacks
+    // any direct grant. Cleanup re-grants so other tests / suites running
+    // in the same cluster see the default state.
+    it("populates _warnings when the role lacks EXECUTE on pg_current_wal_lsn()", async () => {
+      // Step 1 (as superuser): yank PUBLIC EXECUTE from the WAL function so
+      // a plain LOGIN role gets 42501. Superuser is unaffected.
+      const revoke = await runInternal("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() FROM PUBLIC");
+      assert.equal(revoke.ok, true, `REVOKE setup failed: ${revoke.error}`);
+
+      const originalUrl = process.env.DATABASE_URL!;
+      // Capture the primary test failure (if any) so cleanup below can run
+      // unconditionally. Throwing from a `finally` would shadow the
+      // assertion error, which is what the lint correctly objects to.
+      let testError: unknown = null;
+      try {
+        // Step 2: swap to the limited role and rebuild the pool so the
+        // handler's sub-queries actually run as that role.
+        const limited = new URL(originalUrl);
+        limited.username = FIXTURE_LIMITED_ROLE;
+        limited.password = FIXTURE_LIMITED_PASSWORD;
+        process.env.DATABASE_URL = limited.toString();
+        await shutdown();
+
+        const res = (await replicationStatus.handler()) as {
+          ok: boolean;
+          data?: {
+            is_replica: boolean | null;
+            wal_position: string | null;
+            slots: unknown[];
+            replicas: unknown[];
+            _warnings?: string[];
+          };
+          error?: string;
+        };
+        assert.equal(res.ok, true, `handler must return partial-failure shape, not a hard error; got ${res.error}`);
+        const warnings = res.data?._warnings ?? [];
+        assert.ok(
+          warnings.length > 0,
+          `expected at least one warning under restricted role, got ${JSON.stringify(res.data)}`,
+        );
+        // walRes failure: is_replica and wal_position MUST go null. `false`
+        // here would falsely tell the caller "this is a primary" when in
+        // fact we couldn't determine the role at all.
+        assert.equal(res.data?.is_replica, null, "is_replica must be null, not false, when walRes fails");
+        assert.equal(res.data?.wal_position, null, "wal_position must be null when walRes fails");
+        // The wal_position warning specifically should reference permission
+        // denied or SQLSTATE 42501.
+        assert.ok(
+          warnings.some((w) => /wal_position fetch failed/.test(w) && /permission denied|42501/i.test(w)),
+          `expected a wal_position permission-denied warning, got ${JSON.stringify(warnings)}`,
+        );
+      } catch (e) {
+        testError = e;
+      }
+
+      // Cleanup (always runs). Restore the superuser URL + pool first, then
+      // re-grant the default. A failure here means subsequent test files
+      // in the same cluster will fail on walRes, so surface it -- but only
+      // if the test itself didn't already throw, since the primary failure
+      // is the more informative signal.
+      process.env.DATABASE_URL = originalUrl;
+      await shutdown();
+      const grant = await runInternal("GRANT EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() TO PUBLIC");
+
+      if (testError) throw testError;
+      if (!grant.ok) {
+        throw new Error(`Failed to restore PUBLIC EXECUTE on pg_current_wal_lsn(): ${grant.error}`);
+      }
     });
   });
 

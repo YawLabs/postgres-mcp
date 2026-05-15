@@ -16,6 +16,16 @@ export const FIXTURE_SCHEMA = "test_fixture";
 export const FIXTURE_GROUP_ROLE = "mcp_test_group";
 export const FIXTURE_MEMBER_ROLE = "mcp_test_member";
 
+// Limited-privilege login role used by the pg_replication_status _warnings
+// partial-failure test: the role has CONNECT only, no pg_monitor / no
+// REPLICATION attribute, so the three sub-queries inside
+// pg_replication_status all hit permission-denied and the handler must
+// surface them via the _warnings array (rather than the pre-0.6.1 short-
+// circuit return on first failure). Password is fixed so the test can
+// construct the limited DATABASE_URL deterministically.
+export const FIXTURE_LIMITED_ROLE = "mcp_test_restricted";
+export const FIXTURE_LIMITED_PASSWORD = "restricted_pw";
+
 export function integrationEnabled(): boolean {
   return process.env.POSTGRES_MCP_INTEGRATION === "1";
 }
@@ -124,6 +134,14 @@ export async function setupFixtures(): Promise<void> {
     `CREATE ROLE ${FIXTURE_GROUP_ROLE} NOLOGIN`,
     `CREATE ROLE ${FIXTURE_MEMBER_ROLE} NOLOGIN`,
     `GRANT ${FIXTURE_GROUP_ROLE} TO ${FIXTURE_MEMBER_ROLE}`,
+
+    // Limited login role for the pg_replication_status _warnings test.
+    // CONNECT is granted to PUBLIC by default on every postgres database,
+    // so we don't need an explicit GRANT here -- the role can connect but
+    // can't read any of the replication-monitoring views/functions because
+    // it has no pg_monitor / REPLICATION attribute.
+    `DROP ROLE IF EXISTS ${FIXTURE_LIMITED_ROLE}`,
+    `CREATE ROLE ${FIXTURE_LIMITED_ROLE} LOGIN PASSWORD '${FIXTURE_LIMITED_PASSWORD}'`,
   ];
 
   for (const sql of statements) {
@@ -148,6 +166,7 @@ export async function teardownFixtures(): Promise<void> {
     // there's no dangling role-membership row.
     await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_MEMBER_ROLE}`);
     await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_GROUP_ROLE}`);
+    await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_LIMITED_ROLE}`);
   } finally {
     await shutdown();
   }
