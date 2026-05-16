@@ -317,9 +317,17 @@ function toQueryResult(result: pg.QueryResult, maxRows: number, typeNames: Recor
  * end the READ ONLY transaction mid-stream and run DDL in autocommit.
  * See: https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/
  */
-/** Optional in-transaction hooks. `setup` runs after BEGIN, before user SQL.
- *  `teardown` runs in `finally` (always executed) so it can clean up
- *  session-scoped state (e.g. HypoPG hypothetical indexes) even on error. */
+/**
+ * Optional in-transaction hooks. `setup` runs after BEGIN, before user SQL.
+ * `teardown` runs in `finally` (always executed) so it can clean up
+ * session-scoped state (e.g. HypoPG hypothetical indexes) even on error.
+ *
+ * **Reserved savepoint name:** `runUserQueryBounded` opens
+ * `SAVEPOINT __pgmcp_sp` around the user SQL and `RELEASE`s it at the end.
+ * Hooks MUST NOT create a savepoint with that name -- the inner `RELEASE`
+ * here would unwind hook-owned state too. If you need a savepoint inside a
+ * hook, pick any other name.
+ */
 export interface RunHooks {
   setup?: (client: pg.PoolClient) => Promise<void>;
   teardown?: (client: pg.PoolClient) => Promise<void>;
