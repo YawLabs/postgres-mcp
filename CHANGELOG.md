@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-05-16
+
+### Security
+- `paramValue` (used by `pg_query`, `pg_readonly`, `pg_explain` for positional
+  parameters) was unbounded recursive via `z.lazy`. A pathologically nested
+  request body could surface a `Maximum call stack size exceeded` RangeError
+  out of the request path instead of a clear validation error. The new
+  `paramsArray` schema wraps the top-level params array with an iterative
+  depth check capped at 32 levels (arrays and objects each count as one
+  level). Closes #7.
+
 ## [0.6.13] - 2026-05-16
 
 ### Fixed
