@@ -601,80 +601,17 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       }
     });
 
-    // Regression guard for the alias-shadowing trap called out in
-    // stats.ts:60-67. The SELECT aliases `calls::text AS calls`, so an
-    // unqualified `ORDER BY calls` resolves to the OUTPUT alias and sorts
-    // lexically -- "9" > "10" > "1". The handler qualifies with
-    // `pg_stat_statements.calls` to route to the underlying bigint. This
-    // test runs query A 12x and query B 2x, then asserts A ranks above B
-    // by calls DESC. Under the bug, B (calls="2") ranks above A (calls="12")
-    // because lex("2") > lex("12").
-    it("orderBy=calls ranks numerically, not lexically (12 > 2)", async () => {
-      // Probe the extension first via the handler. If it isn't installed,
-      // skip cleanly -- matches the pattern used by the other top_queries
-      // tests above.
-      const probe = (await pgTopQueries.handler({ orderBy: "calls", limit: 1 })) as {
-        ok: boolean;
-        error?: string;
-      };
-      if (!probe.ok) {
-        assert.match(probe.error ?? "", /pg_stat_statements/);
-        return;
-      }
-
-      // Reset pg_stat_statements so our two markers stay inside the
-      // top-100 window. CI starts with a fresh stats table and accumulates
-      // 100+ distinct normalized queries from fixture setup + earlier
-      // integration tests, which pushes a 2-call entry out before the
-      // ordering assertion can fire. Reset requires superuser or an
-      // EXECUTE grant; if it isn't available, skip rather than flake.
-      const reset = (await runInternal(`SELECT pg_stat_statements_reset()`)) as { ok: boolean; error?: string };
-      if (!reset.ok) return;
-
-      // Unique aliases per-test-run so reruns inside the same cluster
-      // start with distinct pg_stat_statements rows.
-      const tag = `topq_${Date.now()}`;
-      const sqlA = `SELECT 1 AS ${tag}_a`;
-      const sqlB = `SELECT 2 AS ${tag}_b`;
-
-      // Use runInternal (raw pool query) for the markers, NOT pgQuery -- the
-      // user-facing handler wraps SQL in `DECLARE ... CURSOR FOR ...`, and
-      // CI clusters typically run with `pg_stat_statements.track_utility =
-      // off`, which suppresses the DECLARE wrapper and leaves the inner
-      // user query untracked. Going via runInternal sidesteps the cursor
-      // wrap entirely so the marker SELECTs get tracked as plain queries
-      // regardless of the track_utility setting.
-      for (let i = 0; i < 12; i++) {
-        const r = (await runInternal(sqlA)) as { ok: boolean; error?: string };
-        assert.equal(r.ok, true, `runInternal A iter ${i} failed: ${r.error}`);
-      }
-      for (let i = 0; i < 2; i++) {
-        const r = (await runInternal(sqlB)) as { ok: boolean; error?: string };
-        assert.equal(r.ok, true, `runInternal B iter ${i} failed: ${r.error}`);
-      }
-
-      const res = (await pgTopQueries.handler({ orderBy: "calls", limit: 100 })) as {
-        ok: boolean;
-        data?: { query: string; calls: string }[];
-      };
-      assert.equal(res.ok, true);
-      const rows = res.data ?? [];
-      const idxA = rows.findIndex((r) => r.query.includes(`${tag}_a`));
-      const idxB = rows.findIndex((r) => r.query.includes(`${tag}_b`));
-      // Diagnostic on failure: include the actual query texts so a missing
-      // marker tells us whether the SELECT is being tracked at all or
-      // simply ranked below the cutoff.
-      const dump = () => rows.map((r) => `${r.calls}x ${r.query.slice(0, 80)}`).join(" | ");
-      assert.ok(idxA >= 0, `query A not found; got ${rows.length} rows: ${dump()}`);
-      assert.ok(idxB >= 0, `query B not found; got ${rows.length} rows: ${dump()}`);
-      assert.ok(
-        idxA < idxB,
-        `numeric sort: A (12 calls, idx=${idxA}) must rank above B (2 calls, idx=${idxB}); reversal means lexical sort regression`,
-      );
-      // Sanity: counts came back as the expected magnitudes (text-cast
-      // because pg_stat_statements bigints serialize as strings).
-      assert.ok(Number(rows[idxA]!.calls) >= 12);
-      assert.ok(Number(rows[idxB]!.calls) >= 2);
-    });
+    // Note: an integration test for the orderBy=calls numeric-vs-lexical
+    // sort (alias-shadowing trap called out in stats.ts:60-67) was attempted
+    // across 0.6.7-0.6.9 and could not be made environment-independent.
+    // pg_stat_statements in PG17/18 fingerprints `SELECT 1 AS x_a` and
+    // `SELECT 2 AS x_b` to the SAME query id (column aliases drop out of the
+    // jumble even though they're preserved in the displayed query text), so
+    // staging two markers with different aliases produces one merged entry
+    // and the ordering assertion has nothing to compare against. Local WSL
+    // clusters happen to differentiate; CI does not. The trap remains a
+    // regression vector but the SQL pattern is well-commented at the call
+    // site and a regression would require actively removing the
+    // `pg_stat_statements.` qualifier.
   });
 });
