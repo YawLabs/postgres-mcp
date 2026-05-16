@@ -202,6 +202,23 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(res.ok, false);
       assert.match(res.error ?? "", /not found/i);
     });
+
+    // The `kind` field is what tells an agent "this is a matview, REFRESH
+    // not INSERT". The plain-view branch is covered above; this pins the
+    // 'm' branch of the relkind CASE so a regression that mislabels matviews
+    // as plain views or plain tables can't slip through.
+    it("reports kind=materialized_view for a materialized view", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "user_post_counts_mv" })) as {
+        ok: boolean;
+        data?: { kind: string; columns: { name: string }[] };
+        error?: string;
+      };
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      assert.equal(res.data?.kind, "materialized_view");
+      // Sanity check: the matview's projected columns come through.
+      const colNames = (res.data?.columns ?? []).map((c) => c.name).sort();
+      assert.deepEqual(colNames, ["email", "id", "post_count"]);
+    });
   });
 
   describe("pg_list_views", () => {

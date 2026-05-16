@@ -600,5 +600,57 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         }
       }
     });
+
+    // Regression guard for the alias-shadowing trap called out in
+    // stats.ts:60-67. The SELECT aliases `calls::text AS calls`, so an
+    // unqualified `ORDER BY calls` resolves to the OUTPUT alias and sorts
+    // lexically -- "9" > "10" > "1". The handler qualifies with
+    // `pg_stat_statements.calls` to route to the underlying bigint. This
+    // test runs query A 12x and query B 2x, then asserts A ranks above B
+    // by calls DESC. Under the bug, B (calls="2") ranks above A (calls="12")
+    // because lex("2") > lex("12").
+    it("orderBy=calls ranks numerically, not lexically (12 > 2)", async () => {
+      // Unique aliases per-test-run so pg_stat_statements entries don't
+      // accumulate across reruns and dilute the ordering signal.
+      const tag = `topq_${Date.now()}`;
+      const sqlA = `SELECT 1 AS ${tag}_a`;
+      const sqlB = `SELECT 2 AS ${tag}_b`;
+
+      for (let i = 0; i < 12; i++) {
+        const r = (await pgQuery.handler({ sql: sqlA })) as { ok: boolean };
+        assert.equal(r.ok, true);
+      }
+      for (let i = 0; i < 2; i++) {
+        const r = (await pgQuery.handler({ sql: sqlB })) as { ok: boolean };
+        assert.equal(r.ok, true);
+      }
+
+      const res = (await pgTopQueries.handler({ orderBy: "calls", limit: 100 })) as {
+        ok: boolean;
+        data?: { query: string; calls: string }[];
+        error?: string;
+      };
+      if (!res.ok) {
+        // pg_stat_statements absent -- nothing to assert against, treat as skip.
+        assert.match(res.error ?? "", /pg_stat_statements/);
+        return;
+      }
+      const rows = res.data ?? [];
+      const idxA = rows.findIndex((r) => r.query.includes(`${tag}_a`));
+      const idxB = rows.findIndex((r) => r.query.includes(`${tag}_b`));
+      // Both should land in the top 100. If pg_stat_statements has been
+      // running with extreme volume, A could push B out -- still safe, but
+      // we want both visible to actually compare ranks.
+      assert.ok(idxA >= 0, `query A not found in top 100 by calls; got ${rows.length} rows`);
+      assert.ok(idxB >= 0, `query B not found in top 100 by calls; got ${rows.length} rows`);
+      assert.ok(
+        idxA < idxB,
+        `numeric sort: A (12 calls, idx=${idxA}) must rank above B (2 calls, idx=${idxB}); reversal means lexical sort regression`,
+      );
+      // Sanity: counts came back as the expected magnitudes (text-cast
+      // because pg_stat_statements bigints serialize as strings).
+      assert.ok(Number(rows[idxA]!.calls) >= 12);
+      assert.ok(Number(rows[idxB]!.calls) >= 2);
+    });
   });
 });

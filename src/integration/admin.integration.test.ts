@@ -43,6 +43,80 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       // No contention expected in isolated test run, but we don't hard-assert 0
       // since a parallel test could incidentally hold a lock.
     });
+
+    // Real-contention coverage. The negative case above proves the SELECT
+    // runs; this test proves the LATERAL unnest of pg_blocking_pids() and
+    // the per-(blocked, blocker) row shape advertised in the description
+    // actually fire. Without this, a regression that drops the JOIN or
+    // mangles the unnest would still pass the empty-array test.
+    //
+    // Uses ACCESS EXCLUSIVE table lock (rather than row-level FOR UPDATE) so
+    // the blocked waiter queues on a relation lock with `bl.relation` set --
+    // exercising the relation-resolution CASE. Row-level contention queues
+    // on a transactionid lock (relation IS NULL); the relation field is
+    // genuinely unresolved in that case, which is a tool-level limitation
+    // separate from this test.
+    it("reports a blocked-by-blocker pair with relation under real lock contention", async () => {
+      const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      const waiter = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await holder.connect();
+      await waiter.connect();
+      try {
+        const holderPid = (await holder.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+        const waiterPid = (await waiter.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+
+        // Holder takes an ACCESS EXCLUSIVE lock -- the same lock ALTER TABLE
+        // and VACUUM FULL acquire. Conflicts with every other lock mode,
+        // including the AccessShareLock a plain SELECT needs.
+        await holder.query("BEGIN");
+        await holder.query(`LOCK TABLE ${FIXTURE_SCHEMA}.users IN ACCESS EXCLUSIVE MODE`);
+
+        // Waiter's SELECT needs AccessShareLock on users -- blocks on a
+        // relation lock, so bl.relation in the handler's CASE is non-null.
+        const waiterPromise = waiter.query(`SELECT 1 FROM ${FIXTURE_SCHEMA}.users LIMIT 1`).catch((e: unknown) => e);
+
+        // Give postgres time to actually register the wait. 500ms is plenty
+        // on the local cluster -- the waiter is already in pg_locks by then.
+        await new Promise((r) => setTimeout(r, 500));
+
+        const res = (await inspectLocks.handler({ limit: 50 })) as {
+          ok: boolean;
+          data?: {
+            blocked_pid: number;
+            blocking_pid: number;
+            blocked_query: string;
+            relation: string | null;
+            lock_type: string;
+          }[];
+        };
+        assert.equal(res.ok, true);
+        const pair = (res.data ?? []).find((r) => r.blocked_pid === waiterPid && r.blocking_pid === holderPid);
+        assert.ok(pair, `expected a blocked=${waiterPid} blocking=${holderPid} pair, got ${JSON.stringify(res.data)}`);
+        // The blocked query is the waiter's SELECT.
+        assert.match(pair.blocked_query, /SELECT/i);
+        // Relation lock -> bl.relation set -> CASE returns schema.table form.
+        assert.ok(
+          pair.relation?.includes("users"),
+          `expected relation to include 'users', got ${JSON.stringify(pair.relation)}`,
+        );
+        assert.equal(pair.lock_type, "relation");
+
+        // Release the holder so the waiter completes and the test cleans up.
+        await holder.query("ROLLBACK");
+        await waiterPromise;
+      } finally {
+        try {
+          await holder.end();
+        } catch {
+          // Best-effort.
+        }
+        try {
+          await waiter.end();
+        } catch {
+          // Best-effort.
+        }
+      }
+    });
   });
 
   describe("pg_list_roles", () => {
@@ -140,6 +214,29 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       const tables = (res.data ?? []).map((r) => r.table);
       assert.ok(tables.length > 0, "expected some stats rows from fixture schema");
     });
+
+    // Exercises the no-schema branch of the conditional WHERE clause. A
+    // regression that swaps the two branches would silently leak cross-
+    // schema rows when the user did scope to a schema, or scope when they
+    // didn't. The negative is just as load-bearing as the positive.
+    it("with no schema arg spans all user schemas and excludes pg_*/information_schema", async () => {
+      const res = (await seqScanTables.handler({ minSize: 0, limit: 100 })) as {
+        ok: boolean;
+        data?: { schema: string }[];
+      };
+      assert.equal(res.ok, true);
+      assert.ok(Array.isArray(res.data));
+      for (const row of res.data ?? []) {
+        assert.ok(!row.schema.startsWith("pg_"), `pg_* schema leaked: ${row.schema}`);
+        assert.notEqual(row.schema, "information_schema", "information_schema leaked");
+      }
+      // Fixture schema must appear -- proves the "all user schemas" path
+      // isn't accidentally restrictive.
+      assert.ok(
+        (res.data ?? []).some((r) => r.schema === FIXTURE_SCHEMA),
+        `expected ${FIXTURE_SCHEMA} in unfiltered result, got ${JSON.stringify((res.data ?? []).map((r) => r.schema))}`,
+      );
+    });
   });
 
   describe("pg_table_bloat", () => {
@@ -155,6 +252,63 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
           row.dead_ratio >= 0 && row.dead_ratio <= 1,
           `dead_ratio must be in [0,1] for ${row.table}, got ${row.dead_ratio}`,
         );
+      }
+    });
+
+    // Threshold-filter regression guard. Other tests in the suite can mutate
+    // tuple counts as a side effect, so an absolute threshold isn't safe to
+    // hard-code. Instead, prove the relationship: (a) every row in the
+    // filtered result is at or above the threshold, and (b) every baseline
+    // row below the threshold is absent from the filtered result. A
+    // regression that drops the `>= $1` predicate breaks both properties.
+    //
+    // pg_stat_user_tables.n_live_tup / n_dead_tup are populated by
+    // ANALYZE/VACUUM, not raw INSERT, so without ANALYZE the fixture tables
+    // sit at (0, 0) and the handler's `(n_live_tup + n_dead_tup) > 0` filter
+    // excludes them all -- producing an empty baseline that defeats the test.
+    it("minDeadRatio threshold actually filters rows below it (relative)", async () => {
+      const analyzeUsers = await runInternal(`ANALYZE ${FIXTURE_SCHEMA}.users`);
+      const analyzePosts = await runInternal(`ANALYZE ${FIXTURE_SCHEMA}.posts`);
+      assert.equal(analyzeUsers.ok, true, `ANALYZE users failed: ${analyzeUsers.error}`);
+      assert.equal(analyzePosts.ok, true, `ANALYZE posts failed: ${analyzePosts.error}`);
+
+      const baseline = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: 0, limit: 500 })) as {
+        ok: boolean;
+        data?: { table: string; dead_ratio: number }[];
+      };
+      assert.equal(baseline.ok, true);
+      assert.ok((baseline.data ?? []).length > 0, "expected at least one baseline row after ANALYZE");
+
+      const threshold = 0.5;
+      const filtered = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: threshold, limit: 500 })) as {
+        ok: boolean;
+        data?: { table: string; dead_ratio: number }[];
+      };
+      assert.equal(filtered.ok, true);
+      // Property A: every filtered row passes the threshold.
+      for (const r of filtered.data ?? []) {
+        assert.ok(r.dead_ratio >= threshold, `${r.table} ratio=${r.dead_ratio} should be >= ${threshold}`);
+      }
+      // Property B: every baseline row below the threshold is filtered out.
+      for (const b of (baseline.data ?? []).filter((r) => r.dead_ratio < threshold)) {
+        assert.ok(
+          !(filtered.data ?? []).some((f) => f.table === b.table),
+          `${b.table} (ratio=${b.dead_ratio}) should be absent at threshold=${threshold}`,
+        );
+      }
+    });
+
+    // Schema-filter branch (with schema arg). The other tests run without a
+    // schema; this one proves the `AND schemaname = $3` predicate fires.
+    // A regression that swaps the branches would leak cross-schema rows.
+    it("filters by schema when provided (no cross-schema leakage)", async () => {
+      const res = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: 0, limit: 500 })) as {
+        ok: boolean;
+        data?: { schema: string }[];
+      };
+      assert.equal(res.ok, true);
+      for (const row of res.data ?? []) {
+        assert.equal(row.schema, FIXTURE_SCHEMA, `expected only ${FIXTURE_SCHEMA}, got ${row.schema}`);
       }
     });
   });
@@ -440,6 +594,23 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         !indexes.some((i) => i.endsWith("_pkey")),
         `no *_pkey index should appear, got ${JSON.stringify(indexes)}`,
       );
+    });
+
+    // Exercises the no-schema branch of the conditional WHERE clause -- the
+    // other tests in this describe both pass schema=FIXTURE_SCHEMA, so the
+    // "all user schemas" path was previously unverified. A regression that
+    // swaps the branches would silently scope/unscope the result.
+    it("with no schema arg spans all user schemas and excludes pg_*/information_schema", async () => {
+      const res = (await unusedIndexes.handler({ maxScans: 1_000_000, limit: 200 })) as {
+        ok: boolean;
+        data?: { schema: string }[];
+      };
+      assert.equal(res.ok, true);
+      assert.ok(Array.isArray(res.data));
+      for (const row of res.data ?? []) {
+        assert.ok(!row.schema.startsWith("pg_"), `pg_* schema leaked: ${row.schema}`);
+        assert.notEqual(row.schema, "information_schema", "information_schema leaked");
+      }
     });
   });
 
