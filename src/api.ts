@@ -178,7 +178,7 @@ export interface ApiResponse<T = unknown> {
   error?: string;
 }
 
-function formatPgError(err: unknown): string {
+export function formatPgError(err: unknown): string {
   if (!(err instanceof Error)) return String(err);
 
   const errObj = err as Error & { code?: string; detail?: string; hint?: string };

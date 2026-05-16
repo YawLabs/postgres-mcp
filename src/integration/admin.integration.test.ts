@@ -728,10 +728,11 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
   describe("pg_kill", () => {
     // Nonexistent-PID path: the tool wraps the postgres function's boolean
-    // return in a `note` that explains why a `false` came back. We exercise
-    // with PID 1 -- guaranteed not to be a postgres backend, and the
-    // current role lacks pg_signal_backend authority over it.
-    it("returns signaled=false with a helpful note for a PID that is not a postgres backend", async () => {
+    // return in a `note` that explains why a `false` came back. v0.6.13
+    // captures pg's NOTICE channel so the note is specific ("not a
+    // PostgreSQL server process") rather than the generic three-way list.
+    // We exercise with PID 1 -- guaranteed not to be a postgres backend.
+    it("returns signaled=false with a NOTICE-derived note for a PID that is not a postgres backend", async () => {
       const original = process.env.ALLOW_WRITES;
       process.env.ALLOW_WRITES = "1";
       try {
@@ -743,7 +744,18 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         assert.equal(res.data?.pid, 1);
         assert.equal(res.data?.mode, "cancel");
         assert.equal(res.data?.signaled, false);
-        assert.match(res.data?.note ?? "", /PID 1 may not exist|may already be gone|lacks permission/i);
+        // postgres NOTICE for a non-backend PID: "PID 1 is not a
+        // PostgreSQL backend process" (PG13+; older versions sometimes
+        // said "server process"). Fall back to the generic note if the
+        // running postgres doesn't emit one at all.
+        assert.match(
+          res.data?.note ?? "",
+          /not a PostgreSQL (backend|server) process|may not exist|lacks permission/i,
+          `expected a notice-derived or fallback note, got ${JSON.stringify(res.data?.note)}`,
+        );
+        // The PID must appear somewhere in the note so the caller can
+        // correlate even if multiple pg_kill calls are in flight.
+        assert.match(res.data?.note ?? "", /\b1\b/, `note must reference PID 1, got ${JSON.stringify(res.data?.note)}`);
       } finally {
         if (original === undefined) delete process.env.ALLOW_WRITES;
         else process.env.ALLOW_WRITES = original;

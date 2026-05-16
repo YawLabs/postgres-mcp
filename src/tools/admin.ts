@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isWritesAllowed, runInternal, withSharedClient } from "../api.js";
+import { formatPgError, getPool, isWritesAllowed, runInternal, withSharedClient } from "../api.js";
 import { identSchema } from "./params.js";
 
 export const adminTools = [
@@ -212,7 +212,10 @@ export const adminTools = [
       "DATABASE_URL must have permission - cancelling another user's query needs the " +
       "`pg_signal_backend` role or superuser. Note: `pg_signal_backend` does NOT cover " +
       "superuser-owned backends - only a superuser can signal another superuser's session. " +
-      "Cancel is graceful; terminate is forceful.",
+      "Cancel is graceful; terminate is forceful. When `signaled=false`, the `note` field " +
+      "surfaces postgres's NOTICE explaining why (e.g. 'not a PostgreSQL backend process' for " +
+      "a non-pg PID, 'must be a member of...' for permission denial) so an agent can act on " +
+      "the specific cause rather than guess from a three-way list.",
     annotations: {
       title: "Cancel or terminate a backend",
       readOnlyHint: false,
@@ -238,20 +241,43 @@ export const adminTools = [
         };
       }
       const fn = mode === "terminate" ? "pg_terminate_backend" : "pg_cancel_backend";
-      const result = await runInternal<{ signaled: boolean }>(`SELECT ${fn}($1) AS signaled`, [pid]);
-      if (!result.ok) return result;
-      const signaled = result.data?.[0]?.signaled === true;
-      return {
-        ok: true,
-        data: {
-          pid,
-          mode,
-          signaled,
-          note: signaled
-            ? `Sent ${mode === "terminate" ? "SIGTERM" : "SIGINT"} to backend ${pid}.`
-            : `Signal returned false - PID ${pid} may not exist, may already be gone, or the current role lacks permission.`,
-        },
+
+      // pg_cancel_backend / pg_terminate_backend return false for both
+      // "no such PID" and "permission denied", but postgres emits a NOTICE
+      // distinguishing them ("PID N is not a PostgreSQL server process" vs
+      // "must be a member of the role whose query is being canceled or
+      // member of pg_signal_backend"). Capture NOTICEs on the underlying
+      // client during the call so we can surface them in the `note` field
+      // -- the boolean alone is not actionable for a confused agent.
+      const client = await getPool().connect();
+      const notices: string[] = [];
+      const onNotice = (n: { message?: string }) => {
+        if (n.message) notices.push(n.message);
       };
+      client.on("notice", onNotice);
+      try {
+        const result = await client.query<{ signaled: boolean }>(`SELECT ${fn}($1) AS signaled`, [pid]);
+        const signaled = result.rows[0]?.signaled === true;
+        const noticeText = notices.join(" ").trim();
+        return {
+          ok: true,
+          data: {
+            pid,
+            mode,
+            signaled,
+            note: signaled
+              ? `Sent ${mode === "terminate" ? "SIGTERM" : "SIGINT"} to backend ${pid}.`
+              : noticeText
+                ? `${noticeText} (Signal returned false for PID ${pid}.)`
+                : `Signal returned false - PID ${pid} may not exist, may already be gone, or the current role lacks permission.`,
+          },
+        };
+      } catch (err) {
+        return { ok: false, error: formatPgError(err) };
+      } finally {
+        client.off("notice", onNotice);
+        client.release();
+      }
     },
   },
 
