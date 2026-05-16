@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-05-16
+
+### Docs
+- `pg_table_privileges` description now flags the visibility caveat:
+  `information_schema.table_privileges` is filtered by what the calling role
+  can see, so a least-privileged role may miss grants involving unrelated
+  third-party roles. Recommends superuser or `pg_read_all_data` for a
+  complete picture.
+- `pg_inspect_locks` description now documents the row shape: one row per
+  (blocked_pid, blocking_pid) pair, so a session waiting on multiple
+  blockers appears on multiple rows. Suggests grouping by `blocked_pid`
+  for a per-blocked-session count.
+
 ## [0.6.5] - 2026-05-15
 
 ### Fixed
