@@ -9,7 +9,10 @@ export const adminTools = [
       "Show current lock contention: which sessions are blocked and who is blocking them. " +
       "Returns blocked PID, blocking PID, lock types, relation being contested, and the queries " +
       "involved. Use this first when a tool call hangs or the app feels stuck - it's the fastest " +
-      "way to identify a long-held transaction holding a lock.",
+      "way to identify a long-held transaction holding a lock. " +
+      "Row shape: one row per (blocked_pid, blocking_pid) pair. A session waiting on multiple " +
+      "blockers appears on multiple rows -- group/deduplicate by `blocked_pid` if you want a " +
+      "per-blocked-session count.",
     annotations: {
       title: "Inspect blocking locks",
       readOnlyHint: true,
@@ -131,7 +134,11 @@ export const adminTools = [
       "Show which roles have which privileges (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, " +
       "REFERENCES, TRIGGER) on a table or on every table in a schema. If `table` is omitted, " +
       "the result spans every table in `schema`, ordered by table then grantee. Use this to " +
-      "answer 'who can write to this table?' or to audit schema-wide access before a migration.",
+      "answer 'who can write to this table?' or to audit schema-wide access before a migration. " +
+      "Visibility caveat: backed by `information_schema.table_privileges`, which postgres filters " +
+      "by what the calling role can see. A least-privileged role may not see grants involving " +
+      "unrelated third-party roles. For a complete picture, run as a superuser or a member of " +
+      "`pg_read_all_data`.",
     annotations: {
       title: "Show table privileges",
       readOnlyHint: true,
