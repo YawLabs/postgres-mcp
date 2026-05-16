@@ -610,8 +610,29 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     // by calls DESC. Under the bug, B (calls="2") ranks above A (calls="12")
     // because lex("2") > lex("12").
     it("orderBy=calls ranks numerically, not lexically (12 > 2)", async () => {
-      // Unique aliases per-test-run so pg_stat_statements entries don't
-      // accumulate across reruns and dilute the ordering signal.
+      // Probe the extension first via the handler. If it isn't installed,
+      // skip cleanly -- matches the pattern used by the other top_queries
+      // tests above.
+      const probe = (await pgTopQueries.handler({ orderBy: "calls", limit: 1 })) as {
+        ok: boolean;
+        error?: string;
+      };
+      if (!probe.ok) {
+        assert.match(probe.error ?? "", /pg_stat_statements/);
+        return;
+      }
+
+      // Reset pg_stat_statements so our two markers stay inside the
+      // top-100 window. CI starts with a fresh stats table and accumulates
+      // 100+ distinct normalized queries from fixture setup + earlier
+      // integration tests, which pushes a 2-call entry out before the
+      // ordering assertion can fire. Reset requires superuser or an
+      // EXECUTE grant; if it isn't available, skip rather than flake.
+      const reset = (await runInternal(`SELECT pg_stat_statements_reset()`)) as { ok: boolean; error?: string };
+      if (!reset.ok) return;
+
+      // Unique aliases per-test-run so reruns inside the same cluster
+      // start with distinct pg_stat_statements rows.
       const tag = `topq_${Date.now()}`;
       const sqlA = `SELECT 1 AS ${tag}_a`;
       const sqlB = `SELECT 2 AS ${tag}_b`;
@@ -628,19 +649,11 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       const res = (await pgTopQueries.handler({ orderBy: "calls", limit: 100 })) as {
         ok: boolean;
         data?: { query: string; calls: string }[];
-        error?: string;
       };
-      if (!res.ok) {
-        // pg_stat_statements absent -- nothing to assert against, treat as skip.
-        assert.match(res.error ?? "", /pg_stat_statements/);
-        return;
-      }
+      assert.equal(res.ok, true);
       const rows = res.data ?? [];
       const idxA = rows.findIndex((r) => r.query.includes(`${tag}_a`));
       const idxB = rows.findIndex((r) => r.query.includes(`${tag}_b`));
-      // Both should land in the top 100. If pg_stat_statements has been
-      // running with extreme volume, A could push B out -- still safe, but
-      // we want both visible to actually compare ranks.
       assert.ok(idxA >= 0, `query A not found in top 100 by calls; got ${rows.length} rows`);
       assert.ok(idxB >= 0, `query B not found in top 100 by calls; got ${rows.length} rows`);
       assert.ok(
