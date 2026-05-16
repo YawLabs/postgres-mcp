@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-05-16
+
+### Fixed
+- `pg_kill` now captures postgres's NOTICE channel during
+  `pg_cancel_backend` / `pg_terminate_backend` and surfaces the message in
+  the `note` field when `signaled=false`. Postgres distinguishes "PID N
+  is not a PostgreSQL backend process" from "must be a member of the role
+  whose query is being canceled or member of pg_signal_backend" via
+  NOTICE, but the boolean return collapses both to `false`. Pre-0.6.13
+  the handler returned a generic three-way list and the agent had to
+  guess; now the cause is in the response. Closes #6.
+
+### Docs
+- `pg_kill` description now documents the NOTICE-derived `note` field.
+
+### Internal
+- `formatPgError` is now exported from `api.ts` so handlers that bypass
+  `runInternal` / `withSharedClient` (currently only `pg_kill`) can format
+  errors consistently with the rest of the codebase.
+
 ## [0.6.12] - 2026-05-16
 
 ### Fixed
