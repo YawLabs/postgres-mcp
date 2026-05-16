@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-05-16
+
+### Docs
+- `RunHooks` interface in `api.ts` now documents that `__pgmcp_sp` is a
+  reserved savepoint name. `runUserQueryBounded` opens and releases that
+  savepoint around the user SQL; a hook that opens a savepoint with the
+  same name would be unwound by the inner `RELEASE`. Today no hook collides
+  -- this is a contract note for future hook authors. Closes #8.
+
 ## [0.6.14] - 2026-05-16
 
 ### Security
