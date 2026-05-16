@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.12] - 2026-05-16
+
+### Fixed
+- `pg_inspect_locks` now resolves `relation` for the common case of row-level
+  contention. Previously, `SELECT FOR UPDATE` + `UPDATE` row-level waits
+  queued on a `transactionid` lock with `pg_locks.relation = NULL`, so the
+  handler returned `relation: null` and gave the agent no hint as to which
+  table was contested. A fallback subquery now resolves the contested table
+  from the blocker's held write-intent relation locks (RowShareLock,
+  RowExclusiveLock, etc.), filtering out plain SELECT's AccessShareLock so
+  unrelated tables the blocker only read from don't show up. Closes #5.
+
 ## [0.6.11] - 2026-05-16
 
 ### Infrastructure
