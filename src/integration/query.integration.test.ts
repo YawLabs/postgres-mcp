@@ -637,13 +637,20 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       const sqlA = `SELECT 1 AS ${tag}_a`;
       const sqlB = `SELECT 2 AS ${tag}_b`;
 
+      // Use runInternal (raw pool query) for the markers, NOT pgQuery -- the
+      // user-facing handler wraps SQL in `DECLARE ... CURSOR FOR ...`, and
+      // CI clusters typically run with `pg_stat_statements.track_utility =
+      // off`, which suppresses the DECLARE wrapper and leaves the inner
+      // user query untracked. Going via runInternal sidesteps the cursor
+      // wrap entirely so the marker SELECTs get tracked as plain queries
+      // regardless of the track_utility setting.
       for (let i = 0; i < 12; i++) {
-        const r = (await pgQuery.handler({ sql: sqlA })) as { ok: boolean };
-        assert.equal(r.ok, true);
+        const r = (await runInternal(sqlA)) as { ok: boolean; error?: string };
+        assert.equal(r.ok, true, `runInternal A iter ${i} failed: ${r.error}`);
       }
       for (let i = 0; i < 2; i++) {
-        const r = (await pgQuery.handler({ sql: sqlB })) as { ok: boolean };
-        assert.equal(r.ok, true);
+        const r = (await runInternal(sqlB)) as { ok: boolean; error?: string };
+        assert.equal(r.ok, true, `runInternal B iter ${i} failed: ${r.error}`);
       }
 
       const res = (await pgTopQueries.handler({ orderBy: "calls", limit: 100 })) as {
@@ -654,8 +661,12 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       const rows = res.data ?? [];
       const idxA = rows.findIndex((r) => r.query.includes(`${tag}_a`));
       const idxB = rows.findIndex((r) => r.query.includes(`${tag}_b`));
-      assert.ok(idxA >= 0, `query A not found in top 100 by calls; got ${rows.length} rows`);
-      assert.ok(idxB >= 0, `query B not found in top 100 by calls; got ${rows.length} rows`);
+      // Diagnostic on failure: include the actual query texts so a missing
+      // marker tells us whether the SELECT is being tracked at all or
+      // simply ranked below the cutoff.
+      const dump = () => rows.map((r) => `${r.calls}x ${r.query.slice(0, 80)}`).join(" | ");
+      assert.ok(idxA >= 0, `query A not found; got ${rows.length} rows: ${dump()}`);
+      assert.ok(idxB >= 0, `query B not found; got ${rows.length} rows: ${dump()}`);
       assert.ok(
         idxA < idxB,
         `numeric sort: A (12 calls, idx=${idxA}) must rank above B (2 calls, idx=${idxB}); reversal means lexical sort regression`,
