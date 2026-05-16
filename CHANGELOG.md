@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-05-16
+
+### Infrastructure
+- Tightened the `pg_inspect_locks` real-contention test: replaced the
+  500ms hardcoded sleep with a 5s polling loop on `pg_blocking_pids()`
+  (avoids flakes on slow CI hosts and wasted time on fast ones), and
+  moved the `waiterPromise` await into the `finally` block so an
+  assertion failure mid-test still drains the queued waiter query
+  rather than leaving a floating promise.
+
 ## [0.6.10] - 2026-05-16
 
 ### Infrastructure
