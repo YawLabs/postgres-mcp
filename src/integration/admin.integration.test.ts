@@ -61,6 +61,10 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       const waiter = new pg.Client({ connectionString: process.env.DATABASE_URL });
       await holder.connect();
       await waiter.connect();
+      // Hoisted out of the try block so the finally cleanup can await it
+      // on assertion-failure paths (try-block `const` is not visible in
+      // finally).
+      let waiterPromise: Promise<unknown> | undefined;
       try {
         const holderPid = (await holder.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
         const waiterPid = (await waiter.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
@@ -73,11 +77,24 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
         // Waiter's SELECT needs AccessShareLock on users -- blocks on a
         // relation lock, so bl.relation in the handler's CASE is non-null.
-        const waiterPromise = waiter.query(`SELECT 1 FROM ${FIXTURE_SCHEMA}.users LIMIT 1`).catch((e: unknown) => e);
+        waiterPromise = waiter.query(`SELECT 1 FROM ${FIXTURE_SCHEMA}.users LIMIT 1`).catch((e: unknown) => e);
 
-        // Give postgres time to actually register the wait. 500ms is plenty
-        // on the local cluster -- the waiter is already in pg_locks by then.
-        await new Promise((r) => setTimeout(r, 500));
+        // Poll pg_blocking_pids() until postgres actually registers the
+        // wait. Beats a hardcoded sleep, which can be too short on a slow
+        // CI host (waiter not yet queued) or too long on a fast one.
+        const deadline = Date.now() + 5000;
+        let registered = false;
+        while (Date.now() < deadline) {
+          const probe = (await runInternal<{ blockers: number[] }>("SELECT pg_blocking_pids($1)::int[] AS blockers", [
+            waiterPid,
+          ])) as { ok: boolean; data?: { blockers: number[] }[] };
+          if (probe.ok && (probe.data?.[0]?.blockers ?? []).length > 0) {
+            registered = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        assert.ok(registered, `waiter pid ${waiterPid} never appeared in pg_blocking_pids within 5s`);
 
         const res = (await inspectLocks.handler({ limit: 50 })) as {
           ok: boolean;
@@ -101,14 +118,25 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         );
         assert.equal(pair.lock_type, "relation");
 
-        // Release the holder so the waiter completes and the test cleans up.
+        // Release the holder so the waiter completes.
         await holder.query("ROLLBACK");
-        await waiterPromise;
       } finally {
+        // Order matters: close the holder first (which releases the lock if
+        // an assertion threw before the explicit ROLLBACK), then await the
+        // waiter (which can now make progress), then close the waiter. This
+        // keeps the floating waiterPromise from outliving the test on
+        // assertion-failure paths.
         try {
           await holder.end();
         } catch {
           // Best-effort.
+        }
+        if (waiterPromise) {
+          try {
+            await waiterPromise;
+          } catch {
+            // May reject if waiter.end() raced ahead -- benign.
+          }
         }
         try {
           await waiter.end();
