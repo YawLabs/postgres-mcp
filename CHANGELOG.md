@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-05-16
+
+### Infrastructure
+- Closed seven coverage gaps surfaced by a coverage audit. No behavior
+  changes; each test pins a branch the existing suite exercised on only
+  one side, or a structural property a regression could silently violate:
+  - `pg_inspect_locks` real ACCESS EXCLUSIVE contention with two side
+    clients. Covers the LATERAL `unnest(pg_blocking_pids(...))` and the
+    per-(blocked, blocker) row shape the v0.6.6 description claims.
+  - `pg_top_queries` `orderBy: 'calls'` numeric (not lexical) ordering.
+    A 12-call query must rank above a 2-call query -- pins the
+    alias-shadowing fix where unqualified `calls` would resolve to the
+    text output alias and sort lexically (`"2" > "12"`).
+  - `pg_table_bloat` `minDeadRatio` threshold filter, as a relative
+    property (filtered rows are at or above the threshold; baseline rows
+    below the threshold are absent from filtered). Order-independent.
+  - `pg_table_bloat` with-schema filter -- no cross-schema leakage when
+    scoped.
+  - `pg_seq_scan_tables` and `pg_unused_indexes` no-schema branch --
+    spans user schemas and excludes `pg_*` / `information_schema`.
+  - `pg_describe_table` on a materialized view -- `kind='materialized_view'`
+    branch of the relkind CASE.
+
 ## [0.6.6] - 2026-05-16
 
 ### Docs
