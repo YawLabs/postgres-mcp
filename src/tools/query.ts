@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { isWritesAllowed, runReadOnly, runReadWrite } from "../api.js";
-import { paramValue } from "./params.js";
+import { paramsArray } from "./params.js";
 
 export const queryTools = [
   {
@@ -23,7 +23,7 @@ export const queryTools = [
     },
     inputSchema: z.object({
       sql: z.string().min(1).max(1_000_000).describe("The SQL statement to execute. Hard cap of 1 MB."),
-      params: z.array(paramValue).optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
+      params: paramsArray.optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
     }),
     handler: async (input: unknown) => {
       const { sql, params } = input as { sql: string; params?: unknown[] };
@@ -52,7 +52,7 @@ export const queryTools = [
     },
     inputSchema: z.object({
       sql: z.string().min(1).max(1_000_000).describe("The SQL statement to execute. Hard cap of 1 MB."),
-      params: z.array(paramValue).optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
+      params: paramsArray.optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
     }),
     handler: async (input: unknown) => {
       const { sql, params } = input as { sql: string; params?: unknown[] };

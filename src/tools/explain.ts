@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { type ApiResponse, isWritesAllowed, runInternal, runReadOnly, runReadWriteRollback } from "../api.js";
-import { identSchema, paramValue } from "./params.js";
+import { identSchema, paramsArray } from "./params.js";
 
 const indexAccessMethod = z.enum(["btree", "hash", "gin", "gist", "brin", "spgist"]);
 
@@ -146,7 +146,7 @@ export const explainTools = [
       sql: z.string().min(1).max(1_000_000).describe("The SQL statement to explain. Do NOT prefix with EXPLAIN."),
       analyze: z.boolean().default(false).describe("Run EXPLAIN ANALYZE (actually executes the query)."),
       format: z.enum(["text", "json"]).default("text").describe("Output format."),
-      params: z.array(paramValue).optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
+      params: paramsArray.optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
       hypothetical_indexes: z
         .array(hypotheticalIndex)
         .optional()
