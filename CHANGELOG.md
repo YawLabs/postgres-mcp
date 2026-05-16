@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-05-15
+
+### Fixed
+- `pg_explain` now returns an explicit error if EXPLAIN comes back with zero
+  rows instead of a misleading `{plan: ""}` (text) or `{plan: undefined}`
+  (json) payload. Pathological in practice -- EXPLAIN always returns at least
+  one row -- but the response shape is now tight either way.
+
+### Docs
+- `pg_kill` description clarifies that `pg_signal_backend` does NOT authorize
+  signalling a superuser-owned backend; only a superuser can signal another
+  superuser's session. The `note` field already disambiguated post-hoc; the
+  description now matches.
+
 ## [0.6.3] - 2026-05-15
 
 ### Infrastructure

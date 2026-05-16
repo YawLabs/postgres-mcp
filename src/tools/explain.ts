@@ -230,6 +230,14 @@ export const explainTools = [
       const data = result.data as { rows: Record<string, unknown>[] } | undefined;
       const rows = data?.rows ?? [];
 
+      // EXPLAIN always returns at least one row in normal operation. A zero-row
+      // result here means something pathological happened (driver quirk, server
+      // returned an empty result set), so surface it as an error instead of a
+      // misleading `{plan: ""}` or `{plan: undefined}` payload.
+      if (rows.length === 0) {
+        return { ok: false, error: "EXPLAIN returned no rows; unable to produce a plan." };
+      }
+
       // EXPLAIN returns one row per plan line (`QUERY PLAN` column). Flatten for readability.
       if (format === "text") {
         const lines = rows.map((r) => String(r["QUERY PLAN"] ?? ""));

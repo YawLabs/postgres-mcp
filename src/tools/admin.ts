@@ -175,7 +175,9 @@ export const adminTools = [
       "equivalent) by PID. Find the PID via `pg_health` active_queries or `pg_inspect_locks`. " +
       "Requires ALLOW_WRITES=1 since this changes database session state. The role in " +
       "DATABASE_URL must have permission - cancelling another user's query needs the " +
-      "`pg_signal_backend` role or superuser. Cancel is graceful; terminate is forceful.",
+      "`pg_signal_backend` role or superuser. Note: `pg_signal_backend` does NOT cover " +
+      "superuser-owned backends - only a superuser can signal another superuser's session. " +
+      "Cancel is graceful; terminate is forceful.",
     annotations: {
       title: "Cancel or terminate a backend",
       readOnlyHint: false,
