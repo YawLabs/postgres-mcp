@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.7] - 2026-05-16
+## [0.6.8] - 2026-05-16
+
+### Infrastructure
+- Republishes the 0.6.7 coverage additions, which never reached npm: the
+  `pg_top_queries orderBy=calls` ordering test passed locally but failed
+  in CI because CI starts with a fresh `pg_stat_statements` that
+  accumulates 100+ distinct normalized queries from fixture setup,
+  pushing the test's low-call marker (B, 2 calls) out of the top-100
+  window before the ordering assertion could fire. The test now calls
+  `pg_stat_statements_reset()` before staging the markers; if reset
+  isn't available (no superuser / no extension), it skips cleanly.
+
+## [0.6.7] - 2026-05-16 [UNPUBLISHED]
+
+Tagged but never published to npm -- the integration matrix failed on a
+test-stability issue (not a code issue). The coverage additions below
+shipped in 0.6.8.
+
+
 
 ### Infrastructure
 - Closed seven coverage gaps surfaced by a coverage audit. No behavior
