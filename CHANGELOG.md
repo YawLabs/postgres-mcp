@@ -7,17 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.8] - 2026-05-16
+## [0.6.9] - 2026-05-16
 
 ### Infrastructure
-- Republishes the 0.6.7 coverage additions, which never reached npm: the
-  `pg_top_queries orderBy=calls` ordering test passed locally but failed
-  in CI because CI starts with a fresh `pg_stat_statements` that
-  accumulates 100+ distinct normalized queries from fixture setup,
-  pushing the test's low-call marker (B, 2 calls) out of the top-100
-  window before the ordering assertion could fire. The test now calls
+- Republishes the 0.6.8 coverage additions, which never reached npm. The
+  `pg_top_queries orderBy=calls` test now stages the marker queries via
+  raw `runInternal` (plain SELECTs) instead of `pgQuery.handler` (which
+  wraps user SQL in `DECLARE ... CURSOR FOR ...`). The cursor wrapping
+  made the test depend on `pg_stat_statements.track_utility=on` in the
+  target cluster; the new form is tracking-setting-independent. Failure
+  message now dumps the tracked queries so any future divergence is
+  diagnosable from the CI log.
+
+## [0.6.8] - 2026-05-16 [UNPUBLISHED]
+
+Tagged but never published to npm -- the v0.6.8 fix for the
+pg_top_queries test still depended on `pg_stat_statements.track_utility`
+being on, which the CI image's defaults don't guarantee. Shipped in 0.6.9.
+
+### Infrastructure
+- Reset attempt for the pg_top_queries ordering test: the test now calls
   `pg_stat_statements_reset()` before staging the markers; if reset
   isn't available (no superuser / no extension), it skips cleanly.
+  Insufficient on its own -- see 0.6.9 for the follow-up.
 
 ## [0.6.7] - 2026-05-16 [UNPUBLISHED]
 
