@@ -7,35 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.9] - 2026-05-16
+## [0.6.10] - 2026-05-16
 
 ### Infrastructure
-- Republishes the 0.6.8 coverage additions, which never reached npm. The
-  `pg_top_queries orderBy=calls` test now stages the marker queries via
-  raw `runInternal` (plain SELECTs) instead of `pgQuery.handler` (which
-  wraps user SQL in `DECLARE ... CURSOR FOR ...`). The cursor wrapping
-  made the test depend on `pg_stat_statements.track_utility=on` in the
-  target cluster; the new form is tracking-setting-independent. Failure
-  message now dumps the tracked queries so any future divergence is
-  diagnosable from the CI log.
+- Republishes the 0.6.7-0.6.9 coverage additions, which never reached
+  npm. The `pg_top_queries orderBy=calls` numeric-vs-lexical ordering
+  test was removed after three round-trips trying to make it
+  environment-independent. pg_stat_statements on PG17/18 fingerprints
+  `SELECT 1 AS x_a` and `SELECT 2 AS x_b` to the same query id (column
+  aliases drop out of the jumble even though they're preserved in the
+  displayed text), so two markers with different aliases collapse to
+  one entry and the ordering assertion has nothing to compare. Local
+  WSL clusters differentiate; CI doesn't. The alias-shadowing trap at
+  `stats.ts:60-67` remains documented at the call site and the other
+  six coverage additions are unaffected.
+
+## [0.6.9] - 2026-05-16 [UNPUBLISHED]
+
+Tagged but never published to npm -- the pg_top_queries ordering test
+still failed in CI even after switching marker queries from cursor-
+wrapped handler calls to raw `runInternal`. Root cause was column-alias
+jumbling in pg_stat_statements; the test was removed in 0.6.10.
 
 ## [0.6.8] - 2026-05-16 [UNPUBLISHED]
 
-Tagged but never published to npm -- the v0.6.8 fix for the
+Tagged but never published to npm -- the v0.6.8 attempt at the
 pg_top_queries test still depended on `pg_stat_statements.track_utility`
 being on, which the CI image's defaults don't guarantee. Shipped in 0.6.9.
 
-### Infrastructure
-- Reset attempt for the pg_top_queries ordering test: the test now calls
-  `pg_stat_statements_reset()` before staging the markers; if reset
-  isn't available (no superuser / no extension), it skips cleanly.
-  Insufficient on its own -- see 0.6.9 for the follow-up.
-
 ## [0.6.7] - 2026-05-16 [UNPUBLISHED]
 
-Tagged but never published to npm -- the integration matrix failed on a
-test-stability issue (not a code issue). The coverage additions below
-shipped in 0.6.8.
+Tagged but never published to npm -- the initial coverage additions
+included an ordering test for pg_top_queries that failed in CI on a
+test-stability issue (not a code issue). The other six coverage
+additions shipped in 0.6.10.
 
 
 
