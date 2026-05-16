@@ -54,7 +54,35 @@ export const adminTools = [
                      FROM pg_catalog.pg_class c
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                      WHERE c.oid = bl.relation)
-             ELSE NULL
+             ELSE (
+               -- transactionid / virtualxid waits have bl.relation = NULL
+               -- because the wait is on the blocker's xid, not on a relation.
+               -- The contested table is usually identifiable from the
+               -- blocker's held write-intent locks: SELECT FOR UPDATE takes
+               -- RowShareLock, UPDATE/INSERT/DELETE take RowExclusiveLock,
+               -- migrations take stronger modes. Filter out the AccessShare
+               -- locks (plain SELECT) the blocker also holds on every table
+               -- they read from -- those aren't the contention source. If
+               -- the blocker has touched multiple write-intent tables in
+               -- their transaction, this is a best-effort hint, not a
+               -- definitive answer; the blocked/blocking queries above let
+               -- the caller disambiguate.
+               SELECT n.nspname || '.' || c.relname
+               FROM pg_catalog.pg_locks blocker_locks
+               JOIN pg_catalog.pg_class c ON c.oid = blocker_locks.relation
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               WHERE blocker_locks.pid = blocking.pid
+                 AND blocker_locks.locktype = 'relation'
+                 AND blocker_locks.granted
+                 AND blocker_locks.mode IN (
+                   'RowShareLock', 'RowExclusiveLock', 'ShareLock',
+                   'ShareRowExclusiveLock', 'ShareUpdateExclusiveLock',
+                   'ExclusiveLock', 'AccessExclusiveLock'
+                 )
+                 AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+               ORDER BY n.nspname, c.relname
+               LIMIT 1
+             )
            END AS relation,
            bl.locktype AS lock_type
          FROM pg_catalog.pg_locks bl

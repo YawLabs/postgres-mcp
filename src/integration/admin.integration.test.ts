@@ -44,19 +44,14 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       // since a parallel test could incidentally hold a lock.
     });
 
-    // Real-contention coverage. The negative case above proves the SELECT
-    // runs; this test proves the LATERAL unnest of pg_blocking_pids() and
-    // the per-(blocked, blocker) row shape advertised in the description
-    // actually fire. Without this, a regression that drops the JOIN or
-    // mangles the unnest would still pass the empty-array test.
-    //
-    // Uses ACCESS EXCLUSIVE table lock (rather than row-level FOR UPDATE) so
-    // the blocked waiter queues on a relation lock with `bl.relation` set --
-    // exercising the relation-resolution CASE. Row-level contention queues
-    // on a transactionid lock (relation IS NULL); the relation field is
-    // genuinely unresolved in that case, which is a tool-level limitation
-    // separate from this test.
-    it("reports a blocked-by-blocker pair with relation under real lock contention", async () => {
+    // Real-contention coverage, table-lock variant. Proves the LATERAL
+    // unnest of pg_blocking_pids() and the per-(blocked, blocker) row shape
+    // advertised in the description actually fire. Exercises the
+    // `bl.relation IS NOT NULL` branch of the relation CASE -- the waiter
+    // queues on a relation lock directly because ACCESS EXCLUSIVE conflicts
+    // with the AccessShareLock a plain SELECT needs. The row-level FOR
+    // UPDATE variant below exercises the `bl.relation IS NULL` fallback.
+    it("reports a blocked-by-blocker pair with relation under table-lock contention", async () => {
       const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
       const waiter = new pg.Client({ connectionString: process.env.DATABASE_URL });
       await holder.connect();
@@ -126,6 +121,95 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         // waiter (which can now make progress), then close the waiter. This
         // keeps the floating waiterPromise from outliving the test on
         // assertion-failure paths.
+        try {
+          await holder.end();
+        } catch {
+          // Best-effort.
+        }
+        if (waiterPromise) {
+          try {
+            await waiterPromise;
+          } catch {
+            // May reject if waiter.end() raced ahead -- benign.
+          }
+        }
+        try {
+          await waiter.end();
+        } catch {
+          // Best-effort.
+        }
+      }
+    });
+
+    // Row-level FOR UPDATE contention -- the common case in app workloads.
+    // The blocked waiter queues on a `transactionid` lock with bl.relation
+    // = NULL (the wait is on the holder's xid, not on a relation). Pre-#5
+    // the handler returned `relation: null` here; the fallback subquery
+    // now resolves the contested table from the blocker's held write-intent
+    // relation locks (SELECT FOR UPDATE takes RowShareLock on `users`).
+    it("reports a blocked-by-blocker pair with relation under row-level FOR UPDATE contention", async () => {
+      const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      const waiter = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await holder.connect();
+      await waiter.connect();
+      let waiterPromise: Promise<unknown> | undefined;
+      try {
+        const holderPid = (await holder.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+        const waiterPid = (await waiter.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+
+        // Holder grabs the row lock and keeps the transaction open. This
+        // takes a tuple lock + RowShareLock on the relation, plus an xid.
+        await holder.query("BEGIN");
+        await holder.query(`SELECT * FROM ${FIXTURE_SCHEMA}.users WHERE id = 1 FOR UPDATE`);
+
+        // Waiter's UPDATE on the same row queues on the holder's xid via
+        // a transactionid lock. bl.relation is NULL for this entry.
+        waiterPromise = waiter
+          .query(`UPDATE ${FIXTURE_SCHEMA}.users SET email = email WHERE id = 1`)
+          .catch((e: unknown) => e);
+
+        const deadline = Date.now() + 5000;
+        let registered = false;
+        while (Date.now() < deadline) {
+          const probe = (await runInternal<{ blockers: number[] }>("SELECT pg_blocking_pids($1)::int[] AS blockers", [
+            waiterPid,
+          ])) as { ok: boolean; data?: { blockers: number[] }[] };
+          if (probe.ok && (probe.data?.[0]?.blockers ?? []).length > 0) {
+            registered = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        assert.ok(registered, `waiter pid ${waiterPid} never appeared in pg_blocking_pids within 5s`);
+
+        const res = (await inspectLocks.handler({ limit: 50 })) as {
+          ok: boolean;
+          data?: {
+            blocked_pid: number;
+            blocking_pid: number;
+            blocked_query: string;
+            relation: string | null;
+            lock_type: string;
+          }[];
+        };
+        assert.equal(res.ok, true);
+        const pair = (res.data ?? []).find((r) => r.blocked_pid === waiterPid && r.blocking_pid === holderPid);
+        assert.ok(pair, `expected a blocked=${waiterPid} blocking=${holderPid} pair, got ${JSON.stringify(res.data)}`);
+        assert.match(pair.blocked_query, /UPDATE/i);
+        // lock_type is transactionid (the wait kind), but the fallback
+        // subquery resolves relation from the blocker's RowShareLock on users.
+        assert.equal(
+          pair.lock_type,
+          "transactionid",
+          `expected transactionid lock_type for row-level wait, got ${pair.lock_type}`,
+        );
+        assert.ok(
+          pair.relation?.includes("users"),
+          `expected relation to resolve to users via blocker-held-locks fallback, got ${JSON.stringify(pair.relation)}`,
+        );
+
+        await holder.query("ROLLBACK");
+      } finally {
         try {
           await holder.end();
         } catch {
