@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-05-18
+
+### Tests
+- The `pg_replication_status` `_warnings` integration test (which
+  `REVOKE`s `EXECUTE ON pg_current_wal_lsn()` from `PUBLIC` to force a
+  permission-denied path) now scopes the REVOKE/GRANT pair to a nested
+  describe's `before` / `after` hooks instead of an inline try/catch.
+  The previous shape left the cluster's `pg_current_wal_lsn()`
+  ungrantable to `PUBLIC` if cleanup itself raised (e.g. a
+  `shutdown()` throw between the URL restore and the GRANT), which
+  would degrade unrelated tests on the same cluster. node:test runs
+  `after()` whenever the matching `before()` ran -- assertion failure,
+  body throw, or future second `it()` in the block. No production
+  code change. Verified against PG17 and PG18 via the WSL integration
+  matrix.
+
 ## [0.6.15] - 2026-05-16
 
 ### Docs
