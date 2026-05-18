@@ -597,22 +597,44 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // rows even for non-pg_monitor roles. To force a real permission-
     // denied we REVOKE EXECUTE on pg_current_wal_lsn() from PUBLIC for
     // the duration of the test, then swap to a fixture role that lacks
-    // any direct grant. Cleanup re-grants so other tests / suites running
-    // in the same cluster see the default state.
-    it("populates _warnings when the role lacks EXECUTE on pg_current_wal_lsn()", async () => {
-      // Step 1 (as superuser): yank PUBLIC EXECUTE from the WAL function so
-      // a plain LOGIN role gets 42501. Superuser is unaffected.
-      const revoke = await runInternal("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() FROM PUBLIC");
-      assert.equal(revoke.ok, true, `REVOKE setup failed: ${revoke.error}`);
-
+    // any direct grant.
+    //
+    // REVOKE / GRANT live in before/after hooks rather than inline so the
+    // re-grant runs even when the test body throws an assertion or an
+    // earlier inline shutdown() fails -- node:test runs after() whenever
+    // the matching before() ran, regardless of test outcome. The previous
+    // inline try/catch left the cluster's pg_current_wal_lsn() ungrantable
+    // to PUBLIC if cleanup itself raised, and a future second `it()` in
+    // the block would have to remember to repeat the dance. No defense
+    // here against SIGKILL of the test process -- that needs out-of-band
+    // cleanup we don't have.
+    describe("_warnings under restricted role", () => {
+      // Resolve once at describe-load time so the after() hook can rebuild
+      // the superuser pool even if the test body throws mid-mutation.
       const originalUrl = process.env.DATABASE_URL!;
-      // Capture the primary test failure (if any) so cleanup below can run
-      // unconditionally. Throwing from a `finally` would shadow the
-      // assertion error, which is what the lint correctly objects to.
-      let testError: unknown = null;
-      try {
-        // Step 2: swap to the limited role and rebuild the pool so the
-        // handler's sub-queries actually run as that role.
+
+      before(async () => {
+        // Yank PUBLIC EXECUTE from the WAL function so a plain LOGIN role
+        // gets 42501. Superuser is unaffected.
+        const revoke = await runInternal("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() FROM PUBLIC");
+        if (!revoke.ok) throw new Error(`REVOKE setup failed: ${revoke.error}`);
+      });
+
+      after(async () => {
+        // Restore the superuser URL + pool first so the GRANT can land as
+        // the original role. A failure here means subsequent test files in
+        // the same cluster will fail on walRes, so surface it.
+        process.env.DATABASE_URL = originalUrl;
+        await shutdown();
+        const grant = await runInternal("GRANT EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() TO PUBLIC");
+        if (!grant.ok) {
+          throw new Error(`Failed to restore PUBLIC EXECUTE on pg_current_wal_lsn(): ${grant.error}`);
+        }
+      });
+
+      it("populates _warnings when the role lacks EXECUTE on pg_current_wal_lsn()", async () => {
+        // Swap to the limited role and rebuild the pool so the handler's
+        // sub-queries actually run as that role.
         const limited = new URL(originalUrl);
         limited.username = FIXTURE_LIMITED_ROLE;
         limited.password = FIXTURE_LIMITED_PASSWORD;
@@ -647,23 +669,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
           warnings.some((w) => /wal_position fetch failed/.test(w) && /permission denied|42501/i.test(w)),
           `expected a wal_position permission-denied warning, got ${JSON.stringify(warnings)}`,
         );
-      } catch (e) {
-        testError = e;
-      }
-
-      // Cleanup (always runs). Restore the superuser URL + pool first, then
-      // re-grant the default. A failure here means subsequent test files
-      // in the same cluster will fail on walRes, so surface it -- but only
-      // if the test itself didn't already throw, since the primary failure
-      // is the more informative signal.
-      process.env.DATABASE_URL = originalUrl;
-      await shutdown();
-      const grant = await runInternal("GRANT EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() TO PUBLIC");
-
-      if (testError) throw testError;
-      if (!grant.ok) {
-        throw new Error(`Failed to restore PUBLIC EXECUTE on pg_current_wal_lsn(): ${grant.error}`);
-      }
+      });
     });
   });
 
