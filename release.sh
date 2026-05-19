@@ -35,8 +35,9 @@ fail() { echo -e "${RED}  [X] $1${NC}"; exit 1; }
 
 TOTAL_STEPS=8
 
-# ---- Resolve version ----
+# ---- Resolve version + optional pre-release commit message ----
 VERSION="${1:-}"
+PRE_COMMIT_MSG="${2:-}"
 IS_CI="${CI:-false}"
 
 if [ -z "$VERSION" ]; then
@@ -44,8 +45,9 @@ if [ -z "$VERSION" ]; then
     VERSION="${GITHUB_REF_NAME#v}"
     info "CI mode - version $VERSION from tag $GITHUB_REF_NAME"
   else
-    echo "Usage: ./release.sh <version>"
+    echo "Usage: ./release.sh <version> [\"commit message\"]"
     echo "  e.g. ./release.sh 0.1.0"
+    echo "       ./release.sh 0.1.0 \"feat: add foo\"   # commits tracked changes first"
     exit 1
   fi
 fi
@@ -66,16 +68,38 @@ command -v npm >/dev/null  || fail "npm not installed"
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 RESUMING=false
 
+# ---- Optional: commit + push tracked changes before the release ----
+# When a commit message is passed as $2 and the tree is dirty, run the pre-
+# commit checklist (lint:fix + tsc + unit tests) and then commit only TRACKED
+# changes (`git add -u`) -- never sweep untracked files, which can include
+# .env / secrets. Push, then fall through to the existing clean-tree path
+# below. The integration matrix runs again in step 2; we skip it here to
+# keep the pre-commit fast (matrix gates the tag, not the feature commit).
+if [ "$IS_CI" != "true" ] && [ -n "$PRE_COMMIT_MSG" ] && [ -n "$(git status --porcelain)" ]; then
+  echo -e "${CYAN}Committing tracked changes before release...${NC}"
+  npm run lint:fix >/dev/null || fail "lint:fix failed -- fix and re-run"
+  npx tsc --noEmit         || fail "tsc failed -- fix type errors and re-run"
+  npm test                 || fail "unit tests failed -- fix and re-run"
+  git add -u || fail "git add -u failed"
+  if [ -z "$(git diff --cached --name-only)" ]; then
+    info "Nothing staged after lint:fix -- skipping pre-release commit"
+  else
+    git commit -m "$PRE_COMMIT_MSG" || fail "git commit failed"
+    git push origin main           || fail "git push failed -- resolve and re-run"
+    info "Pre-release commit pushed: $PRE_COMMIT_MSG"
+  fi
+fi
+
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   RESUMING=true
   info "Already at v${VERSION} - resuming"
 else
   if [ "$IS_CI" != "true" ]; then
     if [ -n "$(git status --porcelain)" ]; then
-      fail "Working directory not clean. Commit or stash changes first."
+      fail "Working directory not clean. Commit or stash changes first (or pass \"commit message\" as the 2nd arg)."
     fi
   fi
-  info "Current: v${CURRENT_VERSION} → v${VERSION}"
+  info "Current: v${CURRENT_VERSION} -> v${VERSION}"
 fi
 
 if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
