@@ -508,6 +508,83 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       }
     });
 
+    // buildHypopgHooks uses a for-loop over the indexes array, so N>1 works,
+    // but every other hypothetical_indexes test passes exactly one entry. A
+    // regression that swaps the loop for `indexes[0]` would silently ignore
+    // every entry past the first.
+    it("supports multiple hypothetical_indexes in a single call", async () => {
+      const check = (await runInternal<{ installed: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
+      )) as { ok: boolean; data?: { installed: boolean }[] };
+      const installed = check.ok && check.data?.[0]?.installed === true;
+      if (!installed) return;
+
+      const res = (await pgExplain.handler({
+        sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE body = 'world' AND title = 'hello'`,
+        analyze: false,
+        format: "text",
+        hypothetical_indexes: [
+          { table: `${FIXTURE_SCHEMA}.posts`, columns: ["body"], using: "btree" },
+          { table: `${FIXTURE_SCHEMA}.posts`, columns: ["title"], using: "btree" },
+        ],
+      })) as { ok: boolean; data?: { plan: string }; error?: string };
+      assert.equal(res.ok, true, `expected ok with two hypothetical indexes, got error: ${res.error}`);
+      // At least one of the hypotheticals must show up in the plan; on a
+      // multi-column predicate the planner picks the more selective one.
+      assert.match(
+        res.data?.plan ?? "",
+        /Index|Bitmap/i,
+        "expected an Index/Bitmap scan from at least one hypothetical index",
+      );
+    });
+
+    // analyze=true + ALLOW_WRITES=1 + hypothetical_indexes routes through
+    // runReadWriteRollback instead of runReadOnly. The hooks (setup +
+    // teardown) must still install + reset the HypoPG indexes inside the
+    // write-path transaction. A regression in the hooks plumbing specific
+    // to the write path wouldn't be caught by any other test in the suite.
+    it("hypothetical_indexes work on an EXPLAIN ANALYZE write (writes path, not read-only path)", async () => {
+      const check = (await runInternal<{ installed: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
+      )) as { ok: boolean; data?: { installed: boolean }[] };
+      const installed = check.ok && check.data?.[0]?.installed === true;
+      if (!installed) return;
+
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        const before = (await pgQuery.handler({
+          sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.posts`,
+        })) as { ok: boolean; data?: { rows: { c: number }[] } };
+        assert.equal(before.ok, true);
+        const beforeCount = before.data?.rows[0]?.c;
+
+        const res = (await pgExplain.handler({
+          sql: `INSERT INTO ${FIXTURE_SCHEMA}.posts (user_id, title, body) VALUES (1, 'hypo-rw-canary', 'x')`,
+          analyze: true,
+          format: "text",
+          hypothetical_indexes: [{ table: `${FIXTURE_SCHEMA}.posts`, columns: ["body"], using: "btree" }],
+        })) as { ok: boolean; data?: { plan: string }; error?: string };
+        assert.equal(res.ok, true, `expected ok on analyze+writes+hypo, got error: ${res.error}`);
+        assert.match(res.data?.plan ?? "", /Insert/i);
+
+        // Hooks teardown (hypopg_reset) ran AND the rollback path persisted
+        // nothing: same row count.
+        const after = (await pgQuery.handler({
+          sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.posts`,
+        })) as { ok: boolean; data?: { rows: { c: number }[] } };
+        assert.equal(after.ok, true);
+        assert.equal(
+          after.data?.rows[0]?.c,
+          beforeCount,
+          "INSERT under EXPLAIN ANALYZE must roll back even with hypothetical_indexes hooks",
+        );
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
+    });
+
     it("EXPLAIN ANALYZE of a write statement does not persist (regression: rollback, not commit)", async () => {
       const original = process.env.ALLOW_WRITES;
       process.env.ALLOW_WRITES = "1";

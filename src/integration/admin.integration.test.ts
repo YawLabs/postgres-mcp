@@ -262,6 +262,47 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // actual membership in the cluster, member_of stays `[]` for every row
     // and the cast is never exercised -- a regression that drops the cast
     // would silently re-introduce stringly-typed arrays in tool responses.
+    // The handler returns superuser/createdb/createrole/replication/bypass_rls
+    // as booleans alongside name and member_of, but the existing tests only
+    // assert on name + member_of + can_login. A regression that drops an AS
+    // alias, swaps two columns, or breaks the boolean cast would only surface
+    // when a caller actually relied on the field. The postgres bootstrap role
+    // and the fixture NOLOGIN role have known-stable values worth pinning.
+    it("returns superuser/createdb/createrole booleans for postgres and NOLOGIN flag for fixture role", async () => {
+      const res = (await listRoles.handler({ includeSystem: false })) as {
+        ok: boolean;
+        data?: {
+          name: string;
+          can_login: boolean;
+          superuser: boolean;
+          createdb: boolean;
+          createrole: boolean;
+          replication: boolean;
+          bypass_rls: boolean;
+        }[];
+      };
+      assert.equal(res.ok, true);
+
+      const postgres = (res.data ?? []).find((r) => r.name === "postgres");
+      assert.ok(postgres, "postgres role not present in listing");
+      // The bootstrap superuser always has these attributes; pinning catches
+      // a column-swap regression.
+      assert.equal(postgres.superuser, true, "postgres.superuser should be true");
+      assert.equal(postgres.can_login, true, "postgres.can_login should be true");
+      assert.equal(typeof postgres.createdb, "boolean");
+      assert.equal(typeof postgres.createrole, "boolean");
+      assert.equal(typeof postgres.replication, "boolean");
+      assert.equal(typeof postgres.bypass_rls, "boolean");
+
+      // FIXTURE_MEMBER_ROLE is created NOLOGIN -- locks the can_login=false
+      // path. If the AS alias for rolcanlogin gets dropped, this fails.
+      const member = (res.data ?? []).find((r) => r.name === FIXTURE_MEMBER_ROLE);
+      assert.ok(member, `${FIXTURE_MEMBER_ROLE} not present in listing`);
+      assert.equal(member.can_login, false, "NOLOGIN fixture role should report can_login=false");
+      assert.equal(member.superuser, false);
+      assert.equal(member.replication, false);
+    });
+
     it("returns member_of as a real JS string[] when role memberships exist", async () => {
       const res = (await listRoles.handler({ includeSystem: false })) as {
         ok: boolean;
@@ -325,6 +366,63 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       // Should find the fixture tables (minSize=0 includes everything).
       const tables = (res.data ?? []).map((r) => r.table);
       assert.ok(tables.length > 0, "expected some stats rows from fixture schema");
+    });
+
+    // Locks `WHERE n_live_tup >= $1`. Without ANALYZE, fixture tables sit at
+    // n_live_tup=0 in pg_stat_user_tables; ANALYZing seeds the counter so
+    // empty tables are distinguishable from populated ones. A regression
+    // that drops or inverts the predicate would leak the zero-tuple tables
+    // through at minSize=1.
+    it("minSize threshold actually excludes tables below it", async () => {
+      const analyzeUsers = await runInternal(`ANALYZE ${FIXTURE_SCHEMA}.users`);
+      const analyzePosts = await runInternal(`ANALYZE ${FIXTURE_SCHEMA}.posts`);
+      const analyzeNoPk = await runInternal(`ANALYZE ${FIXTURE_SCHEMA}.no_pk_table`);
+      assert.equal(analyzeUsers.ok, true);
+      assert.equal(analyzePosts.ok, true);
+      assert.equal(analyzeNoPk.ok, true);
+
+      const baseline = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 100 })) as {
+        ok: boolean;
+        data?: { table: string; live_tuples: string }[];
+      };
+      assert.equal(baseline.ok, true);
+      const empty = (baseline.data ?? []).filter((r) => Number(r.live_tuples) === 0);
+      // If the cluster happens to have no zero-tuple tables in the fixture
+      // schema, the test is vacuous -- threshold-filtering has nothing to
+      // bite on. The fixture's no_pk_table / no_pk_partitioned / matview /
+      // products usually satisfy this.
+      if (empty.length === 0) return;
+
+      const filtered = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 1, limit: 100 })) as {
+        ok: boolean;
+        data?: { table: string }[];
+      };
+      assert.equal(filtered.ok, true);
+      // Property: every baseline row with live_tuples=0 is absent at minSize=1.
+      for (const b of empty) {
+        assert.ok(
+          !(filtered.data ?? []).some((f) => f.table === b.table),
+          `${b.table} (live_tuples=0) should be excluded at minSize=1`,
+        );
+      }
+    });
+
+    // Locks the CASE WHEN COALESCE(idx_scan,0)=0 THEN NULL guard. Without
+    // it, the division-by-zero would either error the whole query or (worse,
+    // depending on pg version) return Infinity / NaN. The property holds
+    // vacuously when no row has idx_scans=0, but the fixture's lightly-used
+    // tables typically do.
+    it("reports ratio=null when idx_scans=0 (no division by zero)", async () => {
+      const res = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 100 })) as {
+        ok: boolean;
+        data?: { table: string; idx_scans: string; ratio: number | null }[];
+      };
+      assert.equal(res.ok, true);
+      for (const row of res.data ?? []) {
+        if (row.idx_scans === "0") {
+          assert.equal(row.ratio, null, `${row.table} has idx_scans=0 but ratio=${row.ratio}; CASE guard regression`);
+        }
+      }
     });
 
     // Exercises the no-schema branch of the conditional WHERE clause. A
@@ -728,6 +826,25 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       for (const row of res.data ?? []) {
         assert.ok(!row.schema.startsWith("pg_"), `pg_* schema leaked: ${row.schema}`);
         assert.notEqual(row.schema, "information_schema", "information_schema leaked");
+      }
+    });
+
+    // Locks `s.idx_scan <= $1`. Existing positive tests pass
+    // maxScans=1_000_000 (matches everything) so a regression that drops the
+    // predicate has no signal. At maxScans=0 the result MUST contain only
+    // zero-scan indexes; any non-zero leakage means the predicate is gone.
+    it("respects the maxScans predicate (maxScans=0 excludes any non-zero-scan index)", async () => {
+      const zero = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 500 })) as {
+        ok: boolean;
+        data?: { index: string; scans: string }[];
+      };
+      assert.equal(zero.ok, true);
+      for (const r of zero.data ?? []) {
+        assert.equal(
+          r.scans,
+          "0",
+          `${r.index} reports scans=${r.scans} at maxScans=0 -- s.idx_scan <= $1 predicate may be broken`,
+        );
       }
     });
   });

@@ -33,13 +33,23 @@ while read -r V _ PORT _; do
   echo "=============================================="
   echo "  PostgreSQL ${V} on port ${PORT}"
   echo "=============================================="
+  # Capture full output to a temp log so a failure can dump the whole thing.
+  # Piping straight to `tail -20` discards earlier failing-test names when the
+  # final lines are summary noise, leaving the operator with no way to map a
+  # FAIL back to a specific test without re-running.
+  LOG="$(mktemp)"
   if DATABASE_URL="postgres://postgres:postgres@localhost:${PORT}/postgres_mcp_test" \
-     POSTGRES_MCP_INTEGRATION=1 npm run --silent test:integration 2>&1 | tail -20; then
+     POSTGRES_MCP_INTEGRATION=1 npm run --silent test:integration >"${LOG}" 2>&1; then
+    tail -20 "${LOG}"
     RESULTS+=("PG${V}: PASS")
   else
+    echo "--- PG${V} FAILED: full test output below ---"
+    cat "${LOG}"
+    echo "--- end PG${V} output ---"
     RESULTS+=("PG${V}: FAIL")
     EXIT=1
   fi
+  rm -f "${LOG}"
 done < <(pg_lsclusters -h | awk '$4=="online"{print $1, $2, $3}')
 
 echo

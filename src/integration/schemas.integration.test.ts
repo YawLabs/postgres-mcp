@@ -67,6 +67,23 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(view.type, "view");
     });
 
+    // Locks the 'm' branch of the `('r','v','m','f','p')` kinds filter when
+    // includeViews=true. A regression that drops 'm' would silently hide
+    // materialized views from this tool with no signal in the existing
+    // includeViews test (which only asserts the plain view).
+    it("with includeViews includes the materialized view with type='materialized_view'", async () => {
+      const res = (await listTables.handler({
+        schema: FIXTURE_SCHEMA,
+        includeViews: true,
+        limit: 500,
+        offset: 0,
+      })) as { ok: boolean; data?: { name: string; type: string }[] };
+      assert.equal(res.ok, true);
+      const mv = (res.data ?? []).find((r) => r.name === "user_post_counts_mv");
+      assert.ok(mv, "expected user_post_counts_mv when includeViews=true");
+      assert.equal(mv.type, "materialized_view");
+    });
+
     it("paginates with limit and offset", async () => {
       const allRes = (await listTables.handler({
         schema: FIXTURE_SCHEMA,
@@ -237,6 +254,12 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       const mv = res.data?.find((v) => v.name === "user_post_counts_mv");
       assert.ok(mv, "expected user_post_counts_mv to appear when includeMaterialized=true");
       assert.equal(mv.type, "materialized_view");
+      // pg_get_viewdef() goes through a slightly different code path for
+      // matviews than for plain views; pin that it actually returns the SQL
+      // body, not an empty string. A regression here would surface as a
+      // listing with empty `definition` fields for matviews only.
+      assert.ok(mv.definition.length > 0, "matview definition must not be empty");
+      assert.match(mv.definition, /SELECT/i, "matview definition should look like SQL");
     });
 
     // Locks the false branch of the conditional `('v', 'm')` vs `('v')` SQL
@@ -317,6 +340,29 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(res.ok, true);
       // Should find at least the fixture - may find more if other test schemas linger.
       assert.ok((res.data ?? []).some((r) => r.schema === FIXTURE_SCHEMA));
+    });
+
+    // The relkind filter is `('r','p','v','m','f')` so columns on views and
+    // materialized views appear in results. `post_count` is the matview /
+    // view exclusive column in the fixture (no fixture table exposes it),
+    // so a regression that drops 'v' or 'm' from the filter returns zero
+    // matches here.
+    it("matches columns on views and materialized views, not just tables", async () => {
+      const res = (await searchColumns.handler({
+        pattern: "post_count",
+        schema: FIXTURE_SCHEMA,
+        limit: 100,
+      })) as { ok: boolean; data?: { table: string; column: string }[] };
+      assert.equal(res.ok, true);
+      const tables = (res.data ?? []).map((r) => r.table);
+      assert.ok(
+        tables.includes("user_post_counts"),
+        `expected view 'user_post_counts' in matches for 'post_count', got ${JSON.stringify(tables)}`,
+      );
+      assert.ok(
+        tables.includes("user_post_counts_mv"),
+        `expected matview 'user_post_counts_mv' in matches for 'post_count', got ${JSON.stringify(tables)}`,
+      );
     });
 
     // The description advertises case-insensitive matching via ILIKE. A

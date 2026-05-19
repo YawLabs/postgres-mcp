@@ -322,6 +322,14 @@ function toQueryResult(result: pg.QueryResult, maxRows: number, typeNames: Recor
  * `teardown` runs in `finally` (always executed) so it can clean up
  * session-scoped state (e.g. HypoPG hypothetical indexes) even on error.
  *
+ * **teardown runs AFTER ROLLBACK/COMMIT, not inside the user's transaction.**
+ * The success path is BEGIN -> setup -> user SQL -> ROLLBACK/COMMIT, and only
+ * then `finally` -> teardown. So teardown executes in autocommit on the same
+ * pooled client. This is fine for session-scoped state (HypoPG's
+ * `hypopg_reset()` lives at the session level, not the transaction level) but
+ * any hook that needs to run *inside* the open transaction won't work with
+ * this signature -- the txn is already gone by the time teardown fires.
+ *
  * **Reserved savepoint name:** `runUserQueryBounded` opens
  * `SAVEPOINT __pgmcp_sp` around the user SQL and `RELEASE`s it at the end.
  * Hooks MUST NOT create a savepoint with that name -- the inner `RELEASE`

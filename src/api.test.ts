@@ -118,6 +118,16 @@ describe("getConnectionTimeoutMs", () => {
     assert.equal(getConnectionTimeoutMs(), 2500);
   });
 
+  // Unlike getMaxRows / getPoolMax (which floor fractional values because row
+  // counts and pool sizes must be integers), getConnectionTimeoutMs preserves
+  // fractional input -- pg's connectionTimeoutMillis takes a float. Pinning
+  // the design difference so a future "consistency" pass doesn't quietly
+  // wrap this in Math.floor and shave sub-ms off configured timeouts.
+  it("preserves fractional values (timeouts can be sub-ms)", () => {
+    process.env.POSTGRES_CONNECTION_TIMEOUT_MS = "2500.5";
+    assert.equal(getConnectionTimeoutMs(), 2500.5);
+  });
+
   it("falls back to 10000 for invalid values", () => {
     for (const v of ["abc", "-5", "0", ""]) {
       process.env.POSTGRES_CONNECTION_TIMEOUT_MS = v;

@@ -15,7 +15,7 @@
 # =============================================================================
 
 set -euo pipefail
-trap 'echo -e "\n\033[0;31m  ✗ Release failed at line $LINENO (exit code $?)\033[0m"' ERR
+trap 'echo -e "\n\033[0;31m  [X] Release failed at line $LINENO (exit code $?)\033[0m"' ERR
 
 # ---- Helpers ----
 RED='\033[0;31m'
@@ -24,12 +24,16 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# Output uses ASCII status markers ([OK] / [!] / [X]) instead of Unicode
+# check/cross/bang glyphs. The Unicode variants render as mojibake under
+# Windows ConPTY when the active codepage races with UTF-8 output, and the
+# corrupted bytes then get copy-pasted into bug reports.
 step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
-info() { echo -e "${GREEN}  ✓ $1${NC}"; }
-warn() { echo -e "${YELLOW}  ! $1${NC}"; }
-fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
+info() { echo -e "${GREEN}  [OK] $1${NC}"; }
+warn() { echo -e "${YELLOW}  [!] $1${NC}"; }
+fail() { echo -e "${RED}  [X] $1${NC}"; exit 1; }
 
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 
 # ---- Resolve version ----
 VERSION="${1:-}"
@@ -84,6 +88,7 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo "  5. Publish to npm"
   echo "  6. Create GitHub release"
   echo "  7. Verify"
+  echo "  8. Post-publish smoke"
   echo ""
   read -p "Continue? (y/N) " -n 1 -r
   echo
@@ -258,6 +263,25 @@ if [ "$IS_CI" = "true" ]; then
   else
     warn "no provenance attestation found on v${VERSION} (expected in CI publish)"
   fi
+fi
+
+# =============================================================================
+# Step 8: Post-publish smoke
+# =============================================================================
+step 8 "Post-publish smoke"
+
+# Exercise the published tarball end to end. `npm view` in step 7 only checks
+# the registry metadata, which can show the right version even when the
+# tarball or its dependencies aren't installable -- and CDN edges desync
+# enough that a real `npx`/install probe catches things `npm view` misses.
+if [ -x "${SCRIPT_DIR}/scripts/post-publish-smoke.sh" ]; then
+  if "${SCRIPT_DIR}/scripts/post-publish-smoke.sh" "$VERSION"; then
+    info "post-publish smoke: passed"
+  else
+    warn "post-publish smoke failed -- investigate before announcing v${VERSION}"
+  fi
+else
+  warn "scripts/post-publish-smoke.sh not found or not executable -- skipping smoke"
 fi
 
 # =============================================================================
