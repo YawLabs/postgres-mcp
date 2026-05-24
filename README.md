@@ -51,7 +51,7 @@ macOS / Linux / WSL:
   "mcpServers": {
     "postgres": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/postgres-mcp"],
+      "args": ["-y", "@yawlabs/postgres-mcp@latest"],
       "env": {
         "DATABASE_URL": "postgres://user:password@host:5432/dbname"
       }
@@ -67,7 +67,7 @@ Windows:
   "mcpServers": {
     "postgres": {
       "command": "cmd",
-      "args": ["/c", "npx", "-y", "@yawlabs/postgres-mcp"],
+      "args": ["/c", "npx", "-y", "@yawlabs/postgres-mcp@latest"],
       "env": {
         "DATABASE_URL": "postgres://user:password@host:5432/dbname"
       }
