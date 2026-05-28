@@ -7,9 +7,9 @@
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
-[![Add to mcp.hosting](https://mcp.hosting/install-button.svg)](https://mcp.hosting/install?name=Postgres&command=npx&args=-y%2C%40yawlabs%2Fpostgres-mcp&description=Query%20PostgreSQL%20-%20schema%20introspection%2C%20EXPLAIN%20plans%2C%20health%20diagnostics%2C%20read-only%20by%20default&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fpostgres-mcp)
+[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](yaw://install?name=Postgres&command=npx&args=-y%2C%40yawlabs%2Fpostgres-mcp&description=Query%20PostgreSQL%20-%20schema%20introspection%2C%20EXPLAIN%20plans%2C%20health%20diagnostics%2C%20read-only%20by%20default&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fpostgres-mcp)
 
-One click adds this to your [mcp.hosting](https://mcp.hosting) account so it syncs to every MCP client you use. Or install manually below.
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
 ## Backstory
 
