@@ -143,12 +143,13 @@ info "Unit tests passed"
 # until the matrix runner is portable to native Linux/Mac). Aborts the release
 # on failure -- it's the only place the matrix has a real consumer.
 #
-# In CI, this step is intentionally skipped: the github-actions release.yml
-# workflow gates the publish on integration.yml (PG17/18 service containers)
-# completing successfully, so we don't need a redundant local-equivalent run
-# inside the runner.
+# In CI, this step is intentionally skipped: GitHub Actions runners don't
+# have WSL, and release.yml does not spin up PG service containers. The
+# matrix is now a LOCAL pre-tag gate only -- if you tag without running
+# scripts/wsl-test-matrix.sh first, you're publishing without PG-version
+# coverage (unit tests + prepublishOnly are still the CI gates).
 if [ "$IS_CI" = "true" ]; then
-  info "CI mode -- integration matrix gated by integration.yml workflow, skipping local WSL run"
+  info "CI mode -- integration matrix is a local-only pre-tag gate, skipping in CI"
 elif command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\0' | grep -q Ubuntu; then
   # Translate a Git Bash drive-letter prefix (/c/, /d/, ...) into the WSL
   # equivalent (/mnt/c/, /mnt/d/, ...). Hardcoding /c/ broke contributors
