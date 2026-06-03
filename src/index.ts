@@ -3,6 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isWritesAllowed, shutdown } from "./api.js";
+import { wrapToolHandler } from "./mcp-wrapper.js";
 import { adminTools } from "./tools/admin.js";
 import { explainTools } from "./tools/explain.js";
 import { healthTools } from "./tools/health.js";
@@ -41,35 +42,7 @@ for (const tool of allTools) {
     tool.description,
     tool.inputSchema.shape,
     tool.annotations,
-    async (input: Record<string, unknown>) => {
-      try {
-        const result = await (tool.handler as (input: unknown) => Promise<unknown>)(input);
-        const response = result as { ok: boolean; data?: unknown; error?: string };
-
-        if (!response.ok) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: ${response.error || "Unknown error"}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        const text = JSON.stringify(response.data ?? { success: true }, null, 2);
-        return {
-          content: [{ type: "text" as const, text }],
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text" as const, text: `Error: ${message}` }],
-          isError: true,
-        };
-      }
-    },
+    wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>),
   );
 }
 
