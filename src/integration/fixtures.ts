@@ -17,11 +17,17 @@ export const FIXTURE_GROUP_ROLE = "mcp_test_group";
 export const FIXTURE_MEMBER_ROLE = "mcp_test_member";
 
 // Limited-privilege login role used by the pg_replication_status _warnings
-// partial-failure test: the role has CONNECT only, no pg_monitor / no
-// REPLICATION attribute, so the three sub-queries inside
-// pg_replication_status all hit permission-denied and the handler must
-// surface them via the _warnings array (rather than the pre-0.6.1 short-
-// circuit return on first failure). Password is fixed so the test can
+// partial-failure test. The role has CONNECT only -- no pg_monitor, no
+// REPLICATION attribute. On a standalone cluster only ONE of the handler's
+// three sub-queries is actually privilege-gated for this role: the
+// wal_position fetch, pg_current_wal_lsn(). The slots (pg_replication_slots)
+// and replicas (pg_stat_replication) sub-queries return empty rows even to a
+// non-pg_monitor role on an instance with no slots / no replicas, so they
+// succeed rather than warn. To force a real permission-denied the test also
+// REVOKEs PUBLIC EXECUTE on pg_current_wal_lsn(); the role then hits 42501 on
+// that one sub-query, and the handler must surface it via the _warnings array
+// (rather than the pre-0.6.1 short-circuit return on first failure) while the
+// slots/replicas results stay readable. Password is fixed so the test can
 // construct the limited DATABASE_URL deterministically.
 export const FIXTURE_LIMITED_ROLE = "mcp_test_restricted";
 export const FIXTURE_LIMITED_PASSWORD = "restricted_pw";

@@ -22,9 +22,12 @@ describe("identSchema", () => {
     assert.equal(identSchema.parse(sixtyThree), sixtyThree);
   });
 
-  it("rejects 64-char ASCII identifiers (1 byte over)", () => {
+  it("rejects 64-char ASCII identifiers (1 byte over) with the NAMEDATALEN byte message", () => {
     const sixtyFour = "a".repeat(64);
-    assert.throws(() => identSchema.parse(sixtyFour));
+    // `.max(63)` was removed so the byte-length refine is the sole length
+    // guard -- a 64-ASCII-char string must surface the tailored NAMEDATALEN
+    // message, not Zod's generic "at most 63 character(s)".
+    assert.throws(() => identSchema.parse(sixtyFour), /NAMEDATALEN/);
   });
 
   // The reason this test file exists: previous identSchema used `.max(63)` on
@@ -69,6 +72,17 @@ describe("paramsArray nesting-depth cap", () => {
 
   it("accepts scalar params (depth 0)", () => {
     assert.doesNotThrow(() => paramsArray.parse(["a", 1, true, null]));
+  });
+
+  // `z.number()` accepts NaN/Infinity, which pg serializes to the literal
+  // strings 'NaN'/'Infinity' and mishandles on non-float columns. The
+  // `.finite()` member on paramValue rejects them at the call boundary.
+  it("rejects NaN and Infinity in params", () => {
+    assert.throws(() => paramsArray.parse([Number.NaN]));
+    assert.throws(() => paramsArray.parse([Number.POSITIVE_INFINITY]));
+    assert.throws(() => paramsArray.parse([Number.NEGATIVE_INFINITY]));
+    // a finite number alongside them still parses fine on its own
+    assert.doesNotThrow(() => paramsArray.parse([42]));
   });
 
   it("accepts shallow nesting (array of depth 5)", () => {

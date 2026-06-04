@@ -86,7 +86,18 @@ export const healthTools = [
         // rather than nesting `{error: "..."}` inside the data fields. The
         // nested form makes `data.database.size_bytes` resolve to undefined
         // when an LLM looks it up, with no signal "failed" vs "missing key".
+        // This path only covers per-catalog-query permission/visibility
+        // failures (one of the five fanout queries erroring while the
+        // connection is fine). Broad connectivity loss never reaches here --
+        // it throws out of getPool().connect() inside withSharedClient and is
+        // caught upstream in mcp-wrapper.
         const warnings: string[] = [];
+        // versionRes.ok is guaranteed true here (early-returned above), but the
+        // row/column could still be absent -- warn so the success object is
+        // never silently missing its headline field, matching the other four.
+        if (versionRes.data?.[0]?.version === undefined) {
+          warnings.push(`version unavailable despite successful query`);
+        }
         if (!sizeRes.ok) warnings.push(`database fetch failed: ${sizeRes.error}`);
         if (!connsRes.ok) warnings.push(`connections fetch failed: ${connsRes.error}`);
         if (!activeRes.ok) warnings.push(`active_queries fetch failed: ${activeRes.error}`);

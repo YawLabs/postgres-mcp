@@ -1,3 +1,10 @@
+// SERIALIZATION: these integration files MUST run serialized in one process
+// (--test-concurrency=1 via scripts/run-tests.mjs). The pg pool, typeNameCache,
+// and process.env are process-global singletons; running these files (or their
+// tests) concurrently would let one test's pool swap / env mutation / cache
+// reset race another's in-flight query. Do not parallelize without first
+// removing those shared singletons.
+
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { schemaTools } from "../tools/schemas.js";
@@ -84,6 +91,13 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(mv.type, "materialized_view");
     });
 
+    // Assumes a STABLE table set across the N+1 sequential handler calls below
+    // (the allNames snapshot, then one call per page). Safe under serial
+    // in-process execution (see the file-level SERIALIZATION note): nothing
+    // concurrently creates/drops tables in FIXTURE_SCHEMA between calls. If this
+    // file is ever parallelized, the per-page `got.length === expectedSize`
+    // assertions become racy -- replace them with a set assertion that the
+    // union of all pages equals allNames, which tolerates ordering/size drift.
     it("paginates with limit and offset", async () => {
       const allRes = (await listTables.handler({
         schema: FIXTURE_SCHEMA,

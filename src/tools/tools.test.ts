@@ -136,10 +136,7 @@ describe("Tool definitions", () => {
         );
         if (result.success) {
           for (const name of fieldNames) {
-            assert.ok(
-              name in result.data,
-              `${tool.name} inputSchema parsed output missing declared field "${name}"`,
-            );
+            assert.ok(name in result.data, `${tool.name} inputSchema parsed output missing declared field "${name}"`);
           }
         }
       });

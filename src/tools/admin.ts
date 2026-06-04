@@ -12,7 +12,11 @@ export const adminTools = [
       "way to identify a long-held transaction holding a lock. " +
       "Row shape: one row per (blocked_pid, blocking_pid) pair. A session waiting on multiple " +
       "blockers appears on multiple rows -- group/deduplicate by `blocked_pid` if you want a " +
-      "per-blocked-session count.",
+      "per-blocked-session count. " +
+      "Caveat on `relation`: for non-relation waits (transactionid/virtualxid, where the wait " +
+      "is on the blocker's xid rather than a table) `relation` is a best-effort hint -- an " +
+      "alphabetical guess among the blocker's held write-intent locks -- not authoritative. " +
+      "Use the blocked/blocking query text to disambiguate which table is actually contested.",
     annotations: {
       title: "Inspect blocking locks",
       readOnlyHint: true,
@@ -193,7 +197,7 @@ export const adminTools = [
            table_name AS "table",
            grantee,
            privilege_type,
-           is_grantable::boolean AS is_grantable
+           (is_grantable = 'YES') AS is_grantable
          FROM information_schema.table_privileges
          WHERE table_schema = $1
            ${tableFilter}
@@ -431,6 +435,11 @@ export const adminTools = [
             // Divide in `numeric`, not `float8`: BIGINT sequences past 2^53 lose
             // precision in float8, and the danger zone (>= threshold) is exactly
             // where the reported pct_used must stay accurate.
+            // Filter vs display precision differ on purpose: the WHERE clause
+            // tests the full-precision ratio while the SELECT rounds pct_used
+            // to numeric(6,4) for display. So a displayed 0.5000 may correspond
+            // to a true ratio slightly above the threshold -- the filter is
+            // correct, the display is rounded.
             `SELECT
                schemaname AS schema,
                sequencename AS sequence,

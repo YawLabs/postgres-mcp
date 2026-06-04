@@ -163,6 +163,10 @@ export const schemaTools = [
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         JOIN pg_catalog.pg_class cl ON cl.oid = con.confrelid
         JOIN pg_catalog.pg_namespace fn ON fn.oid = cl.relnamespace
+        -- Pairing local conkey[i] to foreign confkey[i] by ordinality relies on
+        -- the postgres invariant that conkey[i] references confkey[i]. unnest
+        -- WITH ORDINALITY preserves array order; reordering or dropping
+        -- WITH ORDINALITY would silently mispair composite-FK columns.
         JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, attposition) ON TRUE
         JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = u.attnum
         JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fu(attnum, attposition) ON fu.attposition = u.attposition
@@ -226,6 +230,10 @@ export const schemaTools = [
         JOIN pg_catalog.pg_namespace srcn ON srcn.oid = src.relnamespace
         JOIN pg_catalog.pg_class ref ON ref.oid = con.confrelid
         JOIN pg_catalog.pg_namespace refn ON refn.oid = ref.relnamespace
+        -- Pairing local conkey[i] to foreign confkey[i] by ordinality relies on
+        -- the postgres invariant that conkey[i] references confkey[i]. unnest
+        -- WITH ORDINALITY preserves array order; reordering or dropping
+        -- WITH ORDINALITY would silently mispair composite-FK columns.
         JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, attposition) ON TRUE
         JOIN pg_catalog.pg_attribute srcatt ON srcatt.attrelid = con.conrelid AND srcatt.attnum = u.attnum
         JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fu(attnum, attposition) ON fu.attposition = u.attposition
@@ -311,6 +319,10 @@ export const schemaTools = [
         // "table" would mislabel a view or materialized view. Emit a warning
         // when the fetch failed so the caller sees the kind isn't trustworthy.
         if (!kindRes.ok) warnings.push(`kind fetch failed, reported as "table": ${kindRes.error}`);
+        // ok-but-empty: the query succeeded but returned no row (e.g. a race
+        // where the relation was dropped between the cols fetch and this one).
+        // The `?? "table"` default would then silently mislabel the relation.
+        else if ((kindRes.data?.length ?? 0) === 0) warnings.push(`kind unavailable, reported as "table"`);
         if (!pk.ok) warnings.push(`primary_key fetch failed: ${pk.error}`);
         if (!fks.ok) warnings.push(`foreign_keys fetch failed: ${fks.error}`);
         if (!idxs.ok) warnings.push(`indexes fetch failed: ${idxs.error}`);

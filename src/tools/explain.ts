@@ -1,5 +1,12 @@
 import { z } from "zod";
-import { type ApiResponse, isWritesAllowed, runInternal, runReadOnly, runReadWriteRollback } from "../api.js";
+import {
+  type ApiResponse,
+  isWritesAllowed,
+  type RunHooks,
+  runInternal,
+  runReadOnly,
+  runReadWriteRollback,
+} from "../api.js";
 import { identSchema, paramsArray } from "./params.js";
 
 const indexAccessMethod = z.enum(["btree", "hash", "gin", "gist", "brin", "spgist"]);
@@ -57,7 +64,15 @@ function quoteQualifiedTable(name: string): string {
  * default re-application in buildHypopgHooks.
  */
 function validateHypoIndex(idx: { table: string; columns: string[] }): string | null {
-  for (const piece of idx.table.split(".")) {
+  const pieces = idx.table.split(".");
+  // Only `schema.table` (1 or 2 pieces) is a legal dotted shape. A 3+ part
+  // name like `a.b.c` passes the per-piece checks below but renders as
+  // `"a"."b"."c"`, which the planner rejects with a confusing error this
+  // pre-flight exists to prevent.
+  if (pieces.length > 2) {
+    return `Hypothetical index table ${JSON.stringify(idx.table)} is over-qualified; use only \`schema.table\` or \`table\`.`;
+  }
+  for (const piece of pieces) {
     if (piece.includes('"')) {
       // JSON.stringify the offending value so a name containing `"` renders
       // unambiguously instead of producing a broken nested-quote message.
@@ -156,13 +171,27 @@ export const explainTools = [
         ),
     }),
     handler: async (input: unknown) => {
-      const { sql, analyze, format, params, hypothetical_indexes } = input as {
+      const {
+        sql,
+        analyze: rawAnalyze,
+        format: rawFormat,
+        params,
+        hypothetical_indexes,
+      } = input as {
         sql: string;
-        analyze: boolean;
-        format: "text" | "json";
+        analyze?: boolean;
+        format?: "text" | "json";
         params?: unknown[];
         hypothetical_indexes?: { table: string; columns: string[]; using?: string }[];
       };
+
+      // Direct (non-MCP) callers bypass Zod, so the analyze/format defaults the
+      // schema would have applied never ran -- a caller omitting `format` would
+      // otherwise fall into the json branch and get a raw text string back.
+      // Re-apply the documented defaults here, mirroring the `using ?? "btree"`
+      // precedent in buildHypopgHooks.
+      const analyze = rawAnalyze ?? false;
+      const format = rawFormat ?? "text";
 
       // LLMs often pass pre-wrapped SQL like "EXPLAIN ANALYZE SELECT ..." which
       // would become "EXPLAIN (ANALYZE) EXPLAIN ANALYZE SELECT ..." below -
@@ -192,7 +221,7 @@ export const explainTools = [
         if (err) return { ok: false, error: err };
       }
 
-      const hooks = hypoIndexes.length > 0 ? buildHypopgHooks(hypoIndexes) : {};
+      const hooks: RunHooks = hypoIndexes.length > 0 ? buildHypopgHooks(hypoIndexes) : {};
 
       // Verify HypoPG is installed before we even start the txn -- otherwise
       // the user gets a confusing 'function hypopg_create_index does not
@@ -241,10 +270,18 @@ export const explainTools = [
       // EXPLAIN returns one row per plan line (`QUERY PLAN` column). Flatten for readability.
       if (format === "text") {
         const lines = rows.map((r) => String(r["QUERY PLAN"] ?? ""));
+        // The cursor FETCH caps at POSTGRES_MAX_ROWS; toQueryResult sets
+        // `truncated` when it does. For a text plan that means the plan was
+        // chopped mid-output, so flag it rather than returning a silently
+        // incomplete plan.
+        if ((result.data as { truncated?: boolean }).truncated) {
+          lines.push(`... [plan truncated at ${rows.length} lines; raise POSTGRES_MAX_ROWS to see the full plan]`);
+        }
         return { ok: true, data: { plan: lines.join("\n") } };
       }
 
-      // FORMAT JSON returns a single row with a JSON array in QUERY PLAN.
+      // FORMAT JSON returns a single row with a JSON array in QUERY PLAN -- so
+      // truncation can't fire here (one row is always under POSTGRES_MAX_ROWS).
       const jsonPlan = rows[0]?.["QUERY PLAN"];
       return { ok: true, data: { plan: jsonPlan } };
     },

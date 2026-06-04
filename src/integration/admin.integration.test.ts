@@ -1,3 +1,10 @@
+// SERIALIZATION: these integration files MUST run serialized in one process
+// (--test-concurrency=1 via scripts/run-tests.mjs). The pg pool, typeNameCache,
+// and process.env are process-global singletons; running these files (or their
+// tests) concurrently would let one test's pool swap / env mutation / cache
+// reset race another's in-flight query. Do not parallelize without first
+// removing those shared singletons.
+
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
@@ -476,6 +483,13 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // ANALYZE/VACUUM, not raw INSERT, so without ANALYZE the fixture tables
     // sit at (0, 0) and the handler's `(n_live_tup + n_dead_tup) > 0` filter
     // excludes them all -- producing an empty baseline that defeats the test.
+    // Coverage note: the fixture seeds NO dead tuples (no UPDATE/DELETE churn
+    // before ANALYZE), so every baseline row sits at dead_ratio=0 -- all below
+    // the 0.5 threshold. Property A therefore iterates an empty filtered set,
+    // and only Property B (the exclusion direction) does real work. The
+    // positive-survival branch (a row that PASSES a non-zero threshold) is
+    // structurally unreachable here; to cover it, churn rows then ANALYZE so a
+    // table lands between 0 and 0.5.
     it("minDeadRatio threshold actually filters rows below it (relative)", async () => {
       const analyzeUsers = await runInternal(`ANALYZE ${FIXTURE_SCHEMA}.users`);
       const analyzePosts = await runInternal(`ANALYZE ${FIXTURE_SCHEMA}.posts`);
@@ -767,6 +781,25 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
           warnings.some((w) => /wal_position fetch failed/.test(w) && /permission denied|42501/i.test(w)),
           `expected a wal_position permission-denied warning, got ${JSON.stringify(warnings)}`,
         );
+        // Enforce the comment's premise: ONLY the wal_position sub-query is
+        // privilege-gated on a standalone cluster, so slots and replicas must
+        // stay readable (they return empty rows, not warnings). Pin exactly one
+        // warning, and that slots/replicas came back as real arrays rather than
+        // erroring -- a regression that broadened the failure to those
+        // sub-queries would add warnings and/or drop these to non-arrays.
+        assert.equal(
+          warnings.length,
+          1,
+          `only the wal_position sub-query is privilege-gated; expected exactly one warning, got ${JSON.stringify(warnings)}`,
+        );
+        assert.ok(
+          Array.isArray(res.data?.slots),
+          `slots must stay readable under the restricted role, got ${JSON.stringify(res.data?.slots)}`,
+        );
+        assert.ok(
+          Array.isArray(res.data?.replicas),
+          `replicas must stay readable under the restricted role, got ${JSON.stringify(res.data?.replicas)}`,
+        );
       });
     });
   });
@@ -833,6 +866,10 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // maxScans=1_000_000 (matches everything) so a regression that drops the
     // predicate has no signal. At maxScans=0 the result MUST contain only
     // zero-scan indexes; any non-zero leakage means the predicate is gone.
+    // Coverage note: exercises only the exclusion direction -- every returned
+    // row must have scans=0. In a fresh cluster the fixture's indexes are all
+    // unscanned, so there is no surviving-at-a-nonzero-maxScans row to check;
+    // the inclusion side is not pinned here.
     it("respects the maxScans predicate (maxScans=0 excludes any non-zero-scan index)", async () => {
       const zero = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 500 })) as {
         ok: boolean;
@@ -850,6 +887,30 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
   });
 
   describe("pg_kill", () => {
+    // Poll pg_stat_activity until the target backend is actively running its
+    // pg_sleep, instead of a fixed warmup sleep. A hardcoded delay is too short
+    // on a slow / loaded CI host (the sleep hasn't started, so the cancel fires
+    // against an idle backend and pg_cancel_backend returns true with nothing
+    // in flight) and needlessly long on a fast one. Mirrors the pg_blocking_pids
+    // poll the lock tests use (~77-92) and the file's note there about
+    // hardcoded sleeps. Bounded by a 5s deadline; proceeds anyway on timeout so
+    // a missed activation surfaces as the downstream assertion rather than a
+    // hang.
+    async function waitForActiveSleep(pid: number): Promise<void> {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const probe = (await runInternal<{ present: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_stat_activity
+             WHERE pid = $1 AND state = 'active' AND query LIKE '%pg_sleep%'
+           ) AS present`,
+          [pid],
+        )) as { ok: boolean; data?: { present: boolean }[] };
+        if (probe.ok && probe.data?.[0]?.present === true) return;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+
     // Nonexistent-PID path: the tool wraps the postgres function's boolean
     // return in a `note` that explains why a `false` came back. v0.6.13
     // captures pg's NOTICE channel so the note is specific ("not a
@@ -905,10 +966,12 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         // few hundred ms.
         const sleepPromise = sideClient.query("SELECT pg_sleep(30)").catch((e: unknown) => e);
 
-        // Give postgres a moment to actually start executing pg_sleep before
-        // we try to cancel it -- otherwise we may race the start and
-        // pg_cancel_backend returns true without any in-flight statement.
-        await new Promise((r) => setTimeout(r, 250));
+        // Poll pg_stat_activity until the sleep is actually executing before we
+        // cancel it -- otherwise we race the start and pg_cancel_backend returns
+        // true with no in-flight statement. Mirrors the pg_blocking_pids poll
+        // in the lock tests above and the comment there about a hardcoded sleep
+        // being too short on a slow CI host.
+        await waitForActiveSleep(targetPid);
 
         const res = (await pgKill.handler({ pid: targetPid, mode: "cancel" })) as {
           ok: boolean;
@@ -951,7 +1014,8 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         const targetPid = pidRow.rows[0]!.pid;
 
         const sleepPromise = sideClient.query("SELECT pg_sleep(30)").catch((e: unknown) => e);
-        await new Promise((r) => setTimeout(r, 250));
+        // Same poll-not-sleep rationale as the cancel variant above.
+        await waitForActiveSleep(targetPid);
 
         const res = (await pgKill.handler({ pid: targetPid, mode: "terminate" })) as {
           ok: boolean;

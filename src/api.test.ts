@@ -6,6 +6,7 @@ import {
   getMaxRows,
   getPoolMax,
   getSslConfig,
+  getStatementTimeoutMs,
   isWritesAllowed,
   safeResolveTypeNames,
   shutdown,
@@ -135,6 +136,35 @@ describe("getConnectionTimeoutMs", () => {
         getConnectionTimeoutMs(),
         10_000,
         `POSTGRES_CONNECTION_TIMEOUT_MS=${JSON.stringify(v)} should default`,
+      );
+    }
+  });
+});
+
+describe("getStatementTimeoutMs", () => {
+  const original = process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+  afterEach(() => {
+    if (original === undefined) delete process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+    else process.env.POSTGRES_STATEMENT_TIMEOUT_MS = original;
+  });
+
+  it("defaults to 30000", () => {
+    delete process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+    assert.equal(getStatementTimeoutMs(), 30_000);
+  });
+
+  it("accepts positive numbers", () => {
+    process.env.POSTGRES_STATEMENT_TIMEOUT_MS = "5000";
+    assert.equal(getStatementTimeoutMs(), 5000);
+  });
+
+  it("falls back to 30000 for invalid values", () => {
+    for (const v of ["abc", "-5", "0", ""]) {
+      process.env.POSTGRES_STATEMENT_TIMEOUT_MS = v;
+      assert.equal(
+        getStatementTimeoutMs(),
+        30_000,
+        `POSTGRES_STATEMENT_TIMEOUT_MS=${JSON.stringify(v)} should default`,
       );
     }
   });

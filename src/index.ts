@@ -13,10 +13,32 @@ import { statsTools } from "./tools/stats.js";
 
 // Injected at build time by esbuild; falls back to reading package.json for tsc builds.
 declare const __VERSION__: string | undefined;
-const version =
-  typeof __VERSION__ !== "undefined"
-    ? __VERSION__
-    : ((await import("node:module")).createRequire(import.meta.url)("../package.json") as { version: string }).version;
+
+// Resolve package.json by walking up from this file rather than assuming a
+// fixed `../package.json`. A deeper tsc emit layout (e.g. dist/src/index.js)
+// would crash startup with a hard-coded relative require; walking up finds
+// package.json wherever it actually sits.
+async function readPackageVersion(): Promise<string> {
+  const { createRequire } = await import("node:module");
+  const { fileURLToPath } = await import("node:url");
+  const { existsSync } = await import("node:fs");
+  const path = await import("node:path");
+  const require = createRequire(import.meta.url);
+
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (;;) {
+    const candidate = path.join(dir, "package.json");
+    if (existsSync(candidate)) {
+      return (require(candidate) as { version: string }).version;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  throw new Error("could not locate package.json walking up from the emitted module path");
+}
+
+const version = typeof __VERSION__ !== "undefined" ? __VERSION__ : await readPackageVersion();
 
 // ─── CLI subcommands (run instead of MCP server) ───
 
@@ -54,7 +76,13 @@ const writesNote = isWritesAllowed() ? "writes ENABLED" : "read-only";
 console.error(`@yawlabs/postgres-mcp v${version} ready (${allTools.length} tools, ${writesNote})`);
 
 // Clean shutdown: release pool connections when the transport closes.
+// SIGINT, SIGTERM, and stdin 'end' can all fire near-simultaneously (e.g. a
+// client closes stdin and the shell also sends SIGTERM). Guard so the second
+// trigger returns early instead of double-running shutdown() / racing exit().
+let exiting = false;
 const cleanup = async () => {
+  if (exiting) return;
+  exiting = true;
   try {
     await shutdown();
   } catch {

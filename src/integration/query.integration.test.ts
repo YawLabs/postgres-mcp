@@ -1,3 +1,10 @@
+// SERIALIZATION: these integration files MUST run serialized in one process
+// (--test-concurrency=1 via scripts/run-tests.mjs). The pg pool, typeNameCache,
+// and process.env are process-global singletons; running these files (or their
+// tests) concurrently would let one test's pool swap / env mutation / cache
+// reset race another's in-flight query. Do not parallelize without first
+// removing those shared singletons.
+
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { runInternal, shutdown } from "../api.js";
@@ -212,7 +219,12 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /does_not_exist_at_all|42P01|relation/i);
     });
 
-    it("rejects $1 reference when no params array is passed", async () => {
+    // Not tool-level arity validation: the handler defaults params to [] when
+    // omitted (query.ts:62, `runReadOnly(sql, params ?? [])`), so postgres
+    // receives a $1 placeholder with an empty values array and raises the
+    // bind-time error itself. This pins that postgres's error is surfaced
+    // verbatim rather than being swallowed or rewritten by the handler.
+    it("surfaces postgres bind error when $1 has no matching parameter", async () => {
       const res = (await pgQuery.handler({
         sql: `SELECT email FROM ${FIXTURE_SCHEMA}.users WHERE id = $1`,
       })) as { ok: boolean; error?: string };
@@ -236,9 +248,19 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         })) as { ok: boolean; data?: { rows: { i: number }[]; truncated?: boolean } };
         const elapsedMs = Date.now() - start;
         assert.equal(res.ok, true);
+        // Correctness proof: rows.length===10 (MAX_ROWS) + truncated===true is
+        // what proves the cursor bounded the FETCH -- a non-bounded fetch would
+        // materialize all 1M rows in node-pg before the slice. The timing below
+        // is NOT a correctness check; it's only a loose memory-bound canary
+        // (an unbounded fetch of 1M rows is slow AND heap-heavy). Kept generous
+        // (10s) so a slow / loaded CI host doesn't flake -- the row-count and
+        // truncated assertions above already carry the real signal.
         assert.equal(res.data?.rows.length, 10);
         assert.equal(res.data?.truncated, true);
-        assert.ok(elapsedMs < 2000, `expected <2s with bounded fetch, took ${elapsedMs}ms`);
+        assert.ok(
+          elapsedMs < 10000,
+          `expected bounded fetch to stay well under a full-materialization wall time, took ${elapsedMs}ms`,
+        );
       } finally {
         if (original === undefined) delete process.env.POSTGRES_MAX_ROWS;
         else process.env.POSTGRES_MAX_ROWS = original;

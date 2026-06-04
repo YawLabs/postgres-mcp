@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-06-04
+
+### Fixed
+- `wrapToolHandler` now distinguishes a handler that returned a non-`ApiResponse`
+  value (null, a primitive, a raw object) from a handler that returned
+  `{ok: false}`. The former surfaces `"Error: tool handler returned a malformed
+  result (missing ok)"`; the latter still surfaces `"Error: <error>"`. A
+  misbehaving handler no longer collapses into the generic `Unknown error` path.
+  `wrapToolHandler` is also now exported from `mcp-wrapper.ts` and covered by
+  a dedicated unit test (`mcp-wrapper.test.ts`), so the production mapping is
+  exercised without standing up `index.ts` and the stdio transport.
+- `index.ts` resolves `package.json` by walking up from the emitted module path
+  rather than via a hard-coded `"../package.json"`. A non-trivial `tsc` emit
+  layout (e.g. `dist/src/index.js`) used to crash startup with an unresolvable
+  require. Verified against the current `outDir: "dist"` layout; future layout
+  changes don't need an `index.ts` patch.
+- Shutdown is now idempotent. SIGINT, SIGTERM, and `stdin.end` can all fire
+  near-simultaneously when a client closes the connection while the shell also
+  sends a signal. An `exiting` flag short-circuits the second and third so
+  `shutdown()` and `process.exit()` don't race.
+- `index.ts` no longer fakes a `version` string when `__VERSION__` is unset
+  (which only happens on a plain `tsc` build, not the esbuild bundled output).
+  The new `readPackageVersion()` throws a clear error if it can't find
+  `package.json` rather than silently emitting a malformed banner.
+
+### Security
+- `paramValue` (used by `pg_query`, `pg_readonly`, `pg_explain` for positional
+  parameters) now uses `.finite()` on the number member, so `NaN`, `Infinity`,
+  and `-Infinity` are rejected at the MCP boundary. Without `.finite()`, pg
+  serializes the JS number to the literal string `'NaN'` / `'Infinity'`, which
+  the server happily accepts on a text column and rejects opaquely on a numeric
+  one. Now the request is rejected before it ever hits the database.
+- `identSchema` dropped its redundant `.max(63)` so the byte-length `.refine`
+  is the sole length guard. A 64-ASCII-char string now surfaces the tailored
+  "exceeds PostgreSQL's 63-byte NAMEDATALEN limit" message instead of Zod's
+  generic "at most 63 character(s)" -- agents that read the message act on it
+  correctly.
+
+### Added
+- `pg_explain` rejects pre-wrapped `EXPLAIN ...` SQL with a clear hint. An LLM
+  that calls the tool with `sql: "EXPLAIN ANALYZE SELECT ..."` no longer
+  becomes the double-`EXPLAIN` syntax error from the server; the handler
+  short-circuits with "the `sql` parameter should be the query to explain, not
+  an EXPLAIN statement." Also re-applies Zod defaults (`analyze`, `format`,
+  `using`) on the direct-call path so unit tests that bypass Zod still hit
+  the documented behavior.
+- `pg_explain` hypothetical_indexes pre-flight rejects over-qualified
+  `schema.table.extra` table names, not just pre-quoted / over-63-byte ones.
+  An `a.b.c` form previously rendered as `"a"."b"."c"` and surfaced a
+  confusing planner error; now it's rejected with a clear message.
+- `pg_describe_table` populates `_warnings` even when the `kind` sub-query
+  returned zero rows (not just when it errored). The `?? "table"` default
+  would otherwise silently mislabel a relation that was dropped between the
+  `columns` and `kind` fetches.
+- `pg_health` warns when the version sub-query returned zero rows (rather
+  than silently emitting `version: undefined`). Symmetric with the other
+  four sub-queries.
+- Per-tool `inputSchema parses a type-correct sample input` test in
+  `tools.test.ts`. Catches drift between the schema's declared shape and
+  the keys the handler destructures at runtime. Uses public Zod 4
+  constructors (`instanceof z.ZodString`, etc.) -- the `_def` introspection
+  path is brittle across Zod majors.
+
+### Docs
+- `pg_query` description now leads with "Postgres itself is the primary
+  safety gate" and presents `ALLOW_WRITES=1` as a secondary belt-and-braces.
+  Pre-0.6.20 the order implied `ALLOW_WRITES` was the primary control, which
+  is the opposite of the recommended posture (a least-privileged role in
+  `DATABASE_URL`).
+- `getPool()` env-var snapshot comment now leads with which two values
+  (`getMaxRows`, `isWritesAllowed`) are intentionally re-read per request,
+  with rationale, instead of burying the re-read list at the end of a
+  paragraph about the snapshot.
+
+### Infrastructure
+- `release.sh` accepts `REQUIRE_MATRIX=1`. When set, the existing "WSL Ubuntu
+  not detected" warning becomes a hard `fail`; default behavior is unchanged
+  (warn-only so contributors without WSL can still tag). The matrix remains
+  a local-only pre-tag gate; this is just an opt-in fail-fast.
+- `package.json` `package-lock.json` and `server.json` all bumped to 0.6.20.
+
 ## [0.6.16] - 2026-05-18
 
 ### Tests

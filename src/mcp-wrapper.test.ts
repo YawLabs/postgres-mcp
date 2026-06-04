@@ -53,6 +53,44 @@ describe("wrapToolHandler: ok result -> content block (no isError)", () => {
   });
 });
 
+describe("wrapToolHandler: malformed (non-ApiResponse) result -> distinct isError block", () => {
+  it("maps a result missing the `ok` property to the malformed-result message", async () => {
+    // A handler that returns a raw value instead of the `{ ok, data? }`
+    // contract must NOT collapse into 'Unknown error' -- it gets a distinct,
+    // diagnosable message so the misbehaving handler is obvious.
+    for (const value of [42, { rows: [] }, "plain string"] as const) {
+      const wrapped = wrapToolHandler(async () => value);
+      const res = await wrapped({});
+      assert.equal(res.isError, true);
+      assert.equal(res.content[0]!.text, "Error: tool handler returned a malformed result (missing ok)");
+    }
+  });
+
+  it("maps a null result to the malformed-result message (not 'Unknown error')", async () => {
+    const wrapped = wrapToolHandler(async () => null);
+    const res = await wrapped({});
+    assert.equal(res.isError, true);
+    assert.equal(res.content[0]!.text, "Error: tool handler returned a malformed result (missing ok)");
+  });
+});
+
+describe("wrapToolHandler: bigint data serializes as a string (no JSON crash)", () => {
+  it("serializes a top-level bigint payload as its decimal string", async () => {
+    // JSON.stringify throws on BigInt by default; the replacer must convert it.
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: 10n }));
+    const res = await wrapped({});
+    assert.equal(res.isError, undefined, "bigint serialization must not be treated as an error");
+    assert.equal(res.content[0]!.text, '"10"');
+  });
+
+  it("serializes nested bigint values inside an object payload", async () => {
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: { id: 9007199254740993n, name: "row" } }));
+    const res = await wrapped({});
+    assert.equal(res.isError, undefined);
+    assert.equal(res.content[0]!.text, JSON.stringify({ id: "9007199254740993", name: "row" }, null, 2));
+  });
+});
+
 describe("wrapToolHandler: { ok: false } result -> isError 'Error: <msg>' block", () => {
   it("maps a handler error string to an isError text block", async () => {
     const wrapped = wrapToolHandler(async () => ({ ok: false, error: "permission denied for table users" }));

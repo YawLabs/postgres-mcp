@@ -6,7 +6,14 @@ import { z } from "zod";
  * json/jsonb columns - pg serializes these automatically).
  */
 export const paramValue: z.ZodType<unknown> = z.lazy(() =>
-  z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(paramValue), z.record(z.string(), paramValue)]),
+  z.union([
+    z.string(),
+    z.number().finite(),
+    z.boolean(),
+    z.null(),
+    z.array(paramValue),
+    z.record(z.string(), paramValue),
+  ]),
 );
 
 /**
@@ -69,7 +76,6 @@ export const paramsArray = z.array(paramValue).refine((arr) => arr.every((v) => 
 export const identSchema = z
   .string()
   .min(1)
-  .max(63)
   .refine((v) => Buffer.byteLength(v, "utf8") <= 63, {
     message:
       "Identifier exceeds PostgreSQL's 63-byte NAMEDATALEN limit (multi-byte characters count as multiple bytes).",
