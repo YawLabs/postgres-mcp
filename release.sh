@@ -184,8 +184,15 @@ elif command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\
   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root bash "${WSL_REPO}/scripts/wsl-test-matrix.sh" \
     || fail "Integration matrix failed against PG17/PG18 -- aborting release"
   info "Integration matrix passed (PG17 + PG18)"
+elif [ "${REQUIRE_MATRIX:-}" = "1" ]; then
+  # REQUIRE_MATRIX=1 turns the "WSL not detected" warning into a hard fail.
+  # Default is still warn-only so contributors without WSL can tag -- the
+  # unit tests + prepublishOnly are the CI gates, and the matrix is a
+  # pre-tag-best-effort on top. Set REQUIRE_MATRIX=1 when you specifically
+  # want a real-PG-major signal before cutting a release.
+  fail "REQUIRE_MATRIX=1 set but WSL Ubuntu not detected -- run scripts/wsl-test-matrix.sh manually or install WSL"
 else
-  warn "WSL Ubuntu not detected -- skipping integration matrix (run scripts/wsl-test-matrix.sh manually before tagging)"
+  warn "WSL Ubuntu not detected -- skipping integration matrix (set REQUIRE_MATRIX=1 to fail-fast; run scripts/wsl-test-matrix.sh manually before tagging)"
 fi
 
 # =============================================================================

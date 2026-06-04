@@ -33,16 +33,18 @@ export const queryTools = [
   {
     name: "pg_query",
     description:
-      "Run a SQL query against the configured PostgreSQL database. Writes are gated by the " +
-      "role in `DATABASE_URL` first and `ALLOW_WRITES` second: a role created with " +
-      "`GRANT pg_read_all_data` makes writes server-rejected regardless of `ALLOW_WRITES`, and " +
-      "is the recommended way to scope agent access. `ALLOW_WRITES=1` is a secondary belt-and-" +
-      "braces gate - useful for managed databases where creating a second role is awkward. " +
-      "For read-only access where you want the guarantee in the tool name, prefer `pg_readonly`. " +
-      "Use `params` for parameterized queries to avoid SQL injection. Params can be strings, " +
-      "numbers, booleans, null, arrays (for postgres arrays / ANY), or objects (for json/jsonb " +
-      "columns). Dates and UUIDs can be passed as ISO strings. Large result sets are truncated " +
-      "to POSTGRES_MAX_ROWS (default 1000) with a `truncated: true` flag.",
+      "Run a SQL query against the configured PostgreSQL database. Postgres itself is the " +
+      "primary safety gate: the role in `DATABASE_URL` enforces what queries can succeed. " +
+      "The recommended posture is a least-privileged role (e.g. one granted " +
+      "`pg_read_all_data`), which makes writes server-rejected regardless of any env var. " +
+      "`ALLOW_WRITES=1` is a secondary belt-and-braces gate - it lifts the in-server " +
+      "`BEGIN READ ONLY` wrapper, but it cannot grant privileges the role lacks. Useful for " +
+      "managed databases where creating a second role is awkward. For read-only access where " +
+      "you want the guarantee in the tool name, prefer `pg_readonly`. Use `params` for " +
+      "parameterized queries to avoid SQL injection. Params can be strings, numbers, booleans, " +
+      "null, arrays (for postgres arrays / ANY), or objects (for json/jsonb columns). Dates and " +
+      "UUIDs can be passed as ISO strings. Large result sets are truncated to " +
+      "POSTGRES_MAX_ROWS (default 1000) with a `truncated: true` flag.",
     annotations: {
       title: "Run SQL query",
       readOnlyHint: false, // conditionally destructive based on role + ALLOW_WRITES
