@@ -10,7 +10,9 @@ export const statsTools = [
       "extension to be installed and enabled (most managed Postgres providers have it on " +
       "by default). Returns normalized query text (constants replaced with `?`), call count, " +
       "total/mean/min/max time in ms, rows returned, and cache hit ratio. Use this to find " +
-      "slow queries worth optimizing.",
+      "slow queries worth optimizing. On pg_stat_statements ≥ 1.10, also returns " +
+      "`io_read_time_ms` and `io_write_time_ms` to separate IO-bound from CPU-bound queries " +
+      "(null when `track_io_timing = off` — enable it in postgresql.conf to get non-null values).",
     annotations: {
       title: "Top queries by execution time",
       readOnlyHint: true,
@@ -56,6 +58,17 @@ export const statsTools = [
       const meanCol = useExecSuffix ? "mean_exec_time" : "mean_time";
       const minCol = useExecSuffix ? "min_exec_time" : "min_time";
       const maxCol = useExecSuffix ? "max_exec_time" : "max_time";
+      // IO timing columns added in pg_stat_statements 1.10 (Postgres 16).
+      // Require track_io_timing=on to be non-zero; NULLIF(x, 0) surfaces zero
+      // as null so callers can tell "IO timing disabled" from "no IO occurred".
+      // Leading comma so the fragment appends cleanly after hit_percent with no
+      // trailing-comma problem when the version gate is false.
+      const hasIoTiming = compareVersions(extVersion, "1.10") >= 0;
+      const ioTimingCols = hasIoTiming
+        ? `,
+           NULLIF(shared_blk_read_time, 0)::numeric(18, 2)::float8 AS io_read_time_ms,
+           NULLIF(shared_blk_write_time, 0)::numeric(18, 2)::float8 AS io_write_time_ms`
+        : "";
 
       // The ORDER BY expression has to dodge an alias-shadowing trap: the
       // SELECT below aliases `calls::text AS calls`, and postgres resolves
@@ -75,6 +88,8 @@ export const statsTools = [
         max_time_ms: number;
         rows: string;
         hit_percent: number | null;
+        io_read_time_ms?: number | null;
+        io_write_time_ms?: number | null;
       }>(
         // bigint counters (calls, rows) come back as `.text` for lossless
         // serialization, matching pg_seq_scan_tables / pg_unused_indexes /
@@ -92,7 +107,7 @@ export const statsTools = [
              WHEN (shared_blks_hit + shared_blks_read) > 0
              THEN (shared_blks_hit::float8 / (shared_blks_hit + shared_blks_read) * 100)::numeric(5, 2)::float8
              ELSE NULL
-           END AS hit_percent
+           END AS hit_percent${ioTimingCols}
          FROM pg_stat_statements
          ORDER BY ${orderCol} DESC NULLS LAST
          LIMIT $1`,
