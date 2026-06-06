@@ -42,7 +42,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         includeViews: false,
         limit: 500,
         offset: 0,
-      })) as { ok: boolean; data?: { name: string; type: string }[] };
+      })) as { ok: boolean; data?: { name: string; type: string; estimated_rows: unknown }[] };
       assert.equal(res.ok, true);
       const names = (res.data ?? []).map((r) => r.name).sort();
       // Includes plain tables, both partition parents (relkind='p'), and
@@ -59,6 +59,13 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       ]);
       const events = (res.data ?? []).find((r) => r.name === "events");
       assert.equal(events?.type, "partitioned_table");
+      // estimated_rows must be a JS number, not a string. pg_class.reltuples is
+      // float4 and was previously cast to ::bigint, which node-pg parses as a
+      // string (int8 OID 20). The fix casts to ::float8 so node-pg returns a
+      // proper number. Regression guard: a revert would silently produce "0"
+      // instead of 0 in the JSON response.
+      const users = (res.data ?? []).find((r) => r.name === "users");
+      assert.equal(typeof users?.estimated_rows, "number", `estimated_rows must be a number, got ${JSON.stringify(users?.estimated_rows)}`);
     });
 
     it("with includeViews returns the view too", async () => {

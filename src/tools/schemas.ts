@@ -68,7 +68,7 @@ export const schemaTools = [
              WHEN 'p' THEN 'partitioned_table'
              ELSE c.relkind::text
            END AS type,
-           c.reltuples::bigint AS estimated_rows
+           c.reltuples::float8 AS estimated_rows
          FROM pg_catalog.pg_class c
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
          WHERE n.nspname = $1
