@@ -536,6 +536,58 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         assert.equal(row.schema, FIXTURE_SCHEMA, `expected only ${FIXTURE_SCHEMA}, got ${row.schema}`);
       }
     });
+
+    // pgstattuple methods. Gated on extension availability; falls back to the
+    // "not installed" error path when pgstattuple is absent in this environment.
+    for (const method of ["approx", "exact"] as const) {
+      it(`method='${method}': returns same shape as estimate or a clear not-installed error`, async () => {
+        // First confirm whether pgstattuple is installed.
+        const extCheck = await runInternal<{ installed: boolean }>(
+          `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'pgstattuple') AS installed`,
+        );
+        const installed = extCheck.ok && extCheck.data?.[0]?.installed === true;
+
+        const res = (await tableBloat.handler({
+          schema: FIXTURE_SCHEMA,
+          minDeadRatio: 0,
+          limit: 50,
+          method,
+        })) as {
+          ok: boolean;
+          data?: { schema: string; table: string; live_tuples: string; dead_tuples: string; dead_ratio: number }[];
+          error?: string;
+        };
+
+        if (!installed) {
+          assert.equal(res.ok, false);
+          assert.match(res.error ?? "", /pgstattuple/);
+          return;
+        }
+
+        assert.equal(res.ok, true, `method=${method} failed: ${res.error}`);
+        assert.ok(Array.isArray(res.data));
+        // All rows must belong to the fixture schema.
+        for (const row of res.data ?? []) {
+          assert.equal(row.schema, FIXTURE_SCHEMA);
+          assert.equal(typeof row.dead_ratio, "number");
+          // live_tuples and dead_tuples are text (bigint-safe serialization).
+          assert.equal(typeof row.live_tuples, "string");
+          assert.equal(typeof row.dead_tuples, "string");
+        }
+      });
+    }
+
+    it("method='estimate' returns an error when pgstattuple is not installed (unit-level gate)", async () => {
+      // estimate path never touches pgstattuple; calling it with method='estimate'
+      // must always succeed regardless of extension state.
+      const res = (await tableBloat.handler({
+        schema: FIXTURE_SCHEMA,
+        minDeadRatio: 0,
+        limit: 5,
+        method: "estimate",
+      })) as { ok: boolean; error?: string };
+      assert.equal(res.ok, true, `estimate path failed unexpectedly: ${res.error}`);
+    });
   });
 
   describe("pg_advisor", () => {
