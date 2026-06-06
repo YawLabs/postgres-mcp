@@ -387,8 +387,9 @@ export const adminTools = [
       "Rolled-up DBA lint pass. One call returns three categories of findings:\n" +
       "- sequence_exhaustion: SERIAL / BIGSERIAL / IDENTITY sequences whose `last_value` is " +
       "above `seqExhaustionThreshold` of `max_value`. The classic incident class.\n" +
-      "- tables_without_primary_key: user tables with no PK. Bloat candidates and a sign of " +
-      "design drift; some replication setups also need PKs.\n" +
+      "- tables_without_primary_key: user tables and foreign tables with no PK defined. Bloat " +
+      "candidates and a sign of design drift; some replication setups also need PKs. Foreign " +
+      "table PKs are metadata-only (not enforced by the FDW) but still worth declaring.\n" +
       "- public_tables_without_rls: tables in `public` (or any schema in `rlsSchemas`) with " +
       "row-level security disabled. Useful as a security baseline check.\n" +
       "Use this as the 'what should I be looking at?' starting point, then drill into " +
@@ -470,7 +471,7 @@ export const adminTools = [
                c.relname AS "table"
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relkind IN ('r', 'p')
+             WHERE c.relkind IN ('r', 'p', 'f')
                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
                AND n.nspname NOT LIKE 'pg_%'
                AND NOT EXISTS (

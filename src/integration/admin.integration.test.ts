@@ -12,6 +12,7 @@ import { runInternal, shutdown } from "../api.js";
 import { adminTools } from "../tools/admin.js";
 import { statsTools } from "../tools/stats.js";
 import {
+  fdwFixtureAvailable,
   FIXTURE_GROUP_ROLE,
   FIXTURE_LIMITED_PASSWORD,
   FIXTURE_LIMITED_ROLE,
@@ -582,6 +583,16 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       );
       assert.ok(Array.isArray(res.data?.sequence_exhaustion));
       assert.ok(Array.isArray(res.data?.public_tables_without_rls));
+
+      // Foreign-table coverage (relkind='f'): remote_users has no defined PK
+      // and must now appear in tables_without_primary_key alongside the heap
+      // and partitioned-parent tables. Skipped when postgres_fdw isn't available.
+      if (fdwFixtureAvailable()) {
+        assert.ok(
+          noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "remote_users"),
+          `expected remote_users (foreign table, no PK) in tables_without_primary_key, got ${JSON.stringify(noPk)}`,
+        );
+      }
     });
 
     it("threshold filters sequence_exhaustion: 0.99 hides everything in a fresh fixture", async () => {

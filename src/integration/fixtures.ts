@@ -36,6 +36,60 @@ export function integrationEnabled(): boolean {
   return process.env.POSTGRES_MCP_INTEGRATION === "1";
 }
 
+export const FDW_SERVER_NAME = "mcp_test_fdw_server";
+
+/**
+ * Best-effort: set up a self-referential postgres_fdw foreign table so the
+ * suite can exercise the foreign-table branches of pg_describe_table and
+ * pg_advisor. Returns true if the foreign table was created, false if
+ * postgres_fdw is unavailable or DATABASE_URL can't be parsed.
+ *
+ * The SERVER and USER MAPPING are cluster-level objects and must be cleaned
+ * up explicitly in teardownFixtures (DROP SCHEMA CASCADE removes the foreign
+ * table but not the server).
+ */
+export async function setupFdwFixture(): Promise<boolean> {
+  const dbUrl = process.env.DATABASE_URL;
+  if (!dbUrl) return false;
+
+  let url: URL;
+  try {
+    // URL constructor rejects the postgres:// scheme; swap to http:// for parsing only.
+    url = new URL(dbUrl.replace(/^postgres(?:ql)?:\/\//, "http://"));
+  } catch {
+    return false;
+  }
+
+  const host = url.hostname || "localhost";
+  const port = url.port || "5432";
+  const dbname = url.pathname.slice(1) || "postgres";
+  const user = decodeURIComponent(url.username) || "postgres";
+  const password = decodeURIComponent(url.password);
+
+  // Single-quote-escape each value so embedded quotes don't break the OPTIONS clause.
+  const q = (s: string) => s.replace(/'/g, "''");
+
+  const statements = [
+    `CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
+    `DROP SERVER IF EXISTS ${FDW_SERVER_NAME} CASCADE`,
+    `CREATE SERVER ${FDW_SERVER_NAME} FOREIGN DATA WRAPPER postgres_fdw` +
+      ` OPTIONS (host '${q(host)}', port '${q(port)}', dbname '${q(dbname)}')`,
+    `CREATE USER MAPPING FOR CURRENT_USER SERVER ${FDW_SERVER_NAME}` +
+      ` OPTIONS (user '${q(user)}', password '${q(password)}')`,
+    // A foreign table with no defined PK -- exercises pg_advisor and pg_describe_table.
+    `CREATE FOREIGN TABLE ${FIXTURE_SCHEMA}.remote_users` +
+      ` (id integer NOT NULL, email text NOT NULL)` +
+      ` SERVER ${FDW_SERVER_NAME}` +
+      ` OPTIONS (schema_name '${q(FIXTURE_SCHEMA)}', table_name 'users')`,
+  ];
+
+  for (const sql of statements) {
+    const res = await runInternal(sql);
+    if (!res.ok) return false;
+  }
+  return true;
+}
+
 /** Drop + recreate the fixture schema so each test run starts clean. */
 export async function setupFixtures(): Promise<void> {
   const statements = [
@@ -162,12 +216,27 @@ export async function setupFixtures(): Promise<void> {
   // hasn't packaged it for this PG major yet), the test falls back to
   // exercising the "extension not installed" error path.
   await runInternal(`CREATE EXTENSION IF NOT EXISTS hypopg`);
+
+  // Best-effort: set up a self-referential FDW foreign table so foreign-table
+  // branches of pg_describe_table and pg_advisor can be exercised.
+  _fdwAvailable = await setupFdwFixture();
+}
+
+// Tracks whether the FDW foreign table fixture was successfully created.
+// Reset by each setupFixtures() call so parallel-file runs stay independent.
+let _fdwAvailable = false;
+
+/** True when the postgres_fdw foreign table fixture is in place. */
+export function fdwFixtureAvailable(): boolean {
+  return _fdwAvailable;
 }
 
 /** Clean up the fixture schema, drop cluster-scoped roles, close the pool. */
 export async function teardownFixtures(): Promise<void> {
   try {
     await runInternal(`DROP SCHEMA IF EXISTS ${FIXTURE_SCHEMA} CASCADE`);
+    // FDW server is a cluster-level object not removed by schema CASCADE.
+    await runInternal(`DROP SERVER IF EXISTS ${FDW_SERVER_NAME} CASCADE`);
     // Order matters: drop the member before the group it belongs to so
     // there's no dangling role-membership row.
     await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_MEMBER_ROLE}`);
