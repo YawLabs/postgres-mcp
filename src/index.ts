@@ -69,11 +69,20 @@ for (const tool of allTools) {
 }
 
 const transport = new StdioServerTransport();
-await server.connect(transport);
-
-// Startup banner on stderr - stdio MCP protocol uses stdout, so stderr is free for logs.
-const writesNote = isWritesAllowed() ? "writes ENABLED" : "read-only";
-console.error(`@yawlabs/postgres-mcp v${version} ready (${allTools.length} tools, ${writesNote})`);
+// Non-TLA connect: the single-binary build bundles this as CJS via esbuild,
+// which cannot emit top-level await. Keep the post-connect banner inside .then()
+// so it still fires only after the transport is live.
+server
+  .connect(transport)
+  .then(() => {
+    // Startup banner on stderr - stdio MCP protocol uses stdout, so stderr is free for logs.
+    const writesNote = isWritesAllowed() ? "writes ENABLED" : "read-only";
+    console.error(`@yawlabs/postgres-mcp v${version} ready (${allTools.length} tools, ${writesNote})`);
+  })
+  .catch((err: unknown) => {
+    process.stderr.write(`postgres-mcp: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  });
 
 // Clean shutdown: release pool connections when the transport closes.
 // SIGINT, SIGTERM, and stdin 'end' can all fire near-simultaneously (e.g. a
