@@ -721,7 +721,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // the block would have to remember to repeat the dance. No defense
     // here against SIGKILL of the test process -- that needs out-of-band
     // cleanup we don't have.
-    describe("_warnings under restricted role", { skip: !destructiveTestsEnabled() }, () => {
+    describe("_warnings under restricted role", { skip: destructiveTestsEnabled() ? false : "set POSTGRES_MCP_DESTRUCTIVE_TESTS=1 (disposable cluster only)" }, () => {
       // Resolve once at describe-load time so the after() hook can rebuild
       // the superuser pool even if the test body throws mid-mutation.
       const originalUrl = process.env.DATABASE_URL!;
