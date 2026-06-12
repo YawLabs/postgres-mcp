@@ -712,8 +712,12 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         return;
       }
       // Check the installed version. If < 1.10 the columns are absent (not a bug).
-      // If >= 1.10, every row must have the keys present (null is fine -- it means
-      // track_io_timing=off; absent means the column was not added to the SELECT).
+      // If >= 1.10, every row must have the keys present (null is fine -- means
+      // track_io_timing=off or the query did no measurable IO; absent means the
+      // column was not added to the SELECT).
+      // Handler uses blk_read_time / blk_write_time for 1.10 (PG 15) and
+      // shared_blk_read_time / shared_blk_write_time for >= 1.11 (PG 17);
+      // both are exposed under the same io_*_time_ms output names.
       const versionRes = await runInternal<{ version: string }>(
         `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
       );
@@ -731,7 +735,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           "io_write_time_ms" in row,
           `io_write_time_ms must be present on pg_stat_statements >= 1.10, got keys: ${Object.keys(row).join(", ")}`,
         );
-        // Values are either null (track_io_timing=off) or a non-negative number.
+        // Values are either null (timing off / no IO) or a non-negative number.
         if (row.io_read_time_ms !== null) assert.equal(typeof row.io_read_time_ms, "number");
         if (row.io_write_time_ms !== null) assert.equal(typeof row.io_write_time_ms, "number");
       }
