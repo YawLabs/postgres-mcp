@@ -34,7 +34,8 @@ export const schemaTools = [
     name: "pg_list_tables",
     description:
       "List tables (and optionally views) in a schema. Returns name, type (table/view/materialized " +
-      "view/foreign), and estimated row count (from `reltuples`; approximate - 0 until ANALYZE runs). " +
+      "view/foreign), and estimated row count (from `reltuples`; null = no ANALYZE yet on PG 14+; " +
+      "0 may mean empty or unanalyzed on PG <= 13). " +
       "Paginate via `limit`/`offset` on very large schemas.",
     annotations: {
       title: "List tables in a schema",
@@ -68,7 +69,7 @@ export const schemaTools = [
              WHEN 'p' THEN 'partitioned_table'
              ELSE c.relkind::text
            END AS type,
-           c.reltuples::float8 AS estimated_rows
+           NULLIF(round(c.reltuples), -1)::float8 AS estimated_rows
          FROM pg_catalog.pg_class c
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
          WHERE n.nspname = $1
