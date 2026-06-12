@@ -584,13 +584,12 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.ok(Array.isArray(res.data?.sequence_exhaustion));
       assert.ok(Array.isArray(res.data?.public_tables_without_rls));
 
-      // Foreign-table coverage (relkind='f'): remote_users has no defined PK
-      // and must now appear in tables_without_primary_key alongside the heap
-      // and partitioned-parent tables. Skipped when postgres_fdw isn't available.
+      // Foreign tables are excluded from tables_without_primary_key because
+      // PostgreSQL forbids declaring PKs on foreign tables entirely.
       if (fdwFixtureAvailable()) {
         assert.ok(
-          noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "remote_users"),
-          `expected remote_users (foreign table, no PK) in tables_without_primary_key, got ${JSON.stringify(noPk)}`,
+          !noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "remote_users"),
+          `remote_users (foreign table) must not appear in tables_without_primary_key, got ${JSON.stringify(noPk)}`,
         );
       }
     });

@@ -387,9 +387,9 @@ export const adminTools = [
       "Rolled-up DBA lint pass. One call returns three categories of findings:\n" +
       "- sequence_exhaustion: SERIAL / BIGSERIAL / IDENTITY sequences whose `last_value` is " +
       "above `seqExhaustionThreshold` of `max_value`. The classic incident class.\n" +
-      "- tables_without_primary_key: user tables and foreign tables with no PK defined. Bloat " +
-      "candidates and a sign of design drift; some replication setups also need PKs. Foreign " +
-      "table PKs are metadata-only (not enforced by the FDW) but still worth declaring.\n" +
+      "- tables_without_primary_key: user tables (plain and partitioned) with no PK defined. Bloat " +
+      "candidates and a sign of design drift; some replication setups also need PKs. " +
+      "Foreign tables are excluded -- PostgreSQL forbids declaring PKs on foreign tables.\n" +
       "- public_tables_without_rls: tables in `public` (or any schema in `rlsSchemas`) with " +
       "row-level security disabled. Useful as a security baseline check.\n" +
       "Use this as the 'what should I be looking at?' starting point, then drill into " +
@@ -466,12 +466,16 @@ export const adminTools = [
             // Partition children (relkind='r') inherit the parent's PK as an
             // indisprimary index on the child, so the NOT EXISTS clause keeps
             // already filtering them out.
+            //
+            // Foreign tables (relkind='f') are excluded: PostgreSQL forbids
+            // PRIMARY KEY (and UNIQUE) constraints on foreign tables entirely,
+            // so they would always appear here with no possible remediation.
             `SELECT
                n.nspname AS schema,
                c.relname AS "table"
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relkind IN ('r', 'p', 'f')
+             WHERE c.relkind IN ('r', 'p')
                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
                AND n.nspname NOT LIKE 'pg_%'
                AND NOT EXISTS (

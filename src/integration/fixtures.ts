@@ -69,14 +69,20 @@ export async function setupFdwFixture(): Promise<boolean> {
   // Single-quote-escape each value so embedded quotes don't break the OPTIONS clause.
   const q = (s: string) => s.replace(/'/g, "''");
 
+  // Omit the password option entirely for trust-auth setups (empty password in
+  // DATABASE_URL). Passing password='' to a trust-auth cluster causes some FDW
+  // versions to reject the mapping with "authentication failed".
+  const userMappingOpts = password
+    ? ` OPTIONS (user '${q(user)}', password '${q(password)}')`
+    : ` OPTIONS (user '${q(user)}')`;
+
   const statements = [
     `CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
     `DROP SERVER IF EXISTS ${FDW_SERVER_NAME} CASCADE`,
     `CREATE SERVER ${FDW_SERVER_NAME} FOREIGN DATA WRAPPER postgres_fdw` +
       ` OPTIONS (host '${q(host)}', port '${q(port)}', dbname '${q(dbname)}')`,
-    `CREATE USER MAPPING FOR CURRENT_USER SERVER ${FDW_SERVER_NAME}` +
-      ` OPTIONS (user '${q(user)}', password '${q(password)}')`,
-    // A foreign table with no defined PK -- exercises pg_advisor and pg_describe_table.
+    `CREATE USER MAPPING FOR CURRENT_USER SERVER ${FDW_SERVER_NAME}` + userMappingOpts,
+    // A foreign table with no defined PK -- exercises pg_describe_table.
     `CREATE FOREIGN TABLE ${FIXTURE_SCHEMA}.remote_users` +
       ` (id integer NOT NULL, email text NOT NULL)` +
       ` SERVER ${FDW_SERVER_NAME}` +
@@ -85,7 +91,10 @@ export async function setupFdwFixture(): Promise<boolean> {
 
   for (const sql of statements) {
     const res = await runInternal(sql);
-    if (!res.ok) return false;
+    if (!res.ok) {
+      console.error(`[FDW fixture] statement failed, skipping FDW tests:\n  ${sql.slice(0, 120)}\n  error: ${(res as { error?: string }).error ?? "unknown"}`);
+      return false;
+    }
   }
   return true;
 }
