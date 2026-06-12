@@ -577,7 +577,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       });
     }
 
-    it("method='estimate' returns an error when pgstattuple is not installed (unit-level gate)", async () => {
+    it("method='estimate' succeeds regardless of pgstattuple extension state", async () => {
       // estimate path never touches pgstattuple; calling it with method='estimate'
       // must always succeed regardless of extension state.
       const res = (await tableBloat.handler({
