@@ -42,7 +42,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         includeViews: false,
         limit: 500,
         offset: 0,
-      })) as { ok: boolean; data?: { name: string; type: string }[] };
+      })) as { ok: boolean; data?: { name: string; type: string; estimated_rows: unknown }[] };
       assert.equal(res.ok, true);
       const names = (res.data ?? []).map((r) => r.name).sort();
       // Includes plain tables, both partition parents (relkind='p'), and
@@ -59,6 +59,23 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       ]);
       const events = (res.data ?? []).find((r) => r.name === "events");
       assert.equal(events?.type, "partitioned_table");
+      // estimated_rows must be a JS number (or null), not a string. pg_class.reltuples is
+      // float4 and was previously cast to ::bigint, which node-pg parses as a
+      // string (int8 OID 20). The fix casts via NULLIF(round(reltuples), -1)::float8:
+      // - node-pg returns a proper number (not string)
+      // - the PG 14+ sentinel -1 (never ANALYZEd) surfaces as null
+      // - fractional estimates are rounded to integral row counts
+      // Regression guard: a revert would silently produce "0" or "-1"
+      // instead of a number/null in the JSON response.
+      const users = (res.data ?? []).find((r) => r.name === "users");
+      const er = users?.estimated_rows;
+      assert.ok(
+        er === null || typeof er === "number",
+        `estimated_rows must be a number or null, got ${JSON.stringify(er)}`,
+      );
+      if (typeof er === "number") {
+        assert.equal(er, Math.round(er), `estimated_rows must be integral, got ${er}`);
+      }
     });
 
     it("with includeViews returns the view too", async () => {
