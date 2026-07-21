@@ -30,14 +30,20 @@ NC='\033[0m'
 # corrupted bytes then get copy-pasted into bug reports.
 step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
 info() { echo -e "${GREEN}  [OK] $1${NC}"; }
-warn() { echo -e "${YELLOW}  [!] $1${NC}"; }
+# warn() writes to stderr so warnings survive stdout redirects -- e.g. the
+# pre-commit path runs `npm run lint:fix >/dev/null`, which would otherwise
+# swallow the SKIP_LINT noop notice and silently skip the formatting gate.
+warn() { echo -e "${YELLOW}  [!] $1${NC}" >&2; }
 fail() { echo -e "${RED}  [X] $1${NC}"; exit 1; }
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
 # no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
-# segfaults on exit-cleanup (platform-windows.md). Apply only when the
-# lint runner is broken on the host; CI catches lint regressions anyway.
+# segfaults on exit-cleanup (platform-windows.md). NOTE: this repo has no CI
+# lint gate (release.yml was dropped when registry publish moved into this
+# script), so with SKIP_LINT=1 lint runs NOWHERE for this release -- run
+# `npx biome check src/` on a working runner before tagging.
 if [ "${SKIP_LINT:-}" = "1" ]; then
+  warn "SKIP_LINT=1 -- lint will not run anywhere this release (no CI lint gate exists); run 'npx biome check src/' on a working runner before tagging"
   npm() {
     if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
       warn "SKIP_LINT=1 -- noop 'npm run $2'"
@@ -143,8 +149,20 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
       echo "Aborted."
       exit 0
     fi
+  elif [ "${RELEASE_YES:-}" = "1" ]; then
+    info "RELEASE_YES=1 -- proceeding without confirmation"
   else
-    info "Non-interactive shell -- proceeding without confirmation"
+    # stdin is not a tty: honor a piped reply (`echo y |` proceeds, `echo n |`
+    # aborts) instead of releasing unconditionally -- a piped decline used to
+    # be read and honored before the tty-gate. -t 5 bounds the wait so an
+    # open-but-silent pipe can't hang the release.
+    REPLY=""
+    IFS= read -r -t 5 -n 1 REPLY || true
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      info "Non-interactive stdin -- proceeding on piped 'y'"
+    else
+      fail "Non-interactive stdin and no 'y' confirmation -- pipe 'y' or set RELEASE_YES=1 to release non-interactively."
+    fi
   fi
 fi
 
@@ -260,7 +278,12 @@ else
   # reports success, but origin's tag stays at the old SHA -- and the later
   # `gh release create` step then creates a GitHub release linked to that
   # stale commit while npm carries the new one.
-  ORIGIN_TAG_SHA=$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | awk '{print $1}')
+  # No stderr suppression and an explicit failure branch: under `set -euo
+  # pipefail` a failing ls-remote (network blip, auth) inside the command
+  # substitution would otherwise kill the script with only the generic
+  # ERR-trap line and git's actual error discarded.
+  ORIGIN_TAG_SHA=$(git ls-remote --tags origin "refs/tags/v${VERSION}" | awk '{print $1}') \
+    || fail "Could not query origin for tag v${VERSION} (network or auth failure -- see git's error above). Resolve and re-run."
   if [ -n "$ORIGIN_TAG_SHA" ]; then
     LOCAL_TAG_SHA=$(git rev-parse "v${VERSION}")
     if [ "$ORIGIN_TAG_SHA" != "$LOCAL_TAG_SHA" ]; then
@@ -441,12 +464,25 @@ else
   # io.github.YawLabs/* namespace.
   # Fall back to gh CLI's session token if MCP_REGISTRY_TOKEN is unset --
   # gh auth login (admin:org or read:org scope) covers the namespace claim.
-  : "${MCP_REGISTRY_TOKEN:=$(gh auth token 2>/dev/null || true)}"
+  # Track which source supplied the token so a login failure names the thing
+  # the operator actually controls instead of an env var they never set.
+  TOKEN_SOURCE="env"
   if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
-    fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
+    MCP_REGISTRY_TOKEN="$(gh auth token 2>/dev/null || true)"
+    TOKEN_SOURCE="gh-cli"
   fi
-  "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null 2>&1 \
-    || fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"
+  if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+    fail "MCP_REGISTRY_TOKEN unset and 'gh auth token' returned nothing -- set a GitHub PAT with read:org for YawLabs, or 'gh auth login' first (or run '$MP login github' once interactively to cache the session)."
+  fi
+  # stdout stays quiet; stderr passes through so mcp-publisher's own
+  # diagnostic isn't hidden behind the generic fail message.
+  if ! "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null; then
+    if [ "$TOKEN_SOURCE" = "gh-cli" ]; then
+      fail "mcp-publisher login failed using the gh CLI session token (MCP_REGISTRY_TOKEN was unset). The gh token likely lacks read:org for YawLabs -- run 'gh auth refresh -h github.com -s read:org' and re-run."
+    else
+      fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)."
+    fi
+  fi
   "$MP" publish \
     || fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
   info "Published to MCP Registry"

@@ -700,6 +700,47 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       }
     });
 
+    it("includes io_read_time_ms / io_write_time_ms when pg_stat_statements >= 1.10", async () => {
+      const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as {
+        ok: boolean;
+        data?: { query: string; io_read_time_ms?: number | null; io_write_time_ms?: number | null }[];
+        error?: string;
+      };
+      if (!res.ok) {
+        // pg_stat_statements not installed -- acceptable, skip the column check.
+        assert.match(res.error ?? "", /pg_stat_statements/);
+        return;
+      }
+      // Check the installed version. If < 1.10 the columns are absent (not a bug).
+      // If >= 1.10, every row must have the keys present (null is fine -- means
+      // track_io_timing=off or the query did no measurable IO; absent means the
+      // column was not added to the SELECT).
+      // Handler uses blk_read_time / blk_write_time for 1.10 (PG 15) and
+      // shared_blk_read_time / shared_blk_write_time for >= 1.11 (PG 17);
+      // both are exposed under the same io_*_time_ms output names.
+      const versionRes = await runInternal<{ version: string }>(
+        `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
+      );
+      if (!versionRes.ok || !versionRes.data?.length) return;
+      const { compareVersions } = await import("../tools/stats.js");
+      const hasIoTiming = compareVersions(versionRes.data[0].version, "1.10") >= 0;
+      if (!hasIoTiming) return; // old extension -- no columns expected, test passes
+
+      for (const row of res.data ?? []) {
+        assert.ok(
+          "io_read_time_ms" in row,
+          `io_read_time_ms must be present on pg_stat_statements >= 1.10, got keys: ${Object.keys(row).join(", ")}`,
+        );
+        assert.ok(
+          "io_write_time_ms" in row,
+          `io_write_time_ms must be present on pg_stat_statements >= 1.10, got keys: ${Object.keys(row).join(", ")}`,
+        );
+        // Values are either null (timing off / no IO) or a non-negative number.
+        if (row.io_read_time_ms !== null) assert.equal(typeof row.io_read_time_ms, "number");
+        if (row.io_write_time_ms !== null) assert.equal(typeof row.io_write_time_ms, "number");
+      }
+    });
+
     // Note: an integration test for the orderBy=calls numeric-vs-lexical
     // sort (alias-shadowing trap called out in stats.ts:60-67) was attempted
     // across 0.6.7-0.6.9 and could not be made environment-independent.

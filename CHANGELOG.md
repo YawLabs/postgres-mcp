@@ -88,6 +88,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a local-only pre-tag gate; this is just an opt-in fail-fast.
 - `package.json` `package-lock.json` and `server.json` all bumped to 0.6.20.
 
+## [0.6.19] - 2026-06-02
+
+Release-flow hardening; no library behavior changes shipped in this version.
+
+### Fixed
+- `release.sh` refuses to push when origin already has `v<version>` pointing
+  at a different commit (rewound tag elsewhere, parallel release race) --
+  previously `git push --follow-tags` silently skipped the stale tag and the
+  GitHub release linked the wrong commit. Compares tag-object SHAs so resume
+  runs don't false-abort.
+- README "Add to Yaw MCP" badge points at the https forwarder so it renders
+  as a link on github.com (raw `yaw://` hrefs are stripped).
+
+### Added
+- `SKIP_LINT=1` escape hatch in `release.sh` for hosts where the npm
+  run-script wrapper segfaults on exit-cleanup (MINGW64-ARM64).
+- `wrapToolHandler` extracted from `index.ts` for testability, with unit
+  coverage of the MCP result wrapper and the connect-failure path (expanded
+  further in 0.6.20).
+
+## [0.6.18] - 2026-05-28
+
+### Changed
+- Release publishing consolidated into `release.sh`: the MCP Registry publish
+  moved into the script and `release.yml` (plus the non-release CI workflows)
+  was dropped. The script hands off to CI when a CI publish path exists and
+  publishes from the workstation otherwise.
+
+### Fixed
+- `release.sh` syncs `server.json` unconditionally, not only inside the bump
+  branch, so a resume run no longer asks mcp-publisher to re-publish the
+  previous version (400 duplicate-version).
+- `release.sh` falls back to the gh CLI session token when
+  `MCP_REGISTRY_TOKEN` is unset.
+- The release confirmation prompt is tty-gated so non-interactive runs don't
+  hang on `read`.
+
+### Docs
+- README install badge swapped to the "Add to Yaw MCP" deep link; `npx`
+  spawn examples pinned to `@latest` for auto-update.
+
+## [0.6.17] - 2026-05-19
+
+### Added
+- `release.sh` accepts an optional pre-release commit message as a second
+  argument: runs the pre-commit checklist, commits tracked changes, then
+  proceeds with the release.
+- Post-publish smoke script (`scripts/post-publish-smoke.sh`) wired into the
+  release flow -- exercises the published tarball via a real `npx` install
+  instead of trusting `npm view` registry metadata.
+
 ## [0.6.16] - 2026-05-18
 
 ### Tests

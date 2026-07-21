@@ -246,6 +246,12 @@ DATABASE_URL='postgres://user:pass@host:5432/db' POSTGRES_MCP_INTEGRATION=1 npm 
 
 The integration suite assumes a disposable database -- it creates and drops a `test_fixture` schema. Don't point it at anything you care about.
 
+To also run the destructive tests (REVOKE / restricted-role path), add `POSTGRES_MCP_DESTRUCTIVE_TESTS=1`. Only safe on a disposable cluster:
+
+```bash
+DATABASE_URL='postgres://user:pass@host:5432/db' POSTGRES_MCP_INTEGRATION=1 POSTGRES_MCP_DESTRUCTIVE_TESTS=1 npm run test:integration
+```
+
 ### Windows: integration tests via WSL2
 
 Native Postgres on Windows ARM64 is fragile (UCRT runtime gaps, missing ARM64 builds). The reliable path is a disposable Ubuntu under WSL2 with the integration suite running inside WSL (WSL2's NAT blocks the Windows host from reaching :5432, so don't try to run the tests from PowerShell):

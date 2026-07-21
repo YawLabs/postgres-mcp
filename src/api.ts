@@ -106,10 +106,12 @@ export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
  * until `shutdown()` runs and a subsequent call rebuilds the pool.
  *
  * Two values are intentionally re-read on every request and are NOT snapshotted
- * here: `getMaxRows()` (so a one-off bump to `POSTGRES_MAX_ROWS` takes effect
- * immediately, no restart) and `isWritesAllowed()` (so flipping `ALLOW_WRITES`
- * on or off between tool calls is observed without a process restart -- the
- * operator uses this when they want to briefly run a write, then flip back).
+ * here: `getMaxRows()` and `isWritesAllowed()`. The per-request re-read matters
+ * for in-process callers (tests set `process.env.ALLOW_WRITES` between calls)
+ * and keeps the flag out of the pool snapshot above. It does NOT give an
+ * operator a live toggle: a stdio MCP server's environment is fixed at spawn
+ * by the host's config, so changing `ALLOW_WRITES` (or `POSTGRES_MAX_ROWS`)
+ * on a running server requires the MCP host to restart it.
  */
 export function getPool(): pg.Pool {
   if (pool) return pool;
@@ -152,10 +154,13 @@ export interface QueryResult {
 // but is never read back (no result row references the dead oid), so it's
 // wasted memory, not a correctness bug.
 //
-// Concurrency: the bootstrap read is unsynchronized, so with POSTGRES_POOL_MAX>1
-// two clients can both observe a null cache and each run the full pg_type
-// SELECT before either assigns -- harmless duplicate work, last-writer-wins on
-// the shared map.
+// Concurrency: the null check and the `new Map()` assignment in
+// resolveTypeNames are synchronous (no await between them), so the bootstrap
+// SELECT runs at most once per cache lifetime. The actual race with
+// POSTGRES_POOL_MAX>1: a second concurrent caller sees an empty-but-non-null
+// map, skips the bootstrap, and runs the targeted `WHERE oid = ANY($1)`
+// miss-fill for its oids -- harmless duplicate targeted work; both callers
+// merge entries into the same shared Map.
 let typeNameCache: Map<number, string> | null = null;
 
 async function resolveTypeNames(client: pg.PoolClient, oids: number[]): Promise<Record<number, string>> {

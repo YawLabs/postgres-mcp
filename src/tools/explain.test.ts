@@ -58,10 +58,10 @@ describe("pg_explain hypothetical_indexes identifier validation", () => {
       hypothetical_indexes: [{ table: 'public."odd.name"', columns: ["x"], using: "btree" }],
     })) as { ok: boolean; error?: string };
     assert.equal(result.ok, false);
-    // The embedded `.` inside the quoted segment splits this into 3 pieces, so
-    // the over-qualified guard fires first; the double-quote guard would catch
-    // it otherwise. Either rejection is correct -- accept both forms.
-    assert.match(result.error ?? "", /double-quote|pre-quoting|over-qualified/i);
+    // The raw-string double-quote check runs before the dot-split, so a
+    // pre-quoted name with an embedded dot gets the actionable "remove the
+    // quotes" message, not the over-qualified one.
+    assert.match(result.error ?? "", /double-quote|pre-quoting/i);
   });
 
   it("rejects an over-qualified (3+ part) table name", async () => {

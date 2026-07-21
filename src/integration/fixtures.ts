@@ -99,6 +99,17 @@ export async function setupFdwFixture(): Promise<boolean> {
   return true;
 }
 
+/**
+ * Guard for tests that mutate pg_catalog grants (e.g. REVOKE EXECUTE on a
+ * built-in function). A hard process kill between REVOKE and GRANT leaves the
+ * cluster broken until manually repaired, so these tests only run when the
+ * caller explicitly opts in with POSTGRES_MCP_DESTRUCTIVE_TESTS=1 -- meaning
+ * the cluster is disposable (CI, ephemeral Docker, etc.).
+ */
+export function destructiveTestsEnabled(): boolean {
+  return process.env.POSTGRES_MCP_DESTRUCTIVE_TESTS === "1";
+}
+
 /** Drop + recreate the fixture schema so each test run starts clean. */
 export async function setupFixtures(): Promise<void> {
   const statements = [
