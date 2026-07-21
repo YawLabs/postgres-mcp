@@ -8,7 +8,13 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { schemaTools } from "../tools/schemas.js";
-import { fdwFixtureAvailable, FIXTURE_SCHEMA, integrationEnabled, setupFixtures, teardownFixtures } from "./fixtures.js";
+import {
+  FIXTURE_SCHEMA,
+  fdwFixtureAvailable,
+  integrationEnabled,
+  setupFixtures,
+  teardownFixtures,
+} from "./fixtures.js";
 
 const listSchemas = schemaTools.find((t) => t.name === "pg_list_schemas")!;
 const listTables = schemaTools.find((t) => t.name === "pg_list_tables")!;

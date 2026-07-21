@@ -562,7 +562,12 @@ export const adminTools = [
         ),
     }),
     handler: async (input: unknown) => {
-      const { schema, minDeadRatio, limit, method: rawMethod } = input as {
+      const {
+        schema,
+        minDeadRatio,
+        limit,
+        method: rawMethod,
+      } = input as {
         schema?: string;
         minDeadRatio: number;
         limit: number;

@@ -92,7 +92,9 @@ export async function setupFdwFixture(): Promise<boolean> {
   for (const sql of statements) {
     const res = await runInternal(sql);
     if (!res.ok) {
-      console.error(`[FDW fixture] statement failed, skipping FDW tests:\n  ${sql.slice(0, 120)}\n  error: ${(res as { error?: string }).error ?? "unknown"}`);
+      console.error(
+        `[FDW fixture] statement failed, skipping FDW tests:\n  ${sql.slice(0, 120)}\n  error: ${(res as { error?: string }).error ?? "unknown"}`,
+      );
       return false;
     }
   }
