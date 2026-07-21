@@ -55,17 +55,18 @@ describe("Tool definitions", () => {
         assert.equal(typeof tool.annotations.openWorldHint, "boolean");
       });
 
-      // Schema/handler-drift guard. Every tool's inputSchema is a ZodObject;
-      // the handler then does `const { ... } = input as { ... }` and reads
-      // the destructured fields without re-validating. A regression that
-      // (a) drops the ZodObject wrapper, (b) leaves the schema empty when
-      // the handler destructures input, or (c) has a schema whose shape
-      // doesn't match the keys the handler reads would compile cleanly
-      // and only surface as `undefined` at runtime -- caught by integration
-      // tests, but months later and at the call site. The cheap probe:
-      // the schema is a ZodObject (already asserted above), the schema
-      // actually parses a sample input built to satisfy each field's
-      // type, and the parsed output exposes the shape's declared keys.
+      // Schema sanity guard. Every tool's inputSchema is a ZodObject; the
+      // handler then does `const { ... } = input as { ... }` and reads the
+      // destructured fields without re-validating. The cheap probe here:
+      // the schema is a ZodObject (already asserted above) and it actually
+      // parses a sample input built to satisfy each field's type -- catching
+      // a dropped ZodObject wrapper or an impossible constraint (a bound or
+      // refine no type-correct input can satisfy). It deliberately does NOT
+      // try to assert that the schema's keys match what the handler
+      // destructures: Zod's parsed output always echoes supplied declared
+      // keys, so a key round-trip assertion can never fail once safeParse
+      // succeeds, and a real handler-key check would need a per-tool fixture
+      // of the keys each handler reads.
       //
       // Note: a tool with `z.object({})` (no declared fields, e.g.
       // pg_list_schemas / pg_list_extensions / pg_replication_status) is
@@ -73,7 +74,7 @@ describe("Tool definitions", () => {
       // and these tools take no input. The "must have at least one field"
       // assertion is intentionally NOT made; the test below still runs
       // and passes (parses {}, parsed object is {}) for those tools.
-      it("inputSchema parses a type-correct sample input and round-trips declared keys", () => {
+      it("inputSchema parses a type-correct sample input", () => {
         const shape = tool.inputSchema.shape as Record<string, z.ZodTypeAny>;
         const fieldNames = Object.keys(shape);
 
@@ -134,11 +135,6 @@ describe("Tool definitions", () => {
           true,
           `${tool.name} inputSchema rejected a type-correct sample: ${result.success ? "" : result.error.message}`,
         );
-        if (result.success) {
-          for (const name of fieldNames) {
-            assert.ok(name in result.data, `${tool.name} inputSchema parsed output missing declared field "${name}"`);
-          }
-        }
       });
     });
   }

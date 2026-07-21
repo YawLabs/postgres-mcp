@@ -64,6 +64,15 @@ function quoteQualifiedTable(name: string): string {
  * default re-application in buildHypopgHooks.
  */
 function validateHypoIndex(idx: { table: string; columns: string[] }): string | null {
+  // Check the RAW string for pre-quoting BEFORE splitting on `.`: a pre-quoted
+  // name with an embedded dot (`public."odd.name"`) splits into 3+ pieces, and
+  // the over-qualified message alone gives the caller no hint that removing
+  // the quotes is the fix. JSON.stringify the offending value so a name
+  // containing `"` renders unambiguously instead of producing a broken
+  // nested-quote message.
+  if (idx.table.includes('"')) {
+    return `Hypothetical index table ${JSON.stringify(idx.table)} contains a double-quote; pass plain identifier names without pre-quoting.`;
+  }
   const pieces = idx.table.split(".");
   // Only `schema.table` (1 or 2 pieces) is a legal dotted shape. A 3+ part
   // name like `a.b.c` passes the per-piece checks below but renders as
@@ -73,11 +82,6 @@ function validateHypoIndex(idx: { table: string; columns: string[] }): string | 
     return `Hypothetical index table ${JSON.stringify(idx.table)} is over-qualified; use only \`schema.table\` or \`table\`.`;
   }
   for (const piece of pieces) {
-    if (piece.includes('"')) {
-      // JSON.stringify the offending value so a name containing `"` renders
-      // unambiguously instead of producing a broken nested-quote message.
-      return `Hypothetical index table ${JSON.stringify(idx.table)} contains a double-quote; pass plain identifier names without pre-quoting.`;
-    }
     if (Buffer.byteLength(piece, "utf8") > 63) {
       return `Hypothetical index table piece ${JSON.stringify(piece)} exceeds PostgreSQL's 63-byte NAMEDATALEN limit (multi-byte characters count as multiple bytes).`;
     }
