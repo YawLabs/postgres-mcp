@@ -39,7 +39,7 @@ while read -r V _ PORT _; do
   # FAIL back to a specific test without re-running.
   LOG="$(mktemp)"
   if DATABASE_URL="postgres://postgres:postgres@localhost:${PORT}/postgres_mcp_test" \
-     POSTGRES_MCP_INTEGRATION=1 npm run --silent test:integration >"${LOG}" 2>&1; then
+     POSTGRES_MCP_INTEGRATION=1 POSTGRES_MCP_DESTRUCTIVE_TESTS=1 npm run --silent test:integration >"${LOG}" 2>&1; then
     tail -20 "${LOG}"
     RESULTS+=("PG${V}: PASS")
   else
