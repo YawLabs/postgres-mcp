@@ -387,8 +387,9 @@ export const adminTools = [
       "Rolled-up DBA lint pass. One call returns three categories of findings:\n" +
       "- sequence_exhaustion: SERIAL / BIGSERIAL / IDENTITY sequences whose `last_value` is " +
       "above `seqExhaustionThreshold` of `max_value`. The classic incident class.\n" +
-      "- tables_without_primary_key: user tables with no PK. Bloat candidates and a sign of " +
-      "design drift; some replication setups also need PKs.\n" +
+      "- tables_without_primary_key: user tables (plain and partitioned) with no PK defined. Bloat " +
+      "candidates and a sign of design drift; some replication setups also need PKs. " +
+      "Foreign tables are excluded -- PostgreSQL forbids declaring PKs on foreign tables.\n" +
       "- public_tables_without_rls: tables in `public` (or any schema in `rlsSchemas`) with " +
       "row-level security disabled. Useful as a security baseline check.\n" +
       "Use this as the 'what should I be looking at?' starting point, then drill into " +
@@ -465,6 +466,10 @@ export const adminTools = [
             // Partition children (relkind='r') inherit the parent's PK as an
             // indisprimary index on the child, so the NOT EXISTS clause keeps
             // already filtering them out.
+            //
+            // Foreign tables (relkind='f') are excluded: PostgreSQL forbids
+            // PRIMARY KEY (and UNIQUE) constraints on foreign tables entirely,
+            // so they would always appear here with no possible remediation.
             `SELECT
                n.nspname AS schema,
                c.relname AS "table"
@@ -520,7 +525,16 @@ export const adminTools = [
       "Estimate table bloat (dead tuples + free space) for tables in a schema. Returns live " +
       "tuples, dead tuples, dead-tuple ratio, last_vacuum / last_autovacuum timestamps, and " +
       "total relation size. A high dead_ratio with a stale last_autovacuum is a sign a table " +
-      "needs VACUUM. Cheap - uses `pg_stat_user_tables`, no extensions required.",
+      "needs VACUUM.\n\n" +
+      "Three methods are available via the `method` parameter:\n" +
+      "- `estimate` (default): reads pg_stat_user_tables -- fast, no extensions, ANALYZE-driven " +
+      "approximations. Use this first.\n" +
+      "- `approx`: uses pgstattuple_approx() -- fast sampling pass, more accurate than estimates, " +
+      "requires the pgstattuple extension.\n" +
+      "- `exact`: uses pgstattuple() -- full table scan, exact counts, slow on large tables, " +
+      "requires the pgstattuple extension. Always pass `schema` with method='exact' -- scanning " +
+      "all user tables in one statement will hit statement_timeout on non-trivial databases.\n" +
+      "Install pgstattuple with `CREATE EXTENSION pgstattuple` (requires superuser).",
     annotations: {
       title: "Estimate table bloat",
       readOnlyHint: true,
@@ -537,19 +551,33 @@ export const adminTools = [
         .default(0.1)
         .describe("Minimum dead-tuple fraction to include - dead / (live + dead). Default 0.1 = 10%."),
       limit: z.number().int().min(1).max(200).default(50).describe("Max rows to return (default 50)."),
+      method: z
+        .enum(["estimate", "approx", "exact"])
+        .default("estimate")
+        .describe(
+          "Bloat measurement method. 'estimate' (default) uses pg_stat_user_tables (fast, no extensions). " +
+            "'approx' uses pgstattuple_approx() (fast sampling, more accurate). " +
+            "'exact' uses pgstattuple() (full scan, exact but slow). " +
+            "Both 'approx' and 'exact' require the pgstattuple extension.",
+        ),
     }),
     handler: async (input: unknown) => {
-      const { schema, minDeadRatio, limit } = input as {
+      const { schema, minDeadRatio, limit, method: rawMethod } = input as {
         schema?: string;
         minDeadRatio: number;
         limit: number;
+        method?: "estimate" | "approx" | "exact";
       };
+      // Direct (non-MCP) callers bypass Zod, so Zod's default("estimate") never
+      // runs for them. Re-apply it here -- matches the precedent in pg_explain.
+      const method = rawMethod ?? "estimate";
       const schemaFilter = schema
         ? "AND schemaname = $3"
         : "AND schemaname NOT IN ('pg_catalog', 'information_schema') AND schemaname NOT LIKE 'pg_%'";
       const params: unknown[] = [minDeadRatio, limit];
       if (schema) params.push(schema);
-      return runInternal<{
+
+      type BloatRow = {
         schema: string;
         table: string;
         live_tuples: string;
@@ -560,7 +588,58 @@ export const adminTools = [
         last_vacuum: string | null;
         last_autovacuum: string | null;
         last_analyze: string | null;
-      }>(
+      };
+
+      if (method !== "estimate") {
+        // Check extension presence before opening a second connection.
+        const check = await runInternal<{ installed: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'pgstattuple'
+           ) AS installed`,
+        );
+        if (!check.ok) return check;
+        if (!check.data?.[0]?.installed) {
+          return {
+            ok: false,
+            error:
+              `pgstattuple extension is not installed. Install with ` +
+              "`CREATE EXTENSION pgstattuple;` (requires superuser), then retry " +
+              `with method='${method}'.`,
+          };
+        }
+
+        // pgstattuple_approx uses approx_tuple_count; pgstattuple uses tuple_count.
+        const fn = method === "approx" ? "pgstattuple_approx" : "pgstattuple";
+        const liveTuplesCol = method === "approx" ? "approx_tuple_count" : "tuple_count";
+        // Join pg_class to filter to heap relations only (relkind='r' or 'm').
+        // pg_stat_user_tables includes partitioned parents (relkind='p'), and
+        // both pgstattuple() and pgstattuple_approx() raise an error on them.
+        // Materialized views ('m') are valid heap targets and included.
+        return runInternal<BloatRow>(
+          `SELECT
+             s.schemaname AS schema,
+             s.relname AS "table",
+             (p.${liveTuplesCol})::text AS live_tuples,
+             p.dead_tuple_count::text AS dead_tuples,
+             (p.dead_tuple_count::float8 / NULLIF(p.${liveTuplesCol} + p.dead_tuple_count, 0))::numeric(6, 3)::float8 AS dead_ratio,
+             pg_size_pretty(pg_total_relation_size(s.relid)) AS size_pretty,
+             pg_total_relation_size(s.relid)::text AS size_bytes,
+             s.last_vacuum::text AS last_vacuum,
+             s.last_autovacuum::text AS last_autovacuum,
+             s.last_analyze::text AS last_analyze
+           FROM pg_catalog.pg_stat_user_tables s
+           JOIN pg_catalog.pg_class c ON c.oid = s.relid AND c.relkind IN ('r', 'm')
+           CROSS JOIN LATERAL ${fn}(s.relid::regclass) p
+           WHERE (p.${liveTuplesCol} + p.dead_tuple_count) > 0
+             AND (p.dead_tuple_count::float8 / NULLIF(p.${liveTuplesCol} + p.dead_tuple_count, 0)) >= $1
+             ${schemaFilter}
+           ORDER BY p.dead_tuple_count DESC
+           LIMIT $2`,
+          params,
+        );
+      }
+
+      return runInternal<BloatRow>(
         // dead_ratio = dead / (live + dead): bounded [0, 1]. A 100%-dead table
         // (live=0, dead>0) correctly reports 1.0 instead of 0. Tables with both
         // counters at 0 are filtered out -- nothing to report.

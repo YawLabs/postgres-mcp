@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { schemaTools } from "../tools/schemas.js";
-import { FIXTURE_SCHEMA, integrationEnabled, setupFixtures, teardownFixtures } from "./fixtures.js";
+import { fdwFixtureAvailable, FIXTURE_SCHEMA, integrationEnabled, setupFixtures, teardownFixtures } from "./fixtures.js";
 
 const listSchemas = schemaTools.find((t) => t.name === "pg_list_schemas")!;
 const listTables = schemaTools.find((t) => t.name === "pg_list_tables")!;
@@ -45,9 +45,9 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       })) as { ok: boolean; data?: { name: string; type: string; estimated_rows: unknown }[] };
       assert.equal(res.ok, true);
       const names = (res.data ?? []).map((r) => r.name).sort();
-      // Includes plain tables, both partition parents (relkind='p'), and
-      // the partition child (relkind='r'). Order alphabetical.
-      assert.deepEqual(names, [
+      // Includes plain tables, partition parents (relkind='p'), partition child
+      // (relkind='r'), and foreign table (relkind='f') when postgres_fdw is available.
+      const expectedNames = [
         "Odd Table",
         "events",
         "events_2026",
@@ -56,7 +56,9 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         "posts",
         "products",
         "users",
-      ]);
+        ...(fdwFixtureAvailable() ? ["remote_users"] : []),
+      ].sort();
+      assert.deepEqual(names, expectedNames);
       const events = (res.data ?? []).find((r) => r.name === "events");
       assert.equal(events?.type, "partitioned_table");
       // estimated_rows must be a JS number (or null), not a string. pg_class.reltuples is
@@ -240,6 +242,20 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
       const names = (res.data?.columns ?? []).map((c) => c.name).sort();
       assert.deepEqual(names, ["id", "weird-col"]);
+    });
+
+    it("reports kind=foreign_table for a foreign table (skipped without postgres_fdw)", async () => {
+      if (!fdwFixtureAvailable()) return;
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "remote_users" })) as {
+        ok: boolean;
+        data?: { kind: string; columns: { name: string }[] };
+        error?: string;
+      };
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      assert.equal(res.data?.kind, "foreign_table");
+      // Columns should still be present even for foreign tables.
+      const colNames = (res.data?.columns ?? []).map((c) => c.name).sort();
+      assert.deepEqual(colNames, ["email", "id"]);
     });
 
     it("returns 'not found' for missing table", async () => {
