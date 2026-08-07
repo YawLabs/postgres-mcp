@@ -95,6 +95,25 @@ command -v npm >/dev/null  || fail "npm not installed"
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 RESUMING=false
 
+# The branch to push to. Every push below used to hardcode `main`, so running
+# this from any other branch pushed a STALE local main -- and if that main was
+# behind origin, the push was rejected and the release died with a generic
+# "git push failed" while the actual commit sat unpushed on the real branch.
+# Resolve it once, here, from the branch actually checked out.
+RELEASE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [ -z "$RELEASE_BRANCH" ] || [ "$RELEASE_BRANCH" = "HEAD" ]; then
+  fail "Could not determine the current branch (detached HEAD?). Check out a branch and re-run."
+fi
+
+# Releasing from a non-default branch tags a commit that is not on the default
+# branch, which is almost always a mistake -- but not always (hotfix branches
+# are real), so warn rather than block. RELEASE_BRANCH_OK=1 silences it.
+DEFAULT_BRANCH=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+if [ "$RELEASE_BRANCH" != "$DEFAULT_BRANCH" ] && [ "${RELEASE_BRANCH_OK:-}" != "1" ]; then
+  warn "Releasing from '$RELEASE_BRANCH', not '$DEFAULT_BRANCH' -- the tag will point at a commit that may not be on $DEFAULT_BRANCH. Set RELEASE_BRANCH_OK=1 to silence."
+fi
+
 # ---- Optional: commit + push tracked changes before the release ----
 # When a commit message is passed as $2 and the tree is dirty, run the pre-
 # commit checklist (lint:fix + tsc + unit tests) and then commit only TRACKED
@@ -112,8 +131,9 @@ if [ "$IS_CI" != "true" ] && [ -n "$PRE_COMMIT_MSG" ] && [ -n "$(git status --po
     info "Nothing staged after lint:fix -- skipping pre-release commit"
   else
     git commit -m "$PRE_COMMIT_MSG" || fail "git commit failed"
-    git push origin main           || fail "git push failed -- resolve and re-run"
-    info "Pre-release commit pushed: $PRE_COMMIT_MSG"
+    git push origin "$RELEASE_BRANCH" \
+      || fail "git push of '$RELEASE_BRANCH' failed -- resolve (fetch/rebase if the branch moved) and re-run"
+    info "Pre-release commit pushed to $RELEASE_BRANCH: $PRE_COMMIT_MSG"
   fi
 fi
 
@@ -330,8 +350,9 @@ else
     fi
   fi
 
-  git push origin main --follow-tags
-  info "Pushed to origin"
+  git push origin "$RELEASE_BRANCH" --follow-tags \
+    || fail "git push of '$RELEASE_BRANCH' failed. If the branch moved on origin, fetch and rebase, then re-run -- the tag is already created locally and this step is idempotent."
+  info "Pushed $RELEASE_BRANCH + tag v${VERSION} to origin"
 fi
 
 # =============================================================================
