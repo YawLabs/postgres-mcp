@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-07
+
 ### Added
 
 - The `postgres-mcp` command is now a runtime launcher (`bin/postgres-mcp.mjs`)
@@ -31,11 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a one-time cost per MCP session rather than per tool call, but it is a real
   regression against plain Node -- `POSTGRES_MCP_RUNTIME=node` opts out.
 
-> **Version note:** the "Changed (breaking)" entries below alter the shape of
-> tool output and the CLI's exit behavior. Under SemVer-for-0.x that makes the
-> next release a MINOR bump -- `0.8.0`, not `0.7.1`. `release.sh` performs the
-> actual bump (`npm version`) and syncs `server.json`, so nothing is pre-bumped
-> here; pass `0.8.0` when cutting the release.
+## [0.8.0] - 2026-08-07
 
 ### Changed (breaking)
 
@@ -129,6 +127,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_stat_statements` renamed `blk_read_time` to `shared_blk_read_time` in 1.11
   (PG17), and with only 17/18 in the matrix the pre-1.11 branch was never
   selected.
+
+## [0.7.0] - 2026-07-21
+
+Backfilled from `git log v0.6.20..v0.7.0` -- this release shipped without a
+CHANGELOG entry. Summarized from commit subjects rather than re-derived from
+the diff, so it is less detailed than the entries around it.
+
+### Added
+
+- `pg_table_bloat`: `approx` and `exact` methods via `pgstattuple` (#19).
+- `pg_top_queries`: `io_read_time_ms` / `io_write_time_ms` on
+  `pg_stat_statements` >= 1.10 (#16).
+- Cross-platform single-binary release pipeline (Scoop + Homebrew), released
+  as 0.6.21.
+
+### Fixed
+
+- `pg_list_tables`: cast `reltuples` to `float8` so `estimated_rows` is a
+  number rather than a string (#17).
+- 10 confirmed findings from a review of `f7b7cb3..a736200` (#21).
+
+### Removed
+
+- GitHub Actions workflows and the dependabot config (#24). This is why the
+  repo has no `.github/` directory and why `release.sh` is the only release
+  path; several stale comments referring to CI survived until 0.8.0.
 
 ## [0.6.20] - 2026-06-04
 
