@@ -241,6 +241,42 @@ if [ -f server.json ]; then
   fi
 fi
 
+# Promote CHANGELOG's [Unreleased] section to this version.
+#
+# This script used to bump package.json and server.json but never touch
+# CHANGELOG.md, so shipped releases stayed filed under [Unreleased] and the
+# file silently drifted -- 0.7.0 shipped with no entry at all, and 0.8.0 and
+# 0.9.0 both shipped with their notes still sitting under [Unreleased].
+#
+# Idempotent on three axes, because this runs on resume too:
+#   1. Already has a [$VERSION] heading -> no-op.
+#   2. No [Unreleased] heading at all -> no-op (nothing to promote).
+#   3. [Unreleased] present but EMPTY -> no-op. Promoting it would leave an
+#      empty version heading, which is worse than no heading: it reads as
+#      "this release changed nothing" rather than "nobody wrote it down".
+if [ -f CHANGELOG.md ]; then
+  if grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+    info "CHANGELOG already has a [${VERSION}] heading - skipping"
+  elif ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
+    warn "CHANGELOG.md has no [Unreleased] heading -- not promoting anything. Add release notes by hand."
+  else
+    # Body = every non-blank line between [Unreleased] and the next `## [`.
+    UNRELEASED_BODY=$(awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md | grep -v '^[[:space:]]*$' | head -1)
+    if [ -z "$UNRELEASED_BODY" ]; then
+      warn "CHANGELOG [Unreleased] is empty -- releasing v${VERSION} with no release notes."
+    else
+      # Insert the version heading right after [Unreleased], leaving
+      # [Unreleased] in place and empty for the next cycle. `done` guards
+      # against a second match later in the file.
+      awk -v ver="$VERSION" -v d="$(date +%Y-%m-%d)" '
+        !seen && /^## \[Unreleased\]/ { print; print ""; print "## [" ver "] - " d; seen=1; next }
+        { print }
+      ' CHANGELOG.md > CHANGELOG.tmp && mv CHANGELOG.tmp CHANGELOG.md
+      info "CHANGELOG: [Unreleased] promoted to [${VERSION}]"
+    fi
+  fi
+fi
+
 # =============================================================================
 # Step 4: Commit, tag, and push
 # =============================================================================
@@ -251,6 +287,9 @@ if [ "$IS_CI" = "true" ]; then
 else
   BUMP_FILES="package.json package-lock.json"
   [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
+  # CHANGELOG.md is bumped above (Unreleased -> this version) and must ride
+  # the same commit, or the promotion is left as uncommitted working-tree dirt.
+  [ -f CHANGELOG.md ] && BUMP_FILES="$BUMP_FILES CHANGELOG.md"
   if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
     git add $BUMP_FILES
     git commit -m "v${VERSION}"

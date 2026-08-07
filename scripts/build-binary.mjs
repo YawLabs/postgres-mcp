@@ -28,7 +28,7 @@
 // package-lock.json, src/, or node_modules, and it never runs `npm install`.
 
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import esbuild from 'esbuild';
@@ -43,10 +43,53 @@ const { version } = pkg;
 // Binary name = the package's first `bin` command, so this script is
 // copy-paste generic across @yawlabs/* servers -- no per-repo rename.
 const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
-// Bundle the SOURCE behind the bin's dist entry (src/index.ts, src/server.ts,
-// src/runner.ts, ...) so this works regardless of the server's entry filename.
-const binEntry = Object.values(pkg.bin ?? {})[0] ?? pkg.main ?? 'dist/index.js';
-const srcEntry = binEntry.replace(/^\.\//, '').replace(/^dist\//, 'src/').replace(/\.[cm]?js$/, '.ts');
+// Bundle the SERVER, derived from `main` -- deliberately NOT from `bin`.
+//
+// `bin` points at bin/postgres-mcp.mjs, the npm launcher that picks a runtime
+// (oam or node) at launch time. A compiled standalone binary IS its runtime,
+// so there is nothing to select and embedding the launcher would only add a
+// spawn. `main` always names the server's own dist entry.
+//
+// This used to read `bin`, which silently broke the moment `bin` was repointed
+// at the launcher in 0.9.0: the mapping produced `bin/postgres-mcp.ts`, a file
+// that does not exist. Nothing caught it because this script is a manual,
+// per-host step that neither `npm test` nor `release.sh` runs.
+const serverDist = pkg.main ?? 'dist/index.js';
+const srcEntry = serverDist.replace(/^\.\//, '').replace(/^dist\//, 'src/').replace(/\.[cm]?js$/, '.ts');
+if (!existsSync(join(repoRoot, srcEntry))) {
+  console.error(`build-binary: derived source entry '${srcEntry}' does not exist (from package.json main='${serverDist}')`);
+  process.exit(1);
+}
+
+// Which toolchain turns the bundle into an executable.
+//   node (default) -- Node SEA: blob + postject injection + macOS re-sign.
+//   oam            -- `oam compile`, which takes the same pre-bundled file and
+//                     emits the executable in one step, skipping the postject
+//                     and codesign dance entirely.
+// Defaults to node because SEA is the path the shipped Scoop/Homebrew binaries
+// were built with and is proven on all five targets; the oam path is smoke-
+// tested on windows-arm64 only. Flip the default once it is exercised on the
+// rest of the matrix.
+const BINARY_RUNTIME = (process.env.POSTGRES_MCP_BINARY_RUNTIME ?? 'node').toLowerCase();
+
+/** Locate an oam binary for the compile path, or exit with a clear message. */
+function requireOam() {
+  const candidates = [
+    process.env.OAM_BIN,
+    ...(process.env.PATH ?? '')
+      .split(isWin ? ';' : ':')
+      .filter(Boolean)
+      .map((d) => join(d, isWin ? 'oam.exe' : 'oam')),
+  ];
+  for (const c of candidates) {
+    if (c && existsSync(c)) return c;
+  }
+  console.error(
+    'build-binary: POSTGRES_MCP_BINARY_RUNTIME=oam but no oam binary was found.\n' +
+      'Install from https://oamjs.org or set OAM_BIN=/path/to/oam.',
+  );
+  process.exit(1);
+}
 
 const platformDir = `${process.platform}-${process.arch}`;
 const binDir = join(repoRoot, 'bin', platformDir);
@@ -94,6 +137,24 @@ await esbuild.build({
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);
+
+// ── oam path: one step replaces 2-5 below ────────────────────────────────
+// `oam compile` takes the same pre-bundled file and emits the executable
+// directly -- no SEA blob, no postject injection, no macOS remove/re-sign
+// dance (oam signs its own output where the platform requires it).
+if (BINARY_RUNTIME === 'oam') {
+  const oam = requireOam();
+  rmSync(outExe, { force: true });
+  run(oam, ['compile', bundlePath, '--output', outExe]);
+  if (!isWin) chmodSync(outExe, 0o755);
+  // Same launch check the SEA path does on macOS, run on every platform here:
+  // `compile` succeeding is not proof the artifact executes.
+  run(outExe, ['version']);
+  console.log('');
+  console.log(`OK  ${outExe}  (oam compile)`);
+  console.log(`    ${fmtSize(outExe)}`);
+  process.exit(0);
+}
 
 // 2. Generate the SEA blob from sea-config.json.
 run(process.execPath, ['--experimental-sea-config', 'sea-config.json']);
