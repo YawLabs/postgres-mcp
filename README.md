@@ -198,10 +198,37 @@ All env vars are read from the MCP server's environment:
 | `POSTGRES_MAX_ROWS` | `1000` | Cap on rows returned by `pg_query`. |
 | `POSTGRES_POOL_MAX` | `5` | Max pool connections. Set to `1` for single-threaded backends (pglite-socket, PgBouncer transaction mode). |
 | `POSTGRES_SSL_REJECT_UNAUTHORIZED` | unset | Set to `false` to skip TLS cert verification (for managed DBs using private-CA certs). Connection is still encrypted. |
+| `POSTGRES_MCP_RUNTIME` | `auto` | Which JS runtime executes the server: `auto` (prefer [oam](https://oamjs.org), fall back to Node), `oam` (require oam, fail if absent), `node` (never use oam). See [Runtime](#runtime). |
+| `OAM_BIN` | unset | Explicit path to an `oam` binary, checked before PATH and the default install locations. |
 
 ### Supported Postgres versions
 
-Tested on **PostgreSQL 17 and 18** in CI. Should work on PG13+ -- a few tools (`pg_replication_status` reading `wal_status`, `pg_top_queries` reading `*_exec_time`) rely on columns that landed in PG13. PG12 and below are out of upstream support and not exercised here.
+Tested on **PostgreSQL 15, 17 and 18** in the integration matrix. Should work on PG13+ -- a few tools (`pg_replication_status` reading `wal_status`, `pg_top_queries` reading `*_exec_time`) rely on columns that landed in PG13. PG12 and below are out of upstream support and not exercised here.
+
+### Runtime
+
+The published `postgres-mcp` command is a small launcher that prefers the [oam](https://oamjs.org) runtime and falls back to Node.
+
+**If you do not have oam, nothing changes.** The fallback is not a re-exec: npm already started Node to run the launcher, so falling back is a plain `import()` of the server into that same process. It costs a few `existsSync` calls and no subprocess, and behaves identically to running `dist/index.js` under Node directly.
+
+**If you do have oam,** the server runs under it. Verified equivalent on both runtimes: all 21 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
+
+**Cost, stated plainly.** Taking the oam path means Node has already booted, so you pay both startups. Measured on windows-arm64 against the 1.4 MB bundle: Node alone ~650-900ms, oam alone ~980-1290ms, launcher-to-oam ~1.8s. This is a **one-time cost per MCP session**, not per tool call -- hosts spawn the server once and hold it open -- but if you care about launch latency, set `POSTGRES_MCP_RUNTIME=node`.
+
+```jsonc
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@yawlabs/postgres-mcp"],
+      "env": {
+        "DATABASE_URL": "postgres://...",
+        "POSTGRES_MCP_RUNTIME": "node"  // opt out of oam
+      }
+    }
+  }
+}
+```
 
 ### Connecting to managed Postgres (Supabase, Neon, RDS, etc.)
 

@@ -28,9 +28,10 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "postgres-mcp": "dist/index.js"
+    "postgres-mcp": "bin/postgres-mcp.mjs"
   },
   "files": [
+    "bin/postgres-mcp.mjs",
     "dist/index.js",
     "LICENSE",
     "README.md",

@@ -14,6 +14,7 @@
 
 import assert from "node:assert/strict";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -193,6 +194,125 @@ describe("CLI: MCP stdio handshake with no args", () => {
     } finally {
       child.kill("SIGKILL");
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// bin/postgres-mcp.mjs -- the runtime launcher (oam preferred, node fallback).
+//
+// The launcher is what package.json `bin` points at, so it is the entrypoint
+// every npm consumer actually executes. It is NOT compiled by tsc (it lives in
+// bin/, not src/), so nothing else in the suite would notice it breaking.
+// ─────────────────────────────────────────────────────────────────────────
+
+const LAUNCHER = fileURLToPath(new URL("../bin/postgres-mcp.mjs", import.meta.url));
+
+/** Run the launcher with an env overlay. `undefined` deletes a key. */
+function runLauncher(args: string[], overlay: Record<string, string | undefined>): Promise<RunResult> {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const [k, v] of Object.entries(overlay)) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [LAUNCHER, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdout += String(d);
+    });
+    child.stderr.on("data", (d) => {
+      stderr += String(d);
+    });
+    child.on("error", reject);
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`launcher did not exit within 30s for ${JSON.stringify(args)}`));
+    }, 30_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+// A path that cannot exist, used to force the "oam not found" branch without
+// depending on whether the machine actually has oam installed.
+const NO_OAM = process.platform === "win32" ? "C:\\__no_such_oam__\\oam.exe" : "/__no_such_oam__/oam";
+
+describe("launcher: runtime selection", () => {
+  it("POSTGRES_MCP_RUNTIME=node runs in-process and never looks for oam", async () => {
+    const res = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "node", OAM_BIN: undefined });
+    assert.equal(res.code, 0, `stderr: ${res.stderr}`);
+    assert.match(res.stdout.trim(), /^\d+\.\d+\.\d+$/);
+  });
+
+  it("falls back to node silently when oam is absent (the common case)", async () => {
+    // auto + an OAM_BIN that does not exist. A user who has never heard of oam
+    // must see exactly the old behavior, with no diagnostic noise on stderr.
+    const res = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: undefined, OAM_BIN: NO_OAM });
+    assert.equal(res.code, 0, `stderr: ${res.stderr}`);
+    assert.match(res.stdout.trim(), /^\d+\.\d+\.\d+$/);
+    assert.equal(res.stderr, "", `fallback must be silent, got: ${res.stderr}`);
+  });
+
+  it("POSTGRES_MCP_RUNTIME=oam fails loudly when oam is absent rather than falling back", async () => {
+    // An explicit demand for oam that silently ran node would hide a broken
+    // deployment -- the operator asked for a specific runtime and did not get it.
+    const res = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "oam", OAM_BIN: NO_OAM });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /no oam binary was found/);
+    assert.match(res.stderr, /oamjs\.org/);
+  });
+
+  it("passes the argv guard through to the server", async () => {
+    const res = await runLauncher(["doctor"], { POSTGRES_MCP_RUNTIME: "node", OAM_BIN: undefined });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /unknown subcommand 'doctor'/);
+  });
+});
+
+// oam-dependent coverage. Resolved OUTSIDE the test so an absent oam reports
+// as a SKIP rather than a silent pass -- the failure mode that let five
+// postgres-mcp tests prove nothing when an extension was missing.
+const oamBin = (() => {
+  const isWin = process.platform === "win32";
+  const name = isWin ? "oam.exe" : "oam";
+  const candidates = [
+    process.env.OAM_BIN,
+    ...(process.env.PATH ?? "")
+      .split(isWin ? ";" : ":")
+      .filter(Boolean)
+      .map((d) => `${d}${isWin ? "\\" : "/"}${name}`),
+  ];
+  for (const c of candidates) {
+    if (c && existsSync(c)) return c;
+  }
+  return null;
+})();
+
+// node:test spells conditional skips `{ skip: <reason> }` -- there is no
+// it.skipIf here (that is vitest). A string reason shows up in the TAP output,
+// so a skipped run says WHY rather than looking like a pass.
+const noOam = oamBin ? false : "oam not installed -- set OAM_BIN or install from oamjs.org";
+
+describe("launcher: oam path", () => {
+  it("runs the server under oam and preserves exit codes", { skip: noOam }, async () => {
+    const version = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "oam", OAM_BIN: oamBin as string });
+    assert.equal(version.code, 0, `stderr: ${version.stderr}`);
+    assert.match(version.stdout.trim(), /^\d+\.\d+\.\d+$/, "version must survive the oam hop unchanged");
+
+    // A non-zero exit from the server must propagate through the launcher --
+    // otherwise a host sees success for a failed launch.
+    const bad = await runLauncher(["doctor"], { POSTGRES_MCP_RUNTIME: "oam", OAM_BIN: oamBin as string });
+    assert.equal(bad.code, 1, "the child's exit code must be mirrored, not swallowed");
+    assert.match(bad.stderr, /unknown subcommand 'doctor'/);
+  });
+
+  it("produces byte-identical version output on both runtimes", { skip: noOam }, async () => {
+    const viaOam = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "oam", OAM_BIN: oamBin as string });
+    const viaNode = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "node", OAM_BIN: undefined });
+    assert.equal(viaOam.stdout, viaNode.stdout, "the two runtimes must not disagree about the version string");
   });
 });
 

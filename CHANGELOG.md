@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `postgres-mcp` command is now a runtime launcher (`bin/postgres-mcp.mjs`)
+  that prefers the [oam](https://oamjs.org) runtime and falls back to Node.
+  Selection is via `POSTGRES_MCP_RUNTIME` (`auto` | `oam` | `node`, default
+  `auto`) and `OAM_BIN`.
+
+  The fallback costs nothing: npm already started Node to run the launcher, so
+  falling back is an `import()` into that same process -- no second spawn, no
+  extra startup, behavior identical to running `dist/index.js` directly. Users
+  without oam see no change and no stderr noise.
+
+  Equivalence on the oam path is verified end to end, not assumed: all 21 tools
+  register, a live query returns identical rows and `dataTypeName` values, and
+  the error paths match. oam provides every `node:` builtin the pg driver needs
+  (`net`, `tls`, `crypto`, `dns`), so SCRAM auth and the extended query protocol
+  both work.
+
+  **Latency, stated plainly:** taking the oam path means Node has booted first,
+  so both startups are paid. On windows-arm64 against the 1.4 MB bundle, Node
+  alone is ~650-900ms, oam alone ~980-1290ms, and launcher-to-oam ~1.8s. That is
+  a one-time cost per MCP session rather than per tool call, but it is a real
+  regression against plain Node -- `POSTGRES_MCP_RUNTIME=node` opts out.
+
 > **Version note:** the "Changed (breaking)" entries below alter the shape of
 > tool output and the CLI's exit behavior. Under SemVer-for-0.x that makes the
 > next release a MINOR bump -- `0.8.0`, not `0.7.1`. `release.sh` performs the
