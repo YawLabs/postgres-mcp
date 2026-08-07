@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Corrected the runtime startup figures published in 0.9.0.** They were wrong
+  in both magnitude and direction, and the README used them to advise opting
+  out of the faster runtime.
+
+  The 0.9.0 numbers (Node ~650-900ms, oam ~980-1290ms, launcher-to-oam ~1.8s)
+  were measured against cold, freshly-built binaries. On Windows a binary that
+  is not in the on-access scanner's cache is rescanned on every exec, while
+  `node` resolved from PATH was cached long ago -- so the comparison measured
+  the scanner and put the entire penalty on the binary under test.
+
+  Re-measured on the same hardware with every binary warmed first, mean of 12
+  runs, `postgres-mcp version` (full module init):
+
+  | path | startup |
+  |---|---|
+  | standalone binary (`oam compile`) | 298ms |
+  | `oam run dist/index.js` | 306ms |
+  | `node dist/index.js` | 358ms |
+  | launcher -> Node (in-process) | 370ms |
+  | launcher -> oam (spawn) | 409ms |
+
+  oam starts faster than Node. What the launcher costs is the spawn: reaching
+  oam means Node has already booted, and that ~100ms hop outweighs oam's ~52ms
+  advantage, so the two land within ~40ms of each other through the npm `bin`.
+  `POSTGRES_MCP_RUNTIME=node` remains available but is now a marginal
+  difference, not the meaningful one 0.9.0 described.
+
+  No behavior changed -- `auto` (prefer oam) was and remains the default, and
+  it was the right default for the wrong stated reason. README, CHANGELOG, and
+  the launcher's header comment are corrected; the launcher comment also
+  records the measurement trap so the mistake is not repeated.
+
 ## [0.9.0] - 2026-08-07
 
 ### Added
@@ -32,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone is ~650-900ms, oam alone ~980-1290ms, and launcher-to-oam ~1.8s. That is
   a one-time cost per MCP session rather than per tool call, but it is a real
   regression against plain Node -- `POSTGRES_MCP_RUNTIME=node` opts out.
+
+  > **These figures are wrong. See 0.9.1.** They were measured against cold,
+  > freshly-built binaries and reflect the Windows on-access virus scanner, not
+  > either runtime. oam is in fact faster than Node here. Left in place rather
+  > than rewritten so the correction has something to point at.
 
 ## [0.8.0] - 2026-08-07
 

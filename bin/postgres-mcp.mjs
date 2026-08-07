@@ -15,12 +15,23 @@
  * resolving a few paths (a handful of `existsSync` calls, no subprocess).
  *
  * WHAT THE OAM PATH COSTS
- * Taking the oam path means node has already booted, so the total is node's
- * startup plus oam's. Measured on windows-arm64 against the 1.4 MB bundle:
- * node alone ~650-900ms, oam alone ~980-1290ms, so the oam path lands near
- * ~1.8s. This is a ONE-TIME cost per MCP session, not per tool call -- hosts
- * spawn the server once and keep it -- but it is a real regression against
- * plain node and the reason `POSTGRES_MCP_RUNTIME=node` exists.
+ * The spawn, not the runtime. windows-arm64, 1.4 MB bundle, warmed binaries,
+ * mean of 12 runs: oam run 306ms, node 358ms -- oam is the FASTER of the two.
+ * But reaching oam from here means node has already booted, and that hop
+ * (~100ms) outweighs oam's ~52ms advantage: launcher -> node 370ms,
+ * launcher -> oam 409ms. So the two land within ~40ms through the npm bin.
+ * A one-time cost per MCP session either way, not per tool call.
+ *
+ * The `oam compile` standalone binary sidesteps this entirely (298ms, no
+ * launcher, no spawn) and is the right answer if startup actually matters.
+ *
+ * DO NOT re-measure this by timing a freshly built binary. On Windows a
+ * binary that is not in the on-access scanner's cache gets rescanned on every
+ * exec, while `node` from PATH was cached long ago -- the comparison then
+ * measures the scanner and dumps the whole penalty on the new binary. That
+ * mistake produced the numbers published in 0.9.0 (node ~650-900ms, oam
+ * ~980-1290ms), which were wrong in both magnitude and direction. Warm every
+ * candidate first, or stage it out of the build directory.
  *
  * SELECTION
  *   POSTGRES_MCP_RUNTIME=oam    require oam; fail loudly if it is missing

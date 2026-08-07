@@ -213,7 +213,21 @@ The published `postgres-mcp` command is a small launcher that prefers the [oam](
 
 **If you do have oam,** the server runs under it. Verified equivalent on both runtimes: all 21 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
 
-**Cost, stated plainly.** Taking the oam path means Node has already booted, so you pay both startups. Measured on windows-arm64 against the 1.4 MB bundle: Node alone ~650-900ms, oam alone ~980-1290ms, launcher-to-oam ~1.8s. This is a **one-time cost per MCP session**, not per tool call -- hosts spawn the server once and hold it open -- but if you care about launch latency, set `POSTGRES_MCP_RUNTIME=node`.
+**Startup cost, measured.** windows-arm64, 1.4 MB bundle, `postgres-mcp version` (full module init), every binary warmed first, mean of 12 runs:
+
+| path | startup |
+|---|---|
+| standalone binary (`oam compile`) | 298ms |
+| `oam run dist/index.js` | 306ms |
+| `node dist/index.js` | 358ms |
+| launcher -> Node (in-process) | 370ms |
+| launcher -> oam (spawn) | 409ms |
+
+oam starts **faster** than Node here. What the launcher costs is the *spawn*: reaching oam means Node has already booted, and that hop (~100ms) is larger than oam's ~52ms advantage. So through the npm `bin`, the two land within ~40ms of each other, and `POSTGRES_MCP_RUNTIME=node` is a marginal win rather than a meaningful one.
+
+Either way it is a **one-time cost per MCP session**, not per tool call -- hosts spawn the server once and hold it open. If startup genuinely matters, the standalone binary avoids the launcher entirely and is the fastest option.
+
+> Earlier releases of this README reported ~650-900ms for Node and ~980-1290ms for oam, and advised opting out of oam on that basis. Those figures were measured against cold, freshly-built binaries and reflected the Windows on-access virus scanner rather than either runtime. They were wrong in both magnitude and direction. Corrected in 0.9.1.
 
 ```jsonc
 {
