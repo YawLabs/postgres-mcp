@@ -1,6 +1,7 @@
 node_modules/
 dist/
-bin/
+bin/*
+!bin/postgres-mcp.mjs
 build-tmp/
 dist-release/
 *.tgz
