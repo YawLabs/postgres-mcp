@@ -27,7 +27,7 @@ None of them position themselves as a general-purpose daily driver you'd hand to
 
 ## Why this one?
 
-- **Read-only by default, with an unconditional read-only tool too** - `pg_query` runs user SQL in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes; opt in to writes with `ALLOW_WRITES=1`. `pg_readonly` is a separate tool that stays read-only regardless of `ALLOW_WRITES`, so hosts that gate tools individually (Claude Code permissions, mcp.hosting) can safely auto-allow it.
+- **Read-only by default, with an unconditional read-only tool too** - `pg_query` runs user SQL in a `BEGIN READ ONLY` transaction, so postgres itself (not string parsing) blocks writes; opt in to writes with `ALLOW_WRITES=1`. `pg_readonly` is a separate tool that stays read-only regardless of `ALLOW_WRITES`, so hosts that gate tools individually (Claude Code permissions, mcp.hosting) can auto-allow it -- paired with a least-privileged role, since `READ ONLY` bounds writes to the database rather than every side effect ([details](#per-tool-gating-in-the-host)).
 - **Role-based access as the primary control** - the recommended posture is to use a least-privileged postgres role in `DATABASE_URL` (e.g. one with `GRANT pg_read_all_data`); postgres itself then enforces the boundary, no env var needed. See [Configuring access](#configuring-access).
 - **Extended query protocol for all user SQL** - `pg_query` sends user input with `queryMode: 'extended'`, which restricts each request to a single statement. This closes the [stacked-query injection class](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) (`COMMIT; DROP SCHEMA x CASCADE;`) that defeated the reference server's `BEGIN READ ONLY` wrapper. Integration test asserts the rejection.
 - **Parameterized queries** - `pg_query` takes a `params` array for `$1`, `$2`, etc. No string-interpolated SQL in our code path.
@@ -132,6 +132,8 @@ Tools split cleanly across two authority classes:
 
 Claude Code's `permissions` block and mcp.hosting's per-tool toggle both honor this split.
 
+> **What `READ ONLY` does and does not cover.** A `BEGIN READ ONLY` transaction blocks writes to the *database* -- INSERT/UPDATE/DELETE, DDL, `nextval`/`setval`. It does not block functions whose effect lands outside the table data. `SELECT pg_terminate_backend(...)`, `pg_cancel_backend`, `pg_read_file`, `lo_export`, and `COPY ... TO PROGRAM` all run to completion inside `pg_readonly`, which means auto-allowing `pg_readonly` reaches the same capability that `pg_kill` puts behind `ALLOW_WRITES=1`. Every one of them still requires a privilege the `DATABASE_URL` role must actually hold (`pg_signal_backend`, `pg_read_server_files`, superuser), so **the role is the control that bounds this tool, not the transaction mode.** If you auto-allow `pg_readonly`, use a least-privileged role -- see [Configuring access](#configuring-access).
+
 **`ALLOW_WRITES` as defense-in-depth:**
 
 `ALLOW_WRITES` is a secondary belt-and-braces gate. Useful when:
@@ -161,7 +163,7 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 
 | Tool | Description |
 |------|-------------|
-| `pg_readonly` | Run a SQL statement guaranteed read-only - always inside `BEGIN READ ONLY`, regardless of `ALLOW_WRITES`. The recommended tool for read access; safe for hosts to auto-allow. |
+| `pg_readonly` | Run a SQL statement with no persistent data changes - always inside `BEGIN READ ONLY`, regardless of `ALLOW_WRITES`. The recommended tool for read access, and the one to auto-allow; pair it with a least-privileged role ([why](#per-tool-gating-in-the-host)). |
 | `pg_query` | Run a SQL query. Writes gated by the role in `DATABASE_URL` first, `ALLOW_WRITES` second. Supports parameterized queries via `params`. Result fields include `dataTypeName` (e.g. `int4`, `jsonb`) alongside `dataTypeID`. |
 | `pg_list_schemas` | List non-system schemas. |
 | `pg_list_tables` | List tables (and optionally views) in a schema with estimated row counts. Paginated via `limit`/`offset`. |

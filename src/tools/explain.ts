@@ -175,10 +175,15 @@ export const explainTools = [
         ),
     }),
     handler: async (input: unknown) => {
+      // Direct (non-MCP) callers bypass Zod, so the analyze/format defaults the
+      // schema would have applied never ran -- a caller omitting `format` would
+      // otherwise fall into the json branch and get a raw text string back.
+      // Re-applied in the destructure, mirroring the `using ?? "btree"`
+      // precedent in buildHypopgHooks. Every other tool here does the same.
       const {
         sql,
-        analyze: rawAnalyze,
-        format: rawFormat,
+        analyze = false,
+        format = "text",
         params,
         hypothetical_indexes,
       } = input as {
@@ -188,14 +193,6 @@ export const explainTools = [
         params?: unknown[];
         hypothetical_indexes?: { table: string; columns: string[]; using?: string }[];
       };
-
-      // Direct (non-MCP) callers bypass Zod, so the analyze/format defaults the
-      // schema would have applied never ran -- a caller omitting `format` would
-      // otherwise fall into the json branch and get a raw text string back.
-      // Re-apply the documented defaults here, mirroring the `using ?? "btree"`
-      // precedent in buildHypopgHooks.
-      const analyze = rawAnalyze ?? false;
-      const format = rawFormat ?? "text";
 
       // LLMs often pass pre-wrapped SQL like "EXPLAIN ANALYZE SELECT ..." which
       // would become "EXPLAIN (ANALYZE) EXPLAIN ANALYZE SELECT ..." below -

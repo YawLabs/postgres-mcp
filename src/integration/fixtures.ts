@@ -174,6 +174,18 @@ export async function setupFixtures(): Promise<void> {
     // pg_advisor tables_without_primary_key check.
     `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_table (id INT, label TEXT)`,
 
+    // Covering-PK fixture: PRIMARY KEY ... INCLUDE (PG11+). `label` lands in
+    // pg_index.indkey alongside the key column but is NOT part of the key --
+    // indnkeyatts is 1. pg_describe_table must report primary_key = ["id"]
+    // only. Matching on the whole indkey vector reported ["id","label"], which
+    // would send an agent to build a wrong ON CONFLICT target.
+    `CREATE TABLE ${FIXTURE_SCHEMA}.covering_pk (
+       id INT NOT NULL,
+       label TEXT,
+       note TEXT,
+       CONSTRAINT covering_pk_pkey PRIMARY KEY (id) INCLUDE (label)
+     )`,
+
     // Advisor fixture: a partitioned table parent with NO primary key.
     // pg_advisor must flag this (relkind='p' coverage). The negative case
     // is covered by `events` above, which is also partitioned but DOES
@@ -239,6 +251,22 @@ export async function setupFixtures(): Promise<void> {
   // exercising the "extension not installed" error path.
   await runInternal(`CREATE EXTENSION IF NOT EXISTS hypopg`);
 
+  // Best-effort: pgstattuple ships in postgresql-contrib and needs no
+  // shared_preload_libraries entry, so a plain CREATE EXTENSION is enough.
+  // Without it every pg_table_bloat method='approx'/'exact' test takes the
+  // "extension not installed" early return and the pgstattuple SQL (the
+  // LATERAL join, the approx_tuple_count/tuple_count column swap, the
+  // relkind IN ('r','m') guard against partitioned parents) never executes.
+  await runInternal(`CREATE EXTENSION IF NOT EXISTS pgstattuple`);
+
+  // Best-effort: pg_stat_statements ALSO requires being listed in
+  // shared_preload_libraries and a server restart -- scripts/wsl-pg-setup.sh
+  // does that. CREATE EXTENSION alone fails when the library isn't preloaded,
+  // and pg_top_queries then has no coverage at all (every one of its tests
+  // early-returns on "not installed"). Failure here is not fatal: the tests
+  // still pass via that branch, they just prove less.
+  await runInternal(`CREATE EXTENSION IF NOT EXISTS pg_stat_statements`);
+
   // Best-effort: set up a self-referential FDW foreign table so foreign-table
   // branches of pg_describe_table and pg_advisor can be exercised.
   _fdwAvailable = await setupFdwFixture();
@@ -253,6 +281,70 @@ export function fdwFixtureAvailable(): boolean {
   return _fdwAvailable;
 }
 
+/**
+ * Second database in the SAME cluster, used to prove pg_top_queries' `dbid`
+ * filter actually scopes results. pg_stat_statements is cluster-wide: a query
+ * run here lands in the shared view with a different dbid, so it must NOT
+ * appear in pg_top_queries results taken against the primary test database.
+ *
+ * CREATE/DROP DATABASE cannot run inside a transaction block -- runInternal
+ * issues on the pool in autocommit, which is why it works here.
+ */
+export const FIXTURE_OTHER_DB = "postgres_mcp_other";
+
+/**
+ * Marker text embedded in the query run against the other database. Distinctive
+ * enough that a substring match against pg_stat_statements' normalized query
+ * text cannot collide with anything else the suite runs.
+ */
+export const FIXTURE_OTHER_DB_MARKER = "mcp_dbid_scope_marker_9f3a";
+
+/**
+ * Create the second database and run the marker query inside it. Returns false
+ * when the database can't be created (insufficient privileges), so the caller
+ * can skip rather than fail.
+ */
+export async function runMarkerQueryInOtherDatabase(): Promise<boolean> {
+  const dbUrl = process.env.DATABASE_URL;
+  if (!dbUrl) return false;
+  // Drop first so a prior crashed run doesn't leave a stale database behind.
+  await dropOtherDatabase();
+  const created = await runInternal(`CREATE DATABASE ${FIXTURE_OTHER_DB}`);
+  if (!created.ok) return false;
+
+  // Connect directly -- the pool is bound to the primary database.
+  const { default: pg } = await import("pg");
+  const other = new URL(dbUrl.replace(/^postgres(?:ql)?:\/\//, "http://"));
+  other.pathname = `/${FIXTURE_OTHER_DB}`;
+  const client = new pg.Client({
+    connectionString: other.toString().replace(/^http:\/\//, "postgres://"),
+  });
+  try {
+    await client.connect();
+    // pg_stat_statements must be enabled per-database to RECORD from it, but
+    // the view is cluster-wide, so creating it here is what gets the marker
+    // into the shared table. Best-effort: without the preload this fails and
+    // the caller's test skips.
+    const ext = await client.query(`CREATE EXTENSION IF NOT EXISTS pg_stat_statements`).catch(() => null);
+    if (!ext) return false;
+    await client.query(`SELECT 1 AS ${FIXTURE_OTHER_DB_MARKER}`);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+/** Drop the second database. Terminates stragglers so DROP can't be blocked. */
+export async function dropOtherDatabase(): Promise<void> {
+  await runInternal(
+    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+    [FIXTURE_OTHER_DB],
+  );
+  await runInternal(`DROP DATABASE IF EXISTS ${FIXTURE_OTHER_DB}`);
+}
+
 /** Clean up the fixture schema, drop cluster-scoped roles, close the pool. */
 export async function teardownFixtures(): Promise<void> {
   try {
@@ -264,6 +356,7 @@ export async function teardownFixtures(): Promise<void> {
     await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_MEMBER_ROLE}`);
     await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_GROUP_ROLE}`);
     await runInternal(`DROP ROLE IF EXISTS ${FIXTURE_LIMITED_ROLE}`);
+    await dropOtherDatabase();
   } finally {
     await shutdown();
   }

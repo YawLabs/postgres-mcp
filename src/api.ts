@@ -137,9 +137,30 @@ export function getPool(): pg.Pool {
 
 export interface QueryResult {
   rows: Record<string, unknown>[];
+  /**
+   * For DML, the number of rows AFFECTED -- which is not necessarily
+   * `rows.length`. An `INSERT ... RETURNING` of 10 rows truncated to 3 reports
+   * `rowCount: 10`, `rows.length: 3`, `truncated: true`.
+   *
+   * For a truncated row-returning statement (the cursor path) the true total
+   * is unknowable by design -- the whole point of the bounded fetch is not to
+   * materialize it -- so `rowCount` matches `rows.length` there.
+   */
   rowCount: number | null;
   fields: { name: string; dataTypeID: number; dataTypeName?: string }[];
-  command: string;
+  /**
+   * Postgres command tag, present ONLY when the statement ran on the direct
+   * exec path (DDL, DML without RETURNING) -- there it is the real tag
+   * (`CREATE TABLE`, `INSERT`, ...).
+   *
+   * Omitted on the cursor path. A statement wrapped in `DECLARE ... CURSOR
+   * FOR` reports the tag of the `FETCH`, not of the user's statement, and
+   * postgres does not surface the inner tag through a cursor. Reporting
+   * `"FETCH"` for every SELECT was actively misleading, and there is no
+   * source of truth to substitute -- so the field is absent rather than
+   * wrong. Treat absent as "row-returning statement, command unknown".
+   */
+  command?: string;
   truncated?: boolean;
 }
 
@@ -165,22 +186,31 @@ let typeNameCache: Map<number, string> | null = null;
 
 async function resolveTypeNames(client: pg.PoolClient, oids: number[]): Promise<Record<number, string>> {
   if (oids.length === 0) return {};
-  if (!typeNameCache) {
-    typeNameCache = new Map();
+  // Bind the map to a local BEFORE the first await. `shutdown()` sets the
+  // module-scoped `typeNameCache` back to null, and it can land while we're
+  // suspended on one of the queries below (SIGTERM, or a test calling
+  // shutdown() between tool calls) -- dereferencing the module variable after
+  // an await would then throw on null. The local keeps this call's writes
+  // going somewhere valid; a post-shutdown cache is simply garbage-collected
+  // instead of being re-published.
+  let cache = typeNameCache;
+  if (!cache) {
+    cache = new Map();
+    typeNameCache = cache;
     const res = await client.query<{ oid: number; typname: string }>("SELECT oid, typname FROM pg_catalog.pg_type");
-    for (const row of res.rows) typeNameCache.set(row.oid, row.typname);
+    for (const row of res.rows) cache.set(row.oid, row.typname);
   }
-  const missing = oids.filter((o) => !typeNameCache?.has(o));
+  const missing = oids.filter((o) => !cache.has(o));
   if (missing.length > 0) {
     const res = await client.query<{ oid: number; typname: string }>(
       "SELECT oid, typname FROM pg_catalog.pg_type WHERE oid = ANY($1)",
       [missing],
     );
-    for (const row of res.rows) typeNameCache.set(row.oid, row.typname);
+    for (const row of res.rows) cache.set(row.oid, row.typname);
   }
   const out: Record<number, string> = {};
   for (const oid of oids) {
-    const n = typeNameCache.get(oid);
+    const n = cache.get(oid);
     if (n !== undefined) out[oid] = n;
   }
   return out;
@@ -235,7 +265,7 @@ async function runUserQueryBounded(
   sql: string,
   params: unknown[],
   maxRows: number,
-): Promise<pg.QueryResult> {
+): Promise<{ result: pg.QueryResult; viaCursor: boolean }> {
   await client.query("SAVEPOINT __pgmcp_sp");
   // Track where in the pipeline we are. If DECLARE itself fails the user SQL
   // has not executed yet, so falling through to a direct exec is safe -- it's
@@ -260,7 +290,9 @@ async function runUserQueryBounded(
       // outer txn rollback below releases the cursor too.
     }
     await client.query("RELEASE SAVEPOINT __pgmcp_sp");
-    return fetched;
+    // viaCursor: `fetched.command` is the FETCH tag, not the user statement's.
+    // Callers use this to omit `command` rather than report a wrong one.
+    return { result: fetched, viaCursor: true };
   } catch (err) {
     if (declareSucceeded) {
       // FETCH / CLOSE / RELEASE failed -- the user SQL already executed
@@ -274,11 +306,14 @@ async function runUserQueryBounded(
     // 42601 (parse error), so a single broad fallback covers both.
     await client.query("ROLLBACK TO SAVEPOINT __pgmcp_sp");
     await client.query("RELEASE SAVEPOINT __pgmcp_sp");
-    return client.query({
+    // Direct exec: the command tag postgres returns here IS the user's
+    // statement tag (CREATE TABLE, INSERT, ...), so it's safe to surface.
+    const direct = await client.query({
       text: sql,
       values: params,
       queryMode: "extended",
     } as UserQueryConfig);
+    return { result: direct, viaCursor: false };
   }
 }
 
@@ -303,19 +338,40 @@ export async function safeResolveTypeNames(
   }
 }
 
-function toQueryResult(result: pg.QueryResult, maxRows: number, typeNames: Record<number, string> = {}): QueryResult {
+// `viaCursor` is REQUIRED, deliberately: defaulting it would make "surface the
+// FETCH tag / rewrite rowCount" the silent fallback for any future call site
+// that forgets to pass it, which is exactly the bug this parameter exists to
+// prevent.
+function toQueryResult(
+  result: pg.QueryResult,
+  maxRows: number,
+  typeNames: Record<number, string>,
+  viaCursor: boolean,
+): QueryResult {
   const truncated = result.rows.length > maxRows;
   const rows = truncated ? result.rows.slice(0, maxRows) : result.rows;
   return {
     rows,
-    rowCount: result.rowCount,
+    // Cursor path only: we deliberately FETCH maxRows + 1 to detect
+    // truncation, so `result.rowCount` is one MORE than what we return --
+    // consumers saw rowCount=1001 next to 1000 rows. Report what's in `rows`.
+    //
+    // The direct-exec path must NOT be rewritten. There `rowCount` is the
+    // affected-row count, which is independent of how many rows came back:
+    // `INSERT ... RETURNING` is non-cursorable (DECLARE rejects it with
+    // 42601), so a 10-row insert truncated to 3 must still report 10 rows
+    // affected. Collapsing it to rows.length told the caller 3 rows were
+    // written when 10 were committed.
+    rowCount: truncated && viaCursor ? rows.length : result.rowCount,
     fields: result.fields.map((f) => {
       const name = typeNames[f.dataTypeID];
       return name !== undefined
         ? { name: f.name, dataTypeID: f.dataTypeID, dataTypeName: name }
         : { name: f.name, dataTypeID: f.dataTypeID };
     }),
-    command: result.command,
+    // See QueryResult.command -- omitted on the cursor path because the tag
+    // there describes the FETCH, not the user's statement.
+    ...(viaCursor ? {} : { command: result.command }),
     ...(truncated ? { truncated: true } : {}),
   };
 }
@@ -365,10 +421,10 @@ export async function runReadOnly(
   try {
     await client.query("BEGIN READ ONLY");
     if (hooks.setup) await hooks.setup(client);
-    const result = await runUserQueryBounded(client, sql, params, maxRows);
+    const { result, viaCursor } = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await safeResolveTypeNames(client, result.fields);
-    return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
+    return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -400,10 +456,10 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
-    const result = await runUserQueryBounded(client, sql, params, maxRows);
+    const { result, viaCursor } = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("COMMIT");
     const typeNames = await safeResolveTypeNames(client, result.fields);
-    return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
+    return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -439,10 +495,10 @@ export async function runReadWriteRollback(
   try {
     await client.query("BEGIN");
     if (hooks.setup) await hooks.setup(client);
-    const result = await runUserQueryBounded(client, sql, params, maxRows);
+    const { result, viaCursor } = await runUserQueryBounded(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await safeResolveTypeNames(client, result.fields);
-    return { ok: true, data: toQueryResult(result, maxRows, typeNames) };
+    return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
     try {
       await client.query("ROLLBACK");

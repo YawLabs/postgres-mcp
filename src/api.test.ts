@@ -4,6 +4,7 @@ import type pg from "pg";
 import {
   getConnectionTimeoutMs,
   getMaxRows,
+  getPool,
   getPoolMax,
   getSslConfig,
   getStatementTimeoutMs,
@@ -322,5 +323,98 @@ describe("safeResolveTypeNames fallback on pg_type failure", () => {
     } as unknown as pg.PoolClient;
     const result = await safeResolveTypeNames(stubClient, []);
     assert.deepEqual(result, {});
+  });
+
+  // shutdown() nulls the module-scoped typeNameCache, and it can land while
+  // resolveTypeNames is suspended on the bootstrap query -- SIGTERM during a
+  // tool call, or a test calling shutdown() between calls. Dereferencing the
+  // module variable after the await then throws on null; the type names are
+  // lost (swallowed by the wrapper) even though the query succeeded.
+  //
+  // The stub calls shutdown() DURING the bootstrap query, reproducing exactly
+  // that interleaving without timing luck. Correct behavior: the resolved
+  // names still come back, and no failure warning is written.
+  it("still resolves type names when shutdown() lands mid-bootstrap", async () => {
+    await shutdown();
+
+    let queries = 0;
+    const stubClient = {
+      query: async () => {
+        queries++;
+        // Null the cache the way a signal handler would, mid-flight.
+        await shutdown();
+        return { rows: [{ oid: 23, typname: "int4" }] };
+      },
+    } as unknown as pg.PoolClient;
+
+    const originalErr = console.error;
+    const stderrCalls: string[] = [];
+    console.error = (msg?: unknown) => {
+      stderrCalls.push(String(msg));
+    };
+    try {
+      const result = await safeResolveTypeNames(stubClient, [{ dataTypeID: 23 }]);
+      assert.deepEqual(result, { 23: "int4" }, "a concurrent shutdown() must not lose the resolved type names");
+      assert.equal(
+        stderrCalls.length,
+        0,
+        `no failure warning expected, got ${JSON.stringify(stderrCalls)} -- the null-cache dereference is back`,
+      );
+      // One bootstrap only: the oid resolved from it, so no miss-fill round trip.
+      assert.equal(queries, 1);
+    } finally {
+      console.error = originalErr;
+    }
+  });
+});
+
+describe("getPool without DATABASE_URL", () => {
+  const original = process.env.DATABASE_URL;
+  const originalPlatform = process.platform;
+
+  function setPlatform(value: string) {
+    Object.defineProperty(process, "platform", { value, configurable: true });
+  }
+
+  afterEach(async () => {
+    setPlatform(originalPlatform);
+    if (original === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = original;
+    await shutdown();
+  });
+
+  // This is the first error a misconfigured user ever sees, and nothing
+  // covered it -- the individual env getters are well tested but the
+  // missing-DSN path was not.
+  it("throws a clear error naming DATABASE_URL", async () => {
+    await shutdown();
+    delete process.env.DATABASE_URL;
+    assert.throws(() => getPool(), /DATABASE_URL is not set/);
+  });
+
+  it("treats a whitespace-only DATABASE_URL as unset", async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "   ";
+    assert.throws(() => getPool(), /DATABASE_URL is not set/);
+  });
+
+  // The Windows-specific hint exists because env vars set in a bash/WSL
+  // profile are invisible to an MCP server launched via cmd -- a real support
+  // case. It is platform-gated, so it never runs on a Linux CI box unless the
+  // platform is faked.
+  it("appends the .mcp.json hint on win32 and omits it elsewhere", async () => {
+    await shutdown();
+    delete process.env.DATABASE_URL;
+
+    setPlatform("win32");
+    assert.throws(() => getPool(), /\.mcp\.json/, "win32 must surface the env-block hint");
+
+    setPlatform("linux");
+    assert.throws(
+      () => getPool(),
+      (err: unknown) =>
+        err instanceof Error && /DATABASE_URL is not set/.test(err.message) && !/\.mcp\.json/.test(err.message),
+      "non-win32 must not carry the Windows hint",
+    );
   });
 });

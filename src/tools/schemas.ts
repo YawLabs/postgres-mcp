@@ -51,11 +51,18 @@ export const schemaTools = [
       offset: z.number().int().min(0).default(0).describe("Rows to skip for pagination (default 0)."),
     }),
     handler: async (input: unknown) => {
-      const { schema, includeViews, limit, offset } = input as {
-        schema: string;
-        includeViews: boolean;
-        limit: number;
-        offset: number;
+      // Zod defaults re-applied for direct (non-MCP) callers, which bypass the
+      // schema. Matches the precedent in pg_explain / pg_table_bloat.
+      const {
+        schema = "public",
+        includeViews = false,
+        limit = 500,
+        offset = 0,
+      } = input as {
+        schema?: string;
+        includeViews?: boolean;
+        limit?: number;
+        offset?: number;
       };
       const kinds = includeViews ? "('r', 'v', 'm', 'f', 'p')" : "('r', 'f', 'p')";
       return runInternal<{ name: string; type: string; estimated_rows: number }>(
@@ -102,7 +109,9 @@ export const schemaTools = [
       table: identSchema.describe("Table name."),
     }),
     handler: async (input: unknown) => {
-      const { schema, table } = input as { schema: string; table: string };
+      // Zod default re-applied for direct callers -- see pg_list_tables above.
+      // `table` has no default (it's required), so it stays as-is.
+      const { schema = "public", table } = input as { schema?: string; table: string };
 
       // Identify the relation kind first so the response signals "this is a
       // view" -- without this, an LLM sees columns + empty PK/FK/indexes and
@@ -140,16 +149,25 @@ export const schemaTools = [
         ORDER BY a.attnum
       `;
 
+      // Slice indkey to its first `indnkeyatts` entries -- those are the KEY
+      // columns. PostgreSQL 11+ allows `PRIMARY KEY (a) INCLUDE (b)`, and the
+      // covering column `b` is also present in `indkey` (indkey is
+      // 0-based, hence [0:indnkeyatts - 1]). Matching on the full vector
+      // reported INCLUDE columns as part of the primary key, which an agent
+      // would then use to build a wrong upsert conflict target or a wrong
+      // row identity. unnest WITH ORDINALITY (same pattern as the FK queries
+      // below) preserves declared key order.
       const primaryKeyQuery = `
         SELECT a.attname AS column_name
         FROM pg_catalog.pg_index i
         JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+        JOIN LATERAL unnest(i.indkey[0:i.indnkeyatts - 1]) WITH ORDINALITY AS k(attnum, ord) ON TRUE
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
         WHERE n.nspname = $1
           AND c.relname = $2
           AND i.indisprimary
-        ORDER BY array_position(i.indkey, a.attnum)
+        ORDER BY k.ord
       `;
 
       const foreignKeysQuery = `
@@ -374,7 +392,11 @@ export const schemaTools = [
       includeMaterialized: z.boolean().default(true).describe("If true, include materialized views."),
     }),
     handler: async (input: unknown) => {
-      const { schema, includeMaterialized } = input as { schema: string; includeMaterialized: boolean };
+      // Zod defaults re-applied for direct callers -- see pg_list_tables above.
+      const { schema = "public", includeMaterialized = true } = input as {
+        schema?: string;
+        includeMaterialized?: boolean;
+      };
       const kinds = includeMaterialized ? "('v', 'm')" : "('v')";
       return runInternal<{ name: string; type: string; definition: string }>(
         `SELECT
@@ -407,7 +429,8 @@ export const schemaTools = [
       schema: identSchema.default("public").describe("Schema name (defaults to 'public')."),
     }),
     handler: async (input: unknown) => {
-      const { schema } = input as { schema: string };
+      // Zod default re-applied for direct callers -- see pg_list_tables above.
+      const { schema = "public" } = input as { schema?: string };
       return runInternal<{
         name: string;
         arguments: string;
@@ -485,7 +508,8 @@ export const schemaTools = [
       limit: z.number().int().min(1).max(1000).default(100).describe("Max rows to return (default 100)."),
     }),
     handler: async (input: unknown) => {
-      const { pattern, schema, limit } = input as { pattern: string; schema?: string; limit: number };
+      // Zod default re-applied for direct callers -- see pg_list_tables above.
+      const { pattern, schema, limit = 100 } = input as { pattern: string; schema?: string; limit?: number };
       const schemaFilter = schema
         ? "AND n.nspname = $3"
         : "AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_%'";

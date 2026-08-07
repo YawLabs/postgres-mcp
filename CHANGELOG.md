@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Version note:** the "Changed (breaking)" entries below alter the shape of
+> tool output and the CLI's exit behavior. Under SemVer-for-0.x that makes the
+> next release a MINOR bump -- `0.8.0`, not `0.7.1`. `release.sh` performs the
+> actual bump (`npm version`) and syncs `server.json`, so nothing is pre-bumped
+> here; pass `0.8.0` when cutting the release.
+
+### Changed (breaking)
+
+- `QueryResult.command` is now OPTIONAL, and is omitted entirely for statements
+  that run on the cursor path (every SELECT and other row-returning statement).
+  Previously it reported `"FETCH"` for all of them -- the command tag of the
+  internal `FETCH`, not of the user's statement. Postgres does not surface the
+  inner tag through a cursor and there is no source of truth to substitute, so
+  the field is absent rather than wrong. It is still present and correct on the
+  direct-exec path (DDL and DML without `RETURNING`), where node-pg reports the
+  first word of the real tag: `CREATE`, `INSERT`, etc.
+- `rowCount` no longer exceeds `rows.length` on a truncated cursor-path result.
+  The bounded fetch deliberately reads `POSTGRES_MAX_ROWS + 1` rows to detect
+  truncation, and that extra probe row was leaking into `rowCount` -- callers
+  saw `rowCount: 1001` next to 1000 rows. The direct-exec path is unchanged and
+  still reports the AFFECTED-row count, which is independent of how many rows
+  come back: a truncated `INSERT ... RETURNING` of 10 rows correctly reports
+  `rowCount: 10`, `rows.length: 3`, `truncated: true`.
+- `pg_top_queries` is now scoped to the database in `DATABASE_URL`.
+  `pg_stat_statements` is cluster-wide, so on a shared cluster the tool
+  previously returned normalized query text from unrelated databases. Results
+  are filtered by `dbid`, matching every other tool in this server. Callers who
+  relied on the cluster-wide view will see fewer rows.
+- The CLI now exits 1 with a usage message on an unrecognized bare argument
+  instead of silently starting the stdio server. `postgres-mcp doctor` used to
+  print nothing and appear to hang while the server waited for MCP framing on
+  stdin. Arguments beginning with `-` are still passed through untouched so
+  host-supplied flags keep working, and a positionally-passed connection string
+  gets a targeted message pointing at the `DATABASE_URL` env block.
+
+### Fixed
+
+- `pg_describe_table` no longer reports `INCLUDE` (covering) columns as part of
+  `primary_key`. PostgreSQL 11+ allows `PRIMARY KEY (id) INCLUDE (label)`, and
+  the covering column sits in `pg_index.indkey` next to the key column; the
+  query matched the whole vector. An agent reading that would build an invalid
+  `ON CONFLICT (id, label)` target. The key columns are now bounded by
+  `indnkeyatts`.
+- `resolveTypeNames` no longer throws when `shutdown()` lands mid-flight. The
+  module-scoped type cache is nulled by `shutdown()`, and dereferencing it after
+  an await (SIGTERM during a tool call, or a test calling `shutdown()` between
+  calls) raised on null -- silently costing the response its `dataTypeName`
+  fields. The cache is now bound to a local before the first await.
+- Zod schema defaults are re-applied consistently by every tool handler for
+  direct (non-MCP) callers, which bypass schema parsing. Previously only
+  `pg_explain` and `pg_table_bloat` did this; `pg_advisor` in particular bound
+  `undefined` into `n.nspname = ANY($1)` and errored at bind time. `pg_kill`
+  defaults to the safer `cancel` mode, so an omitted `mode` can never escalate
+  to `terminate`.
+
+### Documentation
+
+- `pg_readonly`'s description and the README now state the actual scope of
+  `BEGIN READ ONLY`: it bounds writes to the DATABASE, not every side effect.
+  Functions whose effect lands outside the table data -- `pg_terminate_backend`,
+  `pg_cancel_backend`, `pg_read_file`, `lo_export`, `COPY ... TO PROGRAM` -- are
+  not blocked by it and are not behind the `ALLOW_WRITES` gate that `pg_kill`
+  sits behind. All of them still require privileges the `DATABASE_URL` role must
+  hold, so the ROLE is what actually bounds this tool. Auto-allow `pg_readonly`
+  with a least-privileged role.
+- `release.sh` no longer suggests `npm login --auth-type=web` on an E401/E404.
+  That command overwrites the automation token in `~/.npmrc` with a
+  WebAuthn-bound session, and the next publish then fails on a challenge no
+  script can answer. It now points at restoring the automation token.
+- Removed stale references to a CI pipeline this repo does not have: there is no
+  `.github/`, the binary build and the lint gate are both local.
+
+### Testing
+
+- `src/index.test.ts`: the CLI entrypoint had no automated coverage at all (it
+  cannot be imported -- it calls `server.connect` at the top level), including
+  the argv handling that runs before server startup. Now driven as a child
+  process: both version flags, the argv guard's three branches, and a full MCP
+  `initialize` + `tools/list` handshake that covers the tool-registration wiring.
+- Coverage for the `DECLARE`-succeeded / `FETCH`-failed branch of
+  `runUserQueryBounded`, which prevents re-executing a statement whose side
+  effects already landed. Engineered with a short `statement_timeout`; a
+  sequence acts as the double-execution detector, since `nextval` is
+  non-transactional and survives the rollback.
+- Coverage for `dbid` scoping (with a positive control proving the assertion is
+  not vacuous), the truncated `INSERT ... RETURNING` row count, `command`
+  presence on both paths, `PRIMARY KEY ... INCLUDE`, composite-PK ordering,
+  `shutdown()` mid-bootstrap, and `getPool()` without `DATABASE_URL` including
+  the win32-only hint branch.
+- `scripts/wsl-pg-setup.sh` now provisions PostgreSQL 15 alongside 17 and 18,
+  adds `pg_stat_statements` to `shared_preload_libraries`, and creates
+  `pg_stat_statements` + `pgstattuple`. Without those extensions present, every
+  `pg_top_queries` test and both `pg_table_bloat` `approx`/`exact` tests took
+  their "extension not installed" early return and proved nothing about the
+  tool's SQL. PG15 is there for column coverage, not recency:
+  `pg_stat_statements` renamed `blk_read_time` to `shared_blk_read_time` in 1.11
+  (PG17), and with only 17/18 in the matrix the pre-1.11 branch was never
+  selected.
+
 ## [0.6.20] - 2026-06-04
 
 ### Fixed

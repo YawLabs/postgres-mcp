@@ -13,7 +13,10 @@ export const statsTools = [
       "slow queries worth optimizing. On pg_stat_statements >= 1.10 (Postgres 15+), also returns " +
       "`io_read_time_ms` and `io_write_time_ms` to separate IO-bound from CPU-bound queries " +
       "(null when track_io_timing = off or the query did no measurable IO -- " +
-      "enable track_io_timing in postgresql.conf to get non-null values).",
+      "enable track_io_timing in postgresql.conf to get non-null values). " +
+      "Scoped to the database in DATABASE_URL: pg_stat_statements is cluster-wide, so results " +
+      "are filtered by `dbid` to match every other tool here rather than leaking query text " +
+      "from unrelated databases sharing the cluster.",
     annotations: {
       title: "Top queries by execution time",
       readOnlyHint: true,
@@ -29,7 +32,14 @@ export const statsTools = [
       limit: z.number().int().min(1).max(100).default(20).describe("Number of rows to return (default 20)."),
     }),
     handler: async (input: unknown) => {
-      const { orderBy, limit } = input as { orderBy: "total_time" | "mean_time" | "calls"; limit: number };
+      // Direct (non-MCP) callers bypass Zod, so the schema defaults never ran.
+      // Re-apply them in the destructure -- matches the precedent in
+      // pg_explain / pg_table_bloat. Without this an omitted `limit` binds
+      // undefined into `LIMIT $1` and postgres errors on the bind.
+      const { orderBy = "total_time", limit = 20 } = input as {
+        orderBy?: "total_time" | "mean_time" | "calls";
+        limit?: number;
+      };
 
       // Single probe answers BOTH "is the extension installed?" (no rows -> no)
       // AND "what's the extversion?" (used to pick column names below). Saves
@@ -112,6 +122,7 @@ export const statsTools = [
              ELSE NULL
            END AS hit_percent${ioTimingCols}
          FROM pg_stat_statements
+         WHERE dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
          ORDER BY ${orderCol} DESC NULLS LAST
          LIMIT $1`,
         [limit],
@@ -144,7 +155,16 @@ export const statsTools = [
       limit: z.number().int().min(1).max(100).default(20).describe("Max rows to return (default 20)."),
     }),
     handler: async (input: unknown) => {
-      const { schema, minSize, limit } = input as { schema?: string; minSize: number; limit: number };
+      // Zod defaults re-applied for direct callers -- see pg_top_queries above.
+      const {
+        schema,
+        minSize = 1000,
+        limit = 20,
+      } = input as {
+        schema?: string;
+        minSize?: number;
+        limit?: number;
+      };
       const schemaFilter = schema
         ? "AND schemaname = $3"
         : "AND schemaname NOT IN ('pg_catalog', 'information_schema') AND schemaname NOT LIKE 'pg_%'";
@@ -205,7 +225,16 @@ export const statsTools = [
       limit: z.number().int().min(1).max(200).default(50).describe("Max rows to return (default 50)."),
     }),
     handler: async (input: unknown) => {
-      const { schema, maxScans, limit } = input as { schema?: string; maxScans: number; limit: number };
+      // Zod defaults re-applied for direct callers -- see pg_top_queries above.
+      const {
+        schema,
+        maxScans = 10,
+        limit = 50,
+      } = input as {
+        schema?: string;
+        maxScans?: number;
+        limit?: number;
+      };
       const schemaFilter = schema
         ? "AND s.schemaname = $3"
         : "AND s.schemaname NOT IN ('pg_catalog', 'information_schema') AND s.schemaname NOT LIKE 'pg_%'";

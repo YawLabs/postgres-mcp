@@ -12,7 +12,16 @@ import { explainTools } from "../tools/explain.js";
 import { healthTools } from "../tools/health.js";
 import { queryTools } from "../tools/query.js";
 import { statsTools } from "../tools/stats.js";
-import { FIXTURE_SCHEMA, integrationEnabled, setupFixtures, teardownFixtures } from "./fixtures.js";
+import {
+  dropOtherDatabase,
+  FIXTURE_OTHER_DB,
+  FIXTURE_OTHER_DB_MARKER,
+  FIXTURE_SCHEMA,
+  integrationEnabled,
+  runMarkerQueryInOtherDatabase,
+  setupFixtures,
+  teardownFixtures,
+} from "./fixtures.js";
 
 const pgReadonly = queryTools.find((t) => t.name === "pg_readonly");
 const pgQuery = queryTools.find((t) => t.name === "pg_query");
@@ -208,6 +217,70 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       }
     });
 
+    // The OTHER half of the runUserQueryBounded catch. The DDL test above
+    // covers "DECLARE failed, user SQL never ran, safe to re-exec". This
+    // covers "DECLARE succeeded, FETCH failed" -- where the user SQL HAS
+    // already executed and re-running it would double-execute side effects.
+    //
+    // Engineered with statement_timeout: DECLARE only plans, so it returns
+    // instantly; the FETCH is what executes pg_sleep and trips the timeout.
+    // The detector is a sequence -- nextval is non-transactional, so its
+    // value survives the rollback and counts how many times the statement
+    // actually ran. A regression that fell through to the direct-exec path
+    // would advance it twice.
+    it("a FETCH-time failure does not re-execute the statement", async () => {
+      const originalWrites = process.env.ALLOW_WRITES;
+      const originalTimeout = process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        const mk = await runInternal(`CREATE SEQUENCE ${FIXTURE_SCHEMA}.fetch_probe_seq`);
+        assert.equal(mk.ok, true, `sequence setup failed: ${mk.error}`);
+
+        // Rebuild the pool with a short statement_timeout (it is snapshotted
+        // at pool construction, so shutdown() first).
+        process.env.POSTGRES_STATEMENT_TIMEOUT_MS = "500";
+        await shutdown();
+
+        const before = (await runInternal<{ v: string }>(
+          `SELECT last_value::text AS v FROM ${FIXTURE_SCHEMA}.fetch_probe_seq`,
+        )) as { ok: boolean; data?: { v: string }[] };
+        const beforeVal = Number(before.data?.[0]?.v ?? "0");
+
+        // Cursorable (a plain SELECT), so DECLARE succeeds and FETCH executes.
+        const res = (await pgQuery.handler({
+          sql: `SELECT nextval('${FIXTURE_SCHEMA}.fetch_probe_seq') AS n, pg_sleep(5) AS s`,
+        })) as { ok: boolean; error?: string };
+        assert.equal(res.ok, false, "expected the FETCH to trip statement_timeout");
+        assert.match(res.error ?? "", /timeout|canceling statement/i);
+
+        // Rebuild again so the read below isn't itself capped at 500ms.
+        if (originalTimeout === undefined) delete process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+        else process.env.POSTGRES_STATEMENT_TIMEOUT_MS = originalTimeout;
+        await shutdown();
+
+        const after = (await runInternal<{ v: string }>(
+          `SELECT last_value::text AS v FROM ${FIXTURE_SCHEMA}.fetch_probe_seq`,
+        )) as { ok: boolean; data?: { v: string }[] };
+        const delta = Number(after.data?.[0]?.v ?? "0") - beforeVal;
+
+        // <= 1 rather than === 1: whether nextval evaluates before pg_sleep in
+        // the target list is not guaranteed, so 0 is a legal outcome. The
+        // property under test is that it never runs TWICE.
+        assert.ok(
+          delta <= 1,
+          `statement executed more than once after a FETCH-time failure (sequence advanced by ${delta})`,
+        );
+
+        await runInternal(`DROP SEQUENCE IF EXISTS ${FIXTURE_SCHEMA}.fetch_probe_seq`);
+      } finally {
+        if (originalWrites === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = originalWrites;
+        if (originalTimeout === undefined) delete process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+        else process.env.POSTGRES_STATEMENT_TIMEOUT_MS = originalTimeout;
+        await shutdown();
+      }
+    });
+
     it("a bad reference in user SQL surfaces postgres's error message", async () => {
       // A reference to a non-existent table fails DECLARE with SQLSTATE 42P01.
       // The fallback re-runs the SELECT directly, which surfaces the same
@@ -264,6 +337,118 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       } finally {
         if (original === undefined) delete process.env.POSTGRES_MAX_ROWS;
         else process.env.POSTGRES_MAX_ROWS = original;
+      }
+    });
+
+    // rowCount must never disagree with rows.length. The cursor path FETCHes
+    // MAX_ROWS + 1 to detect truncation, and the driver's rowCount reflects
+    // that extra probe row -- returning it verbatim reported 3 alongside 2
+    // rows, so a caller paginating on rowCount would loop past the end.
+    it("reports rowCount matching rows.length when truncated", async () => {
+      const original = process.env.POSTGRES_MAX_ROWS;
+      process.env.POSTGRES_MAX_ROWS = "2";
+      try {
+        const res = (await pgQuery.handler({
+          sql: `SELECT id FROM ${FIXTURE_SCHEMA}.users ORDER BY id`,
+        })) as { ok: boolean; data?: { rows: unknown[]; rowCount: number | null; truncated?: boolean } };
+        assert.equal(res.ok, true);
+        assert.equal(res.data?.truncated, true, "sanity: 3 fixture users vs MAX_ROWS=2 must truncate");
+        assert.equal(res.data?.rows.length, 2);
+        assert.equal(
+          res.data?.rowCount,
+          2,
+          `rowCount must equal the number of rows actually returned, got ${res.data?.rowCount}`,
+        );
+      } finally {
+        if (original === undefined) delete process.env.POSTGRES_MAX_ROWS;
+        else process.env.POSTGRES_MAX_ROWS = original;
+      }
+    });
+
+    // The counterpart to the test above, and the reason the rowCount rewrite
+    // is gated on the cursor path. `INSERT ... RETURNING` is NOT cursorable
+    // (DECLARE rejects it with 42601), so it runs on the direct-exec path
+    // where rowCount is the AFFECTED-row count -- independent of how many rows
+    // came back. Collapsing it to rows.length told the caller 3 rows were
+    // written when 10 were committed.
+    it("keeps the affected-row count on a truncated INSERT ... RETURNING", async () => {
+      const originalWrites = process.env.ALLOW_WRITES;
+      const originalMax = process.env.POSTGRES_MAX_ROWS;
+      process.env.ALLOW_WRITES = "1";
+      process.env.POSTGRES_MAX_ROWS = "3";
+      try {
+        const create = (await pgQuery.handler({
+          sql: `CREATE TABLE ${FIXTURE_SCHEMA}.rowcount_canary (id INT)`,
+        })) as { ok: boolean; error?: string };
+        assert.equal(create.ok, true, `expected DDL to succeed: ${create.error}`);
+
+        const res = (await pgQuery.handler({
+          sql: `INSERT INTO ${FIXTURE_SCHEMA}.rowcount_canary SELECT generate_series(1, 10) RETURNING id`,
+        })) as { ok: boolean; data?: { rows: unknown[]; rowCount: number | null; truncated?: boolean } };
+        assert.equal(res.ok, true);
+        assert.equal(res.data?.truncated, true, "sanity: 10 returned rows vs MAX_ROWS=3 must truncate");
+        assert.equal(res.data?.rows.length, 3, "returned rows are still capped at MAX_ROWS");
+        assert.equal(
+          res.data?.rowCount,
+          10,
+          `rowCount must stay the affected-row count on the direct-exec path, got ${res.data?.rowCount}`,
+        );
+
+        // And the write really did land in full -- rowCount is not optimistic.
+        const committed = (await pgQuery.handler({
+          sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.rowcount_canary`,
+        })) as { ok: boolean; data?: { rows: { c: number }[] } };
+        assert.equal(committed.data?.rows[0]?.c, 10);
+
+        await pgQuery.handler({ sql: `DROP TABLE ${FIXTURE_SCHEMA}.rowcount_canary` });
+      } finally {
+        if (originalWrites === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = originalWrites;
+        if (originalMax === undefined) delete process.env.POSTGRES_MAX_ROWS;
+        else process.env.POSTGRES_MAX_ROWS = originalMax;
+      }
+    });
+
+    // `command` is the postgres command tag. On the cursor path it describes
+    // the FETCH, not the user's statement, so every SELECT came back as
+    // command="FETCH". There is no way to recover the inner tag through a
+    // cursor, so the field is omitted rather than reported wrong -- but it is
+    // still present (and correct) on the direct-exec fallback path.
+    it("omits `command` on the cursor path rather than reporting FETCH", async () => {
+      const res = (await pgQuery.handler({
+        sql: `SELECT id FROM ${FIXTURE_SCHEMA}.users ORDER BY id`,
+      })) as { ok: boolean; data?: { command?: string; rows: unknown[] } };
+      assert.equal(res.ok, true);
+      assert.notEqual(res.data?.command, "FETCH", "the FETCH tag must never be surfaced as the user's command");
+      assert.equal(res.data?.command, undefined, "cursor path must omit `command` entirely");
+    });
+
+    it("still reports the real command tag on the direct-exec fallback path", async () => {
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        // DDL is non-cursorable: DECLARE fails, the fallback runs it directly,
+        // and there the driver's tag describes the user's statement.
+        // node-pg reports only the FIRST word of the postgres command tag
+        // ("CREATE TABLE" -> "CREATE", "INSERT 0 1" -> "INSERT"), so assert the
+        // driver's actual shape rather than the raw tag.
+        const create = (await pgQuery.handler({
+          sql: `CREATE TABLE ${FIXTURE_SCHEMA}.command_tag_canary (id INT)`,
+        })) as { ok: boolean; data?: { command?: string }; error?: string };
+        assert.equal(create.ok, true, `expected DDL to succeed: ${create.error}`);
+        assert.equal(create.data?.command, "CREATE");
+
+        const insert = (await pgQuery.handler({
+          sql: `INSERT INTO ${FIXTURE_SCHEMA}.command_tag_canary (id) VALUES (1)`,
+        })) as { ok: boolean; data?: { command?: string; rowCount: number | null } };
+        assert.equal(insert.ok, true);
+        assert.equal(insert.data?.command, "INSERT");
+        assert.equal(insert.data?.rowCount, 1, "affected-row count must survive on the direct-exec path");
+
+        await pgQuery.handler({ sql: `DROP TABLE ${FIXTURE_SCHEMA}.command_tag_canary` });
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
       }
     });
 
@@ -670,8 +855,13 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
 
   describe("pg_top_queries", () => {
     it("returns rows from pg_stat_statements when installed", async () => {
-      // The CI environment preloads pg_stat_statements; locally this may be absent,
-      // in which case we accept the "not installed" error as valid behavior too.
+      // scripts/wsl-pg-setup.sh adds pg_stat_statements to
+      // shared_preload_libraries so the matrix exercises the real path; on a
+      // cluster without it we accept the "not installed" error as valid.
+      // NOTE: when the extension is absent, EVERY test in this describe takes
+      // that early return and proves nothing about the tool's SQL -- if you are
+      // relying on this suite for pg_top_queries coverage, confirm the
+      // extension is actually present first.
       const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as {
         ok: boolean;
         data?: { query: string; calls: string }[];
@@ -738,6 +928,53 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         // Values are either null (timing off / no IO) or a non-negative number.
         if (row.io_read_time_ms !== null) assert.equal(typeof row.io_read_time_ms, "number");
         if (row.io_write_time_ms !== null) assert.equal(typeof row.io_write_time_ms, "number");
+      }
+    });
+
+    // The `dbid` filter is the whole reason pg_top_queries doesn't leak query
+    // text across a shared cluster. pg_stat_statements is cluster-wide, so a
+    // query executed against a DIFFERENT database in the same cluster lands in
+    // the same view under a different dbid -- and must not come back here.
+    // Dropping the WHERE clause restores the leak silently; nothing else in
+    // the suite would notice.
+    it("excludes queries from other databases in the same cluster (dbid scoping)", async () => {
+      const staged = await runMarkerQueryInOtherDatabase();
+      if (!staged) return; // no pg_stat_statements or no CREATEDB -- nothing to assert
+
+      try {
+        // Ask for a large limit so the marker isn't merely ranked off the end.
+        const res = (await pgTopQueries.handler({ orderBy: "calls", limit: 100 })) as {
+          ok: boolean;
+          data?: { query: string }[];
+          error?: string;
+        };
+        if (!res.ok) {
+          assert.match(res.error ?? "", /pg_stat_statements/);
+          return;
+        }
+        const leaked = (res.data ?? []).filter((r) => r.query.includes(FIXTURE_OTHER_DB_MARKER));
+        assert.deepEqual(
+          leaked,
+          [],
+          `query text from ${FIXTURE_OTHER_DB} leaked into pg_top_queries: ${JSON.stringify(leaked)}`,
+        );
+
+        // Positive control: the marker really IS in the cluster-wide view, so
+        // the assertion above is proving the filter works rather than passing
+        // because pg_stat_statements never recorded anything.
+        const clusterWide = (await runInternal<{ n: string }>(
+          `SELECT count(*)::text AS n FROM pg_stat_statements WHERE query LIKE $1`,
+          [`%${FIXTURE_OTHER_DB_MARKER}%`],
+        )) as { ok: boolean; data?: { n: string }[] };
+        if (clusterWide.ok) {
+          assert.notEqual(
+            clusterWide.data?.[0]?.n,
+            "0",
+            "positive control failed: the marker query was never recorded cluster-wide, so the dbid assertion is vacuous",
+          );
+        }
+      } finally {
+        await dropOtherDatabase();
       }
     });
 

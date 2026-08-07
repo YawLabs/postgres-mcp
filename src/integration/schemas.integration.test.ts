@@ -55,6 +55,7 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       // (relkind='r'), and foreign table (relkind='f') when postgres_fdw is available.
       const expectedNames = [
         "Odd Table",
+        "covering_pk",
         "events",
         "events_2026",
         "no_pk_partitioned",
@@ -262,6 +263,46 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       // Columns should still be present even for foreign tables.
       const colNames = (res.data?.columns ?? []).map((c) => c.name).sort();
       assert.deepEqual(colNames, ["email", "id"]);
+    });
+
+    // PRIMARY KEY (id) INCLUDE (label): the covering column sits in
+    // pg_index.indkey next to the key column, so a query matching on the whole
+    // vector reports it as part of the PK. It is not -- indnkeyatts bounds the
+    // key columns. A regression here hands an agent a wrong row identity: it
+    // would build `ON CONFLICT (id, label)`, which postgres rejects since no
+    // unique constraint spans those columns.
+    it("excludes INCLUDE (covering) columns from primary_key", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "covering_pk" })) as {
+        ok: boolean;
+        data?: { primary_key: string[]; columns: { name: string }[]; indexes: { name: string }[] };
+        error?: string;
+      };
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      assert.deepEqual(
+        res.data?.primary_key,
+        ["id"],
+        `INCLUDE column 'label' must not appear in primary_key, got ${JSON.stringify(res.data?.primary_key)}`,
+      );
+      // The covering column is still a real column and the index is still listed --
+      // only the PK membership claim changed.
+      const colNames = (res.data?.columns ?? []).map((c) => c.name).sort();
+      assert.deepEqual(colNames, ["id", "label", "note"]);
+      assert.ok(
+        (res.data?.indexes ?? []).some((i) => i.name === "covering_pk_pkey"),
+        `expected covering_pk_pkey in indexes, got ${JSON.stringify(res.data?.indexes)}`,
+      );
+    });
+
+    // Composite-PK ordering guard. The rewrite swapped array_position(indkey,
+    // attnum) for unnest WITH ORDINALITY; both must yield declared key order,
+    // and `events` is the only multi-column PK in the fixture.
+    it("returns composite primary key columns in declared order", async () => {
+      const res = (await describeTable.handler({ schema: FIXTURE_SCHEMA, table: "events" })) as {
+        ok: boolean;
+        data?: { primary_key: string[] };
+      };
+      assert.equal(res.ok, true);
+      assert.deepEqual(res.data?.primary_key, ["id", "occurred_at"]);
     });
 
     it("returns 'not found' for missing table", async () => {

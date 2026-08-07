@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-// Build a self-contained single-file binary of the @yawlabs/mcp sidecar.
+// Build a self-contained single-file binary of @yawlabs/postgres-mcp.
+//
+// NOTE ON INVOCATION: this repo has NO .github/ -- the release.yml that used
+// to run this on tag push was dropped when registry publish moved into
+// release.sh. Nothing runs this automatically today; it is a manual,
+// run-it-on-each-host step (Node SEA cannot cross-compile), and the resulting
+// bin/<platform>-<arch>/ artifact is staged by stage-release-asset.mjs.
 //
 // Strategy: esbuild bundles src/index.ts + ALL its dependencies (including
 // the externals tsup leaves out -- @modelcontextprotocol/sdk and undici)
@@ -13,8 +19,9 @@
 // Deno-compatible in principle (clean ESM, no native addons), but the node:
 // builtin imports in the bundle are bare (`fs`, not `node:fs`), which Deno
 // rejects without a compat shim. Node SEA needs no such rewrite and ships with
-// the Node already on the box, so it is the zero-friction path here. See
-// BINARY_DISTRIBUTION.md for the deno/bun fallbacks.
+// the Node already on the box, so it is the zero-friction path here. (An
+// earlier BINARY_DISTRIBUTION.md documented deno/bun fallbacks; it does not
+// exist in this repo -- treat Node SEA as the only supported path.)
 //
 // This script ONLY reads node_modules (via esbuild's resolver) and writes to
 // build-tmp/ and bin/<platform>-<arch>/. It does NOT mutate package.json,
@@ -145,5 +152,7 @@ console.log(`OK  ${outExe}`);
 console.log(`    ${fmtSize(outExe)}`);
 console.log('');
 console.log('Verify with:');
+// `version` / `--version` is the ONLY subcommand this server implements
+// (src/index.ts). Do not add a `doctor` line here from the sibling-repo
+// template -- it would print an instruction that exits as a stdio server.
 console.log(`    "${outExe}" --version`);
-console.log(`    "${outExe}" doctor --json`);

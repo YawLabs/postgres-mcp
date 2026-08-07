@@ -6,14 +6,31 @@ export const queryTools = [
   {
     name: "pg_readonly",
     description:
-      "Run a SQL statement guaranteed read-only. Always executes inside a `BEGIN READ ONLY` " +
-      "transaction regardless of `ALLOW_WRITES`, so postgres itself rejects any write attempt. " +
+      "Run a SQL statement with no persistent data changes. Always executes inside a " +
+      "`BEGIN READ ONLY` transaction regardless of `ALLOW_WRITES`, so postgres itself rejects " +
+      "any INSERT/UPDATE/DELETE/DDL and the transaction is always rolled back. " +
       "Use this whenever the goal is to read - SELECT, EXPLAIN, SHOW, VALUES, WITH ... SELECT, " +
-      "etc. Hosts that gate tools individually (Claude Code permissions, mcp.hosting) can safely " +
-      "auto-allow this one. Use `params` for parameterized queries to avoid SQL injection. " +
+      "etc. Scope caveat for hosts that auto-allow this tool: `READ ONLY` constrains writes to " +
+      "the DATABASE, not every side effect. Functions whose effect is outside the table data - " +
+      "`pg_cancel_backend` / `pg_terminate_backend`, `pg_read_file`, `lo_export`, " +
+      "`COPY ... TO PROGRAM` - are NOT blocked here and are NOT behind the `ALLOW_WRITES` gate " +
+      "that `pg_kill` sits behind. They still require the privileges the `DATABASE_URL` role " +
+      "holds, so a least-privileged role (e.g. `pg_read_all_data`) is what actually bounds " +
+      "this tool. Use `params` for parameterized queries to avoid SQL injection. " +
       "Params can be strings, numbers, booleans, null, arrays (for postgres arrays / ANY), or " +
       "objects (for json/jsonb columns). Large result sets are truncated to POSTGRES_MAX_ROWS " +
       "(default 1000) with a `truncated: true` flag.",
+    // DELIBERATE, do not "fix" to match the caveat in the description above.
+    // `BEGIN READ ONLY` does not block side-effecting functions
+    // (pg_terminate_backend, pg_read_file, COPY ... TO PROGRAM), so these
+    // hints are arguably too generous, and a review pass will keep noticing
+    // that. The decision is to keep them: staying in the host auto-allow class
+    // is the entire reason pg_readonly exists as a separate tool from
+    // pg_query, and the DATABASE_URL role -- not the transaction mode -- is
+    // the control that actually bounds this tool. The description and the
+    // README carry the caveat; a least-privileged role is the enforcement.
+    // Flipping these to destructive would move pg_readonly to "always prompt"
+    // in every existing host config for a bound the role already provides.
     annotations: {
       title: "Run read-only SQL",
       readOnlyHint: true,

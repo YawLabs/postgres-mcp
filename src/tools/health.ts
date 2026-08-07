@@ -24,7 +24,10 @@ export const healthTools = [
         .describe("Max active queries to return (default 10, max 100)."),
     }),
     handler: async (input: unknown) => {
-      const { activeQueryLimit } = input as { activeQueryLimit: number };
+      // Zod default re-applied for direct (non-MCP) callers, which bypass the
+      // schema -- an omitted activeQueryLimit would otherwise bind undefined
+      // into `LIMIT $1`. Matches the precedent in pg_explain / pg_table_bloat.
+      const { activeQueryLimit = 10 } = input as { activeQueryLimit?: number };
       // 5-way catalog fanout on a single shared connection -- avoids
       // saturating the pool (default max 5) on one health probe.
       return withSharedClient(async (run) => {

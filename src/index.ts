@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { writeSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isWritesAllowed, shutdown } from "./api.js";
@@ -18,6 +19,12 @@ declare const __VERSION__: string | undefined;
 // fixed `../package.json`. A deeper tsc emit layout (e.g. dist/src/index.js)
 // would crash startup with a hard-coded relative require; walking up finds
 // package.json wherever it actually sits.
+//
+// Reachability: BOTH shipped artifacts (the esbuild npm bundle and the SEA
+// binary) define __VERSION__, so this fallback only runs for a raw `tsc`
+// output -- i.e. local dev. It is deliberately kept rather than deleted:
+// `npm run build` runs tsc first, and dist/*.js is what the test suite
+// imports. Nothing here is exercised by a published package.
 async function readPackageVersion(): Promise<string> {
   const { createRequire } = await import("node:module");
   const { fileURLToPath } = await import("node:url");
@@ -47,6 +54,34 @@ const subcommand = process.argv[2];
 if (subcommand === "version" || subcommand === "--version") {
   console.log(version);
   process.exit(0);
+}
+
+// Reject an unrecognized bare subcommand instead of silently falling through
+// to the stdio server. `postgres-mcp doctor` used to print nothing and hang
+// looking like a crash, because the server was sitting there waiting for MCP
+// framing on stdin. Only bare words are rejected -- a leading `-` is left
+// alone so flags an MCP host may pass still reach the server untouched.
+if (subcommand !== undefined && !subcommand.startsWith("-")) {
+  // A connection string passed positionally is the one shape that used to
+  // "work" (it was ignored, and DATABASE_URL supplied the real DSN), so a
+  // generic "unknown subcommand" would read as a regression to anyone with
+  // that in their MCP config. Name the actual fix instead.
+  const looksLikeDsn = /^postgres(ql)?:\/\//i.test(subcommand);
+  const message = looksLikeDsn
+    ? `postgres-mcp: connection strings are not accepted as an argument.\n` +
+      `Set DATABASE_URL in the MCP server env instead:\n` +
+      `  "env": { "DATABASE_URL": "postgres://..." }\n`
+    : `postgres-mcp: unknown subcommand '${subcommand}'\n` +
+      `Usage:\n` +
+      `  postgres-mcp            start the MCP server on stdio\n` +
+      `  postgres-mcp version    print the version and exit\n`;
+  // writeSync, not process.stderr.write: stderr is ASYNCHRONOUS for TTYs and
+  // pipes on Windows, and process.exit() truncates pending async writes -- so
+  // the usage text could be cut off exactly where a human reads it. Setting
+  // process.exitCode and returning is not an option at module top level; the
+  // rest of this file would keep evaluating and start the server anyway.
+  writeSync(2, message);
+  process.exit(1);
 }
 
 // ─── No subcommand - start the MCP server ───

@@ -28,7 +28,9 @@ export const adminTools = [
       limit: z.number().int().min(1).max(100).default(50).describe("Max blocked/blocker pairs (default 50)."),
     }),
     handler: async (input: unknown) => {
-      const { limit } = input as { limit: number };
+      // Zod default re-applied for direct (non-MCP) callers, which bypass the
+      // schema -- matches the precedent in pg_explain / pg_table_bloat.
+      const { limit = 50 } = input as { limit?: number };
       return runInternal<{
         blocked_pid: number;
         blocked_user: string;
@@ -121,7 +123,8 @@ export const adminTools = [
         .describe("If true, include built-in `pg_*` roles (pg_read_all_data, pg_monitor, etc.)."),
     }),
     handler: async (input: unknown) => {
-      const { includeSystem } = input as { includeSystem: boolean };
+      // Zod default re-applied for direct callers -- see pg_inspect_locks above.
+      const { includeSystem = false } = input as { includeSystem?: boolean };
       // `starts_with` (pg 11+) is cleaner than LIKE for a literal-underscore
       // prefix match - LIKE requires escaping _ and the escape clause itself
       // needs careful backslash handling through JS -> SQL.
@@ -183,7 +186,8 @@ export const adminTools = [
       table: identSchema.optional().describe("Table name. Omit to list privileges for all tables in the schema."),
     }),
     handler: async (input: unknown) => {
-      const { schema, table } = input as { schema: string; table?: string };
+      // Zod default re-applied for direct callers -- see pg_inspect_locks above.
+      const { schema = "public", table } = input as { schema?: string; table?: string };
       const tableFilter = table ? "AND table_name = $2" : "";
       const params: unknown[] = [schema];
       if (table) params.push(table);
@@ -235,7 +239,10 @@ export const adminTools = [
         .describe("`cancel` aborts the current query; `terminate` closes the connection entirely."),
     }),
     handler: async (input: unknown) => {
-      const { pid, mode } = input as { pid: number; mode: "cancel" | "terminate" };
+      // Zod default re-applied for direct callers -- see pg_inspect_locks above.
+      // Defaulting to the SAFER of the two modes ("cancel") is deliberate: an
+      // omitted `mode` must never escalate to terminate.
+      const { pid, mode = "cancel" } = input as { pid: number; mode?: "cancel" | "terminate" };
       if (!isWritesAllowed()) {
         return {
           ok: false,
@@ -415,10 +422,17 @@ export const adminTools = [
       limit: z.number().int().min(1).max(500).default(50).describe("Max rows per category (default 50)."),
     }),
     handler: async (input: unknown) => {
-      const { seqExhaustionThreshold, rlsSchemas, limit } = input as {
-        seqExhaustionThreshold: number;
-        rlsSchemas: string[];
-        limit: number;
+      // Zod defaults re-applied for direct callers -- see pg_inspect_locks
+      // above. `rlsSchemas` is the load-bearing one: undefined bound into
+      // `n.nspname = ANY($1)` errors at bind time rather than defaulting.
+      const {
+        seqExhaustionThreshold = 0.5,
+        rlsSchemas = ["public"],
+        limit = 50,
+      } = input as {
+        seqExhaustionThreshold?: number;
+        rlsSchemas?: string[];
+        limit?: number;
       };
 
       // 3-way fanout sharing one connection -- see api.ts:withSharedClient.
@@ -562,20 +576,20 @@ export const adminTools = [
         ),
     }),
     handler: async (input: unknown) => {
+      // Direct (non-MCP) callers bypass Zod, so its defaults never run for
+      // them. Re-applied in the destructure -- matches the precedent in
+      // pg_explain.
       const {
         schema,
-        minDeadRatio,
-        limit,
-        method: rawMethod,
+        minDeadRatio = 0.1,
+        limit = 50,
+        method = "estimate",
       } = input as {
         schema?: string;
-        minDeadRatio: number;
-        limit: number;
+        minDeadRatio?: number;
+        limit?: number;
         method?: "estimate" | "approx" | "exact";
       };
-      // Direct (non-MCP) callers bypass Zod, so Zod's default("estimate") never
-      // runs for them. Re-apply it here -- matches the precedent in pg_explain.
-      const method = rawMethod ?? "estimate";
       const schemaFilter = schema
         ? "AND schemaname = $3"
         : "AND schemaname NOT IN ('pg_catalog', 'information_schema') AND schemaname NOT LIKE 'pg_%'";

@@ -1,6 +1,8 @@
 # Force LF line endings in the working tree on every OS. Biome formats with
-# LF; without this, git on Windows converts to CRLF on checkout and CI lint
-# fails with a full-file formatter diff on Windows runners.
+# LF; without this, git on Windows converts to CRLF on checkout and the next
+# `npm run lint` reports a full-file formatter diff. (This repo has no CI --
+# release.sh step 1 is the only lint gate -- so that diff surfaces at release
+# time rather than on a PR.)
 * text=auto eol=lf
 
 # Explicit binary markers so git doesn't try to normalize them.

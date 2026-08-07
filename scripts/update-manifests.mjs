@@ -7,8 +7,11 @@
 // slug, license, description), so this script is copy-paste across @yawlabs/*
 // servers -- only the sibling-repo dirs are flags. Mirrors the Yaw Terminal
 // release.sh pattern: the manifest repos are checked out next to this one and
-// pushed with the gh_woods SSH key -- no CI cross-repo token. The binary BUILD
-// is CI (release.yml on tag push); this manifest BUMP runs locally after.
+// pushed with the gh_woods SSH key -- no CI cross-repo token. In THIS repo the
+// binary BUILD is also local (scripts/build-binary.mjs by hand, per host);
+// there is no .github/ and no release.yml -- it was dropped when registry
+// publish moved into release.sh. `gh release download` below still needs the
+// per-arch assets to have been uploaded to the tag first.
 //
 //   node scripts/update-manifests.mjs --version 0.60.6 \
 //     [--scoop-dir ~/yaw/scoop-yaw] [--homebrew-dir ~/yaw/homebrew-yaw] [--push]
