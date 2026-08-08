@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An opt-in `--permission` sandbox under oam**, via `POSTGRES_MCP_SANDBOX=1`.
+  The network grant is derived from `DATABASE_URL` at launch rather than
+  hardcoded, so the one endpoint the server may reach is the one it was
+  configured to reach. Host and port are both pinned, because oam matches grants
+  by prefix and a bare host would also admit every other port on it. Filesystem
+  and child-process are denied outright.
+
+  Opt-in rather than default because a wrong grant does not fail loudly: oam
+  denies a non-granted environment variable by making it **absent** from
+  `process.env` rather than throwing, so an under-granted `DATABASE_URL` would
+  read as "not configured" instead of "denied". The environment allow-list is
+  derived from what the shipped bundle actually reads, which is why it includes
+  the pg driver's own lookups (`PGSSLMODE`, `PGCONNECT_TIMEOUT` and friends) that
+  a hand-written list would have missed.
+
+### Changed
+
+- **oam 0.9.0 is now the minimum**, enforced in `bin/postgres-mcp.mjs`. Older
+  releases ran `child_process.execFile` arguments through a shell, accepted
+  `exec`'s `timeout` and ignored it, truncated `spawnSync` at `maxBuffer` while
+  reporting success, and treated `stdio: 'inherit'` as `'pipe'`. This server
+  spawns nothing, so the floor is enforced for consistency across
+  `@yawlabs/*-mcp` rather than because this launcher was exposed. An older oam is
+  not an error: the launcher falls back to Node and says so on stderr, and
+  `POSTGRES_MCP_RUNTIME=oam` turns that into a hard error.
+
+### Fixed
+
+- **`release.sh` aborted instead of releasing when `[Unreleased]` was empty.**
+  The body extraction pipes through `grep -v` to drop blank lines, and `grep`
+  exits non-zero when it matches nothing — so under `set -e` an empty section
+  killed the script at that line, and the `warn` branch written to handle
+  exactly that case could never run.
+
 ## [0.9.1] - 2026-08-07
 
 ### Fixed

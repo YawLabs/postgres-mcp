@@ -281,7 +281,11 @@ if [ -f CHANGELOG.md ]; then
     warn "CHANGELOG.md has no [Unreleased] heading -- not promoting anything. Add release notes by hand."
   else
     # Body = every non-blank line between [Unreleased] and the next `## [`.
-    UNRELEASED_BODY=$(awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md | grep -v '^[[:space:]]*$' | head -1)
+    # `|| true` is load-bearing: grep exits 1 when it matches nothing, which is
+    # exactly the empty-[Unreleased] case, and under `set -e` that aborted the
+    # whole release here -- making the `warn` branch below unreachable for the
+    # one condition it was written to handle.
+    UNRELEASED_BODY=$(awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md | { grep -v '^[[:space:]]*$' || true; } | head -1)
     if [ -z "$UNRELEASED_BODY" ]; then
       warn "CHANGELOG [Unreleased] is empty -- releasing v${VERSION} with no release notes."
     else
