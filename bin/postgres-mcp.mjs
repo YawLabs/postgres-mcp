@@ -33,18 +33,47 @@
  * ~980-1290ms), which were wrong in both magnitude and direction. Warm every
  * candidate first, or stage it out of the build directory.
  *
+ * THE `--permission` SANDBOX (oam 0.9.0+, opt-in)
+ * `POSTGRES_MCP_SANDBOX=1` runs the server under oam's permission model.
+ *
+ * The database host is not knowable ahead of time, so the net grant is DERIVED
+ * from DATABASE_URL at launch: the one endpoint this server may reach is the one
+ * it was configured to reach. Both host and port are pinned, because grants are
+ * prefix-matched and a bare host would also admit every other port on it.
+ * Filesystem and child-process stay denied.
+ *
+ * Opt-in, not default. A denied environment variable is ABSENT from process.env
+ * rather than throwing, so an under-granted DATABASE_URL would look like "not
+ * configured" instead of "denied". The env list is derived from the shipped
+ * bundle and includes the pg driver's own reads (PGSSLMODE, PGCONNECT_TIMEOUT
+ * and friends) -- a hand-written list misses those.
+ *
+ * MINIMUM OAM VERSION
+ * 0.9.0. Below it `child_process.execFile` ran its arguments through a SHELL,
+ * `exec` accepted `timeout` and ignored it, `spawnSync` truncated at
+ * `maxBuffer` while reporting success, and `stdio: 'inherit'`/`'ignore'` both
+ * behaved as `'pipe'`. This server spawns nothing, so the floor is
+ * enforced for consistency across @yawlabs/*-mcp rather than because this
+ * launcher was exposed.
+ * An older oam is not an error: the launcher falls back to Node and says so on
+ * stderr. Pinning the floor here is what makes that fallback automatic.
+ *
  * SELECTION
  *   POSTGRES_MCP_RUNTIME=oam    require oam; fail loudly if it is missing
  *   POSTGRES_MCP_RUNTIME=node   never use oam
  *   POSTGRES_MCP_RUNTIME=auto   prefer oam, silently fall back (default)
+ *   POSTGRES_MCP_SANDBOX=1      run oam under --permission (oam 0.9.0+)
  *   OAM_BIN=/path/to/oam        explicit binary, checked before any discovery
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+/** Oldest oam whose `child_process` matches Node. See MINIMUM OAM VERSION above. */
+const OAM_MIN = [0, 9, 0];
 
 // Two forms, deliberately. `import()` on Windows REJECTS a bare `C:\...` path
 // with ERR_UNSUPPORTED_ESM_URL_SCHEME (it reads `c:` as a protocol), so the
@@ -90,6 +119,72 @@ function findOam() {
   return null;
 }
 
+/**
+ * `oam --version` -> [major, minor, patch], or null when it cannot be read.
+ * A pre-release suffix (0.9.0-rc.1) truncates to its base version.
+ */
+function oamVersion(cmd) {
+  try {
+    const out = execFileSync(cmd, ["--version"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const m = /(\d+)\.(\d+)\.(\d+)/.exec(out);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  } catch {
+    // Not executable, wrong arch, or deleted since the stat. Caller degrades.
+    return null;
+  }
+}
+
+/** True when `v` is at least `min`, comparing major/minor/patch in order. */
+function atLeast(v, min) {
+  if (!v) return false;
+  for (let i = 0; i < min.length; i++) {
+    if (v[i] > min[i]) return true;
+    if (v[i] < min[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * The `--permission` grant list, or [] when the sandbox is not requested.
+ *
+ * These are oam's PROCESS-level flags: they belong before the `run` subcommand,
+ * not after it. `oam run --permission file.js` is rejected outright, which is a
+ * good failure but only because it is loud -- ordering here is load-bearing.
+ *
+ * Net grants prefix-match `host` for fetch and `host:port` for sockets.
+ * A denied environment variable is ABSENT from process.env rather than throwing,
+ * so the env list below is derived from what the bundle actually reads; trimming
+ * it produces silent misbehaviour, not a clear denial.
+ */
+function sandboxFlags() {
+  if (process.env.POSTGRES_MCP_SANDBOX !== "1") return [];
+
+  // Derived, not hardcoded: the only endpoint this server may reach is the one
+  // it was configured to reach. Grants are prefix-matched against "host:port"
+  // for sockets, so host alone would also admit any other port on that host --
+  // pin both. A DSN we cannot parse falls back to a bare grant rather than a
+  // broken one, because a wrong narrow grant fails at connect time.
+  const dsn = process.env.DATABASE_URL ?? null;
+  let netFlag = "--allow-net";
+  if (dsn) {
+    try {
+      const u = new URL(dsn);
+      if (u.hostname) netFlag = `--allow-net=${u.hostname}:${u.port || 5432}`;
+    } catch {
+      // Unparseable DATABASE_URL: leave the grant open. The server will fail on
+      // its own connection error, which names the real problem.
+    }
+  }
+
+  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGCONNECT_TIMEOUT","PGSSLMODE","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
+
+  const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];
+  return flags;
+}
+
 /** Run the server in THIS process. The zero-overhead fallback. */
 async function runInProcess() {
   await import(SERVER_URL.href);
@@ -116,11 +211,30 @@ if (mode === "node") {
       process.exit(1);
     }
     await runInProcess();
+  } else if (!atLeast(oamVersion(oam), OAM_MIN)) {
+    // Discovery itself stays stat-only; this is the first subprocess, and it
+    // runs only once we have already decided to spawn oam anyway. Measured 26ms
+    // median (n=12, windows-arm64), paid once per MCP session.
+    const min = OAM_MIN.join(".");
+    if (mode === "oam") {
+      const { writeSync } = await import("node:fs");
+      writeSync(
+        2,
+        `postgres-mcp: POSTGRES_MCP_RUNTIME=oam but ${oam} is older than oam ${min}.\n` +
+          `Run \`oam self-update\`, or use POSTGRES_MCP_RUNTIME=node.\n`,
+      );
+      process.exit(1);
+    }
+    // auto: an old oam is a reason to prefer Node, not to fail. Say so, because
+    // a silent downgrade is how someone keeps running an oam they meant to
+    // update. stderr is safe -- MCP frames travel on stdout.
+    process.stderr.write(`postgres-mcp: oam at ${oam} is older than ${min}; using Node instead.\n`);
+    await runInProcess();
   } else {
     // `--` separates oam's own flags from the script's argv. Everything after
     // it lands in process.argv for the server, so `postgres-mcp version` and
     // any host-supplied flags survive the hop unchanged.
-    const child = spawn(oam, ["run", SERVER_ENTRY, "--", ...process.argv.slice(2)], {
+    const child = spawn(oam, [...sandboxFlags(), "run", SERVER_ENTRY, "--", ...process.argv.slice(2)], {
       // inherit keeps the SAME fds, so MCP's newline-delimited JSON framing on
       // stdin/stdout is untouched and the host's stdin-close still reaches the
       // server's shutdown path.
