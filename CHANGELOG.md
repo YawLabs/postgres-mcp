@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-08
+
 ### Added
 
 - **An opt-in `--permission` sandbox under oam**, via `POSTGRES_MCP_SANDBOX=1`.
