@@ -26,7 +26,11 @@ describe("release metadata", () => {
   it("server.json top-level version matches package.json", () => {
     const pkg = readJson("package.json");
     const server = readJson("server.json");
-    assert.equal(server.version, pkg.version, `server.json version (${String(server.version)}) must match package.json version (${String(pkg.version)})`);
+    assert.equal(
+      server.version,
+      pkg.version,
+      `server.json version (${String(server.version)}) must match package.json version (${String(pkg.version)})`,
+    );
   });
 
   it("server.json packages[].version all match package.json", () => {
@@ -35,7 +39,11 @@ describe("release metadata", () => {
     const packages = server.packages as Array<{ version: string; identifier?: string }> | undefined;
     assert.ok(Array.isArray(packages) && packages.length > 0, "server.json must declare at least one package");
     for (const entry of packages ?? []) {
-      assert.equal(entry.version, pkg.version, `server.json packages entry (${entry.identifier ?? "<unnamed>"}) version (${entry.version}) must match package.json version (${String(pkg.version)})`);
+      assert.equal(
+        entry.version,
+        pkg.version,
+        `server.json packages entry (${entry.identifier ?? "<unnamed>"}) version (${entry.version}) must match package.json version (${String(pkg.version)})`,
+      );
     }
   });
 
@@ -47,8 +55,14 @@ describe("release metadata", () => {
     const server = readJson("server.json");
     // Both must be present, or the equality below passes vacuously when a
     // refactor drops both fields.
-    assert.ok(typeof pkg.mcpName === "string" && (pkg.mcpName as string).length > 0, "package.json must declare a non-empty \`mcpName\`");
-    assert.ok(typeof server.name === "string" && (server.name as string).length > 0, "server.json must declare a non-empty \`name\`");
+    assert.ok(
+      typeof pkg.mcpName === "string" && (pkg.mcpName as string).length > 0,
+      "package.json must declare a non-empty `mcpName`",
+    );
+    assert.ok(
+      typeof server.name === "string" && (server.name as string).length > 0,
+      "server.json must declare a non-empty `name`",
+    );
     assert.equal(pkg.mcpName, server.name, "package.json mcpName must equal server.json name");
   });
 });
