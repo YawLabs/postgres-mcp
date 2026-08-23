@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/postgres-mcp",
   "description": "PostgreSQL MCP server - query, schema introspection, explain, and health checks for AI assistants",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/postgres-mcp",
-      "version": "0.10.0",
+      "version": "0.11.0",
       "transport": {
         "type": "stdio"
       }

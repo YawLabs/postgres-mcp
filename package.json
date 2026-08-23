@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/postgres-mcp",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "mcpName": "io.github.YawLabs/postgres-mcp",
   "description": "PostgreSQL MCP server - query, schema introspection, explain, and health checks for AI assistants",
   "license": "MIT",
