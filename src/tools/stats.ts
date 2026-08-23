@@ -10,7 +10,13 @@ export const statsTools = [
       "extension to be installed and enabled (most managed Postgres providers have it on " +
       "by default). Returns normalized query text (constants replaced with `?`), call count, " +
       "total/mean/min/max time in ms, rows returned, and cache hit ratio. Use this to find " +
-      "slow queries worth optimizing.",
+      "slow queries worth optimizing. " +
+      "When `pg_stat_statements` is version 1.10 or newer, the response also includes " +
+      "`shared_blk_read_time_ms` and `shared_blk_write_time_ms` (cumulative time spent " +
+      "reading/writing shared buffer blocks, in milliseconds) so you can tell 'slow because " +
+      "of IO' from 'slow because of CPU'. Both values will be 0 unless `track_io_timing` is " +
+      "enabled at the cluster level (`ALTER SYSTEM SET track_io_timing = on; SELECT " +
+      "pg_reload_conf();`). On older `pg_stat_statements` (<1.10) these keys are omitted.",
     annotations: {
       title: "Top queries by execution time",
       readOnlyHint: true,
@@ -57,6 +63,19 @@ export const statsTools = [
       const minCol = useExecSuffix ? "min_exec_time" : "min_time";
       const maxCol = useExecSuffix ? "max_exec_time" : "max_time";
 
+      // pg_stat_statements 1.10 (PG15+) added shared_blk_{read,write}_time --
+      // milliseconds spent in shared-buffer IO per query. Surfaced only when
+      // the extension is new enough so the SELECT itself doesn't 42703 on
+      // older installs. Values are 0 unless `track_io_timing = on` at the
+      // cluster level; we don't probe pg_settings to save a round-trip --
+      // the tool description documents the requirement instead.
+      const hasIoTiming = compareVersions(extVersion, "1.10") >= 0;
+      const ioTimingSelect = hasIoTiming
+        ? `,
+           shared_blk_read_time::numeric(18, 2)::float8 AS shared_blk_read_time_ms,
+           shared_blk_write_time::numeric(18, 2)::float8 AS shared_blk_write_time_ms`
+        : "";
+
       // The ORDER BY expression has to dodge an alias-shadowing trap: the
       // SELECT below aliases `calls::text AS calls`, and postgres resolves
       // `ORDER BY calls` to the output alias FIRST. Sorting text would mean
@@ -75,6 +94,8 @@ export const statsTools = [
         max_time_ms: number;
         rows: string;
         hit_percent: number | null;
+        shared_blk_read_time_ms?: number | null;
+        shared_blk_write_time_ms?: number | null;
       }>(
         // bigint counters (calls, rows) come back as `.text` for lossless
         // serialization, matching pg_seq_scan_tables / pg_unused_indexes /
@@ -92,7 +113,7 @@ export const statsTools = [
              WHEN (shared_blks_hit + shared_blks_read) > 0
              THEN (shared_blks_hit::float8 / (shared_blks_hit + shared_blks_read) * 100)::numeric(5, 2)::float8
              ELSE NULL
-           END AS hit_percent
+           END AS hit_percent${ioTimingSelect}
          FROM pg_stat_statements
          ORDER BY ${orderCol} DESC NULLS LAST
          LIMIT $1`,

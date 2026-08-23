@@ -613,5 +613,61 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     // regression vector but the SQL pattern is well-commented at the call
     // site and a regression would require actively removing the
     // `pg_stat_statements.` qualifier.
+
+    it("surfaces shared_blk_{read,write}_time_ms when pg_stat_statements >= 1.10", async () => {
+      // Probe the extension state directly so we can skip cleanly when the
+      // extension is absent or pre-1.10. CI runs PG17/18 with
+      // pg_stat_statements 1.11+, so this assertion fires there. The
+      // track_io_timing GUC is OFF by default in the CI postgres image, so
+      // the fields are present-but-zero -- we assert presence + numeric, not
+      // a positive value.
+      const versionRes = (await runInternal<{ version: string }>(
+        `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
+      )) as { ok: boolean; data?: { version: string }[] };
+      if (!versionRes.ok || !versionRes.data || versionRes.data.length === 0) {
+        return; // extension not installed -- nothing to assert
+      }
+      const ver = versionRes.data[0]?.version ?? "0";
+      // Local numeric-segment parse mirroring compareVersions's intent.
+      const parts = ver.split(".").map((s) => {
+        const m = s.match(/^\d+/);
+        return m ? Number.parseInt(m[0], 10) : 0;
+      });
+      const major = parts[0] ?? 0;
+      const minor = parts[1] ?? 0;
+      if (major < 1 || (major === 1 && minor < 10)) {
+        return; // pre-1.10 -- columns don't exist, nothing to assert
+      }
+
+      const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as {
+        ok: boolean;
+        data?: {
+          query: string;
+          shared_blk_read_time_ms?: number | null;
+          shared_blk_write_time_ms?: number | null;
+        }[];
+        error?: string;
+      };
+      assert.equal(res.ok, true);
+      assert.ok(Array.isArray(res.data));
+      assert.ok((res.data ?? []).length > 0, "fixture queries should populate pg_stat_statements");
+      const row = res.data?.[0];
+      assert.ok(row, "expected at least one row");
+      // Keys must be present (not omitted) on new-enough extension.
+      assert.ok(
+        Object.hasOwn(row as object, "shared_blk_read_time_ms"),
+        "shared_blk_read_time_ms key must appear on pg_stat_statements >= 1.10",
+      );
+      assert.ok(
+        Object.hasOwn(row as object, "shared_blk_write_time_ms"),
+        "shared_blk_write_time_ms key must appear on pg_stat_statements >= 1.10",
+      );
+      // Values are numeric (typically 0 when track_io_timing = off, which is
+      // the CI default; non-negative either way).
+      assert.equal(typeof row?.shared_blk_read_time_ms, "number");
+      assert.equal(typeof row?.shared_blk_write_time_ms, "number");
+      assert.ok((row?.shared_blk_read_time_ms ?? -1) >= 0);
+      assert.ok((row?.shared_blk_write_time_ms ?? -1) >= 0);
+    });
   });
 });
