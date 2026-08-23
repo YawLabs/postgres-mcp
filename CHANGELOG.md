@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Windows: the launcher no longer hard-kills the server on the first Ctrl-C.** There are no POSIX signals on Windows — `child.kill(sig)` ignores the name and calls `TerminateProcess`, an immediate hard kill (verified: a child with a `SIGTERM` handler never runs it and dies with `code=null`). The launcher forwarded anyway, on the stated assumption that this was a "no-op on Windows", so it aborted the graceful shutdown the console's own Ctrl-C had just started and skipped the server's `process.on("exit")` cleanup. The console already delivers the event to the whole process group, so on Windows the launcher now forwards nothing.
 - **A wedged server no longer leaves the launcher hanging.** Forwarding was gated on `child.killed`, which records only that `kill()` was *called* — never that the child is gone — so every signal after the first was swallowed and there was no escape hatch. Escalation is now armed by a timer on the first signal: one press is enough, and a child still alive after a 2s grace window is killed. Using a timer rather than counting signals also stops the ordinary supervisor sequence (`SIGINT` then `SIGTERM` milliseconds apart) from being misread as impatience.
 
+### Documentation
+
+- **The README now carries a "What's new in 0.11.0" section.** The three
+  breaking changes lived only in this file, where someone upgrading from
+  0.10.x is unlikely to look before their first failing call -- and the
+  stats-envelope change fails at the call site rather than at install time,
+  since `data` becomes an object where it used to be an array.
+- **Both WSL scripts and the README document the `MSYS_NO_PATHCONV=1` prefix
+  they require when invoked from Git Bash on Windows.** Without it, Git Bash
+  rewrites the `/mnt/c/...` argument into the Git install prefix before
+  `wsl.exe` sees it, and the script exits "No such file or directory" having
+  run no tests at all. Piping either script into `tail`/`head` is also called
+  out, because the pipeline's exit status is the last command's -- so a red
+  matrix reports success.
+
 ## [0.11.0] - 2026-08-23
 
 ### Added
