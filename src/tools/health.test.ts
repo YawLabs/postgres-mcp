@@ -40,7 +40,21 @@ function categorize(sql: string): HealthQuery {
   return "unknown";
 }
 
-function rowsFor(sql: string): Record<string, unknown>[] {
+/**
+ * The wait-event pair the stubbed `active` row reports. Parameterized because
+ * this vocabulary is the one thing pg_health surfaces that postgres renames
+ * between majors -- a buffer-pin wait is ('BufferPin', 'BufferPin') through
+ * PG18 and ('Buffer', 'BufferShared') from PG19 on -- so the passthrough cases
+ * below can drive both spellings through the real handler.
+ */
+interface WaitEventPair {
+  type: string | null;
+  name: string | null;
+}
+
+const DEFAULT_WAIT_EVENT: WaitEventPair = { type: "Lock", name: "transactionid" };
+
+function rowsFor(sql: string, waitEvent: WaitEventPair = DEFAULT_WAIT_EVENT): Record<string, unknown>[] {
   switch (categorize(sql)) {
     case "version":
       return [{ version: "PostgreSQL 17.4 on aarch64-unknown-linux-gnu" }];
@@ -70,8 +84,8 @@ function rowsFor(sql: string): Record<string, unknown>[] {
           duration_seconds: 3.5,
           transaction_age_seconds: 61.2,
           xact_start: "2026-08-22 10:00:00+00",
-          wait_event_type: "Lock",
-          wait_event: "transactionid",
+          wait_event_type: waitEvent.type,
+          wait_event: waitEvent.name,
           backend_type: "client backend",
           query: "SELECT 1",
           application_name: "psql",
@@ -205,8 +219,9 @@ describe("pg_health (stubbed connect, no live DB)", () => {
    *   permission-gated catalogs on managed providers.
    * @param emptyVersionRow makes the version query succeed with zero rows,
    *   which is not a failure and so does not hit the early return.
+   * @param waitEvent the wait-event pair the stubbed active row reports.
    */
-  function installStub(failing: HealthQuery[] = [], emptyVersionRow = false) {
+  function installStub(failing: HealthQuery[] = [], emptyVersionRow = false, waitEvent = DEFAULT_WAIT_EVENT) {
     seen = [];
     pg.Pool.prototype.query = function queryStub(this: pg.Pool) {
       return Promise.resolve({ rows: [] });
@@ -217,7 +232,7 @@ describe("pg_health (stubbed connect, no live DB)", () => {
         seen.push({ sql, params });
         if (failing.includes(categorize(sql))) throw new Error("permission denied");
         if (emptyVersionRow && categorize(sql) === "version") return { rows: [] };
-        return { rows: rowsFor(sql) };
+        return { rows: rowsFor(sql, waitEvent) };
       },
       release() {
         /* no-op */
@@ -334,6 +349,73 @@ describe("pg_health (stubbed connect, no live DB)", () => {
       /count\(\*\) FILTER \(WHERE backend_type = 'client backend'\)::text AS cluster_client_backends/,
     );
     assert.equal(res.data?.connections?.cluster_client_backends, "11");
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Wait-event passthrough. wait_event_type / wait_event are the only values
+  // pg_health surfaces whose vocabulary postgres renames between majors: the
+  // same buffer-pin wait reports ('BufferPin', 'BufferPin') through PG18 and
+  // ('Buffer', 'BufferShared') from PG19 on. A predicate or a CASE over those
+  // literals in the handler would silently match nothing on the far side of
+  // that rename -- rendering a database stalled on exactly that wait as one
+  // with nothing waiting at all -- and no fixture-row assertion would catch
+  // it, because a stub returns whatever it was told to either way. So the SQL
+  // shape is what gets pinned here.
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("selects the wait-event pair bare, never filtering or switching on the literals", async () => {
+    installStub();
+    await pgHealth.handler({});
+    const sql = sqlFor("active");
+    // Adjacent bare select items, exactly as written. A rewrite into
+    // `CASE WHEN wait_event_type = 'BufferPin' THEN ... END AS wait_event_type`
+    // breaks this and the occurrence counts below.
+    assert.match(sql, /\n\s*wait_event_type,\n\s*wait_event,\n\s*backend_type,/);
+    // The \b after `wait_event` does not fire inside `wait_event_type` --
+    // the next character is a word character -- so the two counts below are
+    // independent. One apiece means the select list is the ONLY place either
+    // column is named anywhere in the statement.
+    const typeMentions = sql.match(/\bwait_event_type\b/g) ?? [];
+    const nameMentions = sql.match(/\bwait_event\b/g) ?? [];
+    assert.equal(typeMentions.length, 1, "wait_event_type is named more than once");
+    assert.equal(nameMentions.length, 1, "wait_event is named more than once");
+    // Asserted separately from the counts so a regression that adds a
+    // predicate reports WHERE it went wrong rather than just "count was 2".
+    const where = sql.slice(sql.indexOf("WHERE"), sql.indexOf("ORDER BY"));
+    assert.ok(where.length > 0, "the active-queries query should still have a WHERE clause");
+    assert.doesNotMatch(where, /wait_event/);
+  });
+
+  // The same underlying wait, spelled either side of the PG19 rename. Neither
+  // spelling is translated, normalized, or dropped on the way out -- which is
+  // what lets the caller interpret it against the `version` in the same
+  // response instead of this tool guessing.
+  const WAIT_EVENT_SPELLINGS: [string, WaitEventPair][] = [
+    ["PG18-and-older", { type: "BufferPin", name: "BufferPin" }],
+    ["PG19", { type: "Buffer", name: "BufferShared" }],
+  ];
+
+  for (const [label, pair] of WAIT_EVENT_SPELLINGS) {
+    it(`passes the ${label} wait-event spelling through verbatim`, async () => {
+      installStub([], false, pair);
+      const res = (await pgHealth.handler({})) as HealthResponse;
+      const rows = res.data?.active_queries ?? [];
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]?.wait_event_type, pair.type);
+      assert.equal(rows[0]?.wait_event, pair.name);
+    });
+  }
+
+  it("reports a null wait-event pair as null rather than a placeholder", async () => {
+    // Both columns are NULL whenever the backend is running rather than
+    // waiting, which is the common case. A COALESCE to 'none' here would
+    // invent a wait event type the caller cannot find in any postgres
+    // version's documentation.
+    installStub([], false, { type: null, name: null });
+    const res = (await pgHealth.handler({})) as HealthResponse;
+    const rows = res.data?.active_queries ?? [];
+    assert.equal(rows[0]?.wait_event_type, null);
+    assert.equal(rows[0]?.wait_event, null);
   });
 
   // ───────────────────────────────────────────────────────────────────────

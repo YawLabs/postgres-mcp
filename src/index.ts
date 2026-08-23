@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
 import { writeSync } from "node:fs";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { isWritesAllowed, shutdown } from "./api.js";
 import { wrapToolHandler } from "./mcp-wrapper.js";
 import { adminTools } from "./tools/admin.js";
 import { explainTools } from "./tools/explain.js";
 import { healthTools } from "./tools/health.js";
+import { indexAdvisorTools } from "./tools/index-advisor.js";
 import { ioTools } from "./tools/io.js";
 import { queryTools } from "./tools/query.js";
 import { schemaTools } from "./tools/schemas.js";
@@ -91,56 +92,100 @@ const allTools = [
   ...queryTools,
   ...schemaTools,
   ...explainTools,
+  ...indexAdvisorTools,
   ...healthTools,
   ...statsTools,
   ...ioTools,
   ...adminTools,
 ];
 
-const server = new McpServer({
-  name: "@yawlabs/postgres-mcp",
-  version,
-});
+/**
+ * Build a fully-registered server instance.
+ *
+ * A FACTORY rather than one long-lived instance, because serveStdio owns the
+ * era decision: it constructs a server only once the opening message reveals
+ * which era the client speaks, and it can call this MORE THAN ONCE for a single
+ * connection -- a modern `server/discover` probe builds an instance
+ * optimistically, and a legacy `initialize` arriving next discards that one and
+ * builds another. So nothing here may carry a side effect that has to happen
+ * exactly once: no banner, no pool warm-up, no counter. Tool registration is
+ * pure in-memory work, and api.ts's pg pool is module-level and lazy, so every
+ * instance this returns shares the one pool however often it runs.
+ */
+function createServer(): McpServer {
+  const server = new McpServer({
+    name: "@yawlabs/postgres-mcp",
+    version,
+  });
 
-// `server.tool()` is deprecated as of SDK 1.30 -- every one of its six
-// overloads carries `@deprecated Use registerTool instead`, and it is gone in
-// the v2 packages. registerTool takes the same information as a config object
-// and is the only form that can carry `outputSchema`, so moving now is what
-// makes structured tool output reachable later without touching this loop
-// again.
-for (const tool of allTools) {
-  server.registerTool(
-    tool.name,
-    {
-      // `title` at the top level is where the current spec puts a tool's
-      // display name; `annotations.title` is the older location. Emit BOTH --
-      // dropping the annotations copy would regress hosts that only read it,
-      // and omitting the top-level one leaves newer hosts showing the raw
-      // `pg_*` name.
-      title: tool.annotations.title,
-      description: tool.description,
-      inputSchema: tool.inputSchema.shape,
-      annotations: tool.annotations,
-    },
-    wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>),
-  );
+  // `server.tool()` was deprecated through SDK 1.x and is GONE in v2.
+  // registerTool takes the same information as a config object and is the only
+  // form that can carry `outputSchema`, which is what makes the structured tool
+  // output wired below reachable at all.
+  for (const tool of allTools) {
+    server.registerTool(
+      tool.name,
+      {
+        // `title` at the top level is where the current spec puts a tool's
+        // display name; `annotations.title` is the older location. Emit BOTH --
+        // dropping the annotations copy would regress hosts that only read it,
+        // and omitting the top-level one leaves newer hosts showing the raw
+        // `pg_*` name.
+        title: tool.annotations.title,
+        description: tool.description,
+        // The zod object itself, NOT `.shape`. v2 still accepts a raw shape,
+        // but only through an overload marked `@deprecated` that auto-wraps it
+        // in `z.object()`; handing the schema over directly skips that wrap and
+        // is the form the v1-to-v2 codemod's raw-shape warning asks for.
+        inputSchema: tool.inputSchema,
+        // Declaring outputSchema is not free: from here on the SDK REJECTS any
+        // successful result whose `structuredContent` fails to parse against it,
+        // so a schema that overstates the response turns a working tool into a
+        // hard failure. mcp-wrapper.ts is what supplies the structuredContent;
+        // tools/output.ts documents the optional-vs-nullable rule the per-tool
+        // schemas follow to stay inside that contract.
+        outputSchema: tool.outputSchema,
+        annotations: tool.annotations,
+      },
+      wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>),
+    );
+  }
+
+  return server;
 }
 
-const transport = new StdioServerTransport();
-// Non-TLA connect: the single-binary build bundles this as CJS via esbuild,
-// which cannot emit top-level await. Keep the post-connect banner inside .then()
-// so it still fires only after the transport is live.
-server
-  .connect(transport)
-  .then(() => {
-    // Startup banner on stderr - stdio MCP protocol uses stdout, so stderr is free for logs.
-    const writesNote = isWritesAllowed() ? "writes ENABLED" : "read-only";
-    console.error(`@yawlabs/postgres-mcp v${version} ready (${allTools.length} tools, ${writesNote})`);
-  })
-  .catch((err: unknown) => {
-    process.stderr.write(`postgres-mcp: ${err instanceof Error ? err.message : String(err)}\n`);
-    process.exit(1);
-  });
+// serveStdio, NOT a hand-wired `new McpServer().connect(new StdioServerTransport())`.
+// The hand-wired form speaks exactly one protocol era -- the 2025 one -- and the
+// 2026-07-28 spec's compatibility matrix makes a modern client against a
+// legacy-only server a hard failure rather than a downgrade. serveStdio reads
+// the opening message, pins the connection to the era the client actually spoke,
+// and serves either one from this single factory (`legacy: 'serve'` is its
+// default). The process-level tests in index.test.ts drive the 2025 handshake,
+// so their staying green is what proves the legacy era still works after the
+// port to v2.
+//
+// It also returns SYNCHRONOUSLY, which is what keeps the single-binary build
+// working: that one is bundled as CJS by esbuild, which cannot emit top-level
+// await, so an awaited connect here would break it. Nothing is lost by having no
+// promise to wait on -- serveStdio starts the transport itself, and `start()`
+// only attaches the stdin/stdout listeners, which it has already done by the
+// time this call returns. The banner below still prints with the transport live.
+serveStdio(createServer, {
+  // Out-of-band errors only. A tool handler's failure never reaches here
+  // (mcp-wrapper.ts shapes those into an isError envelope), and this must NOT
+  // exit the way the old connect().catch() did: serveStdio reports routine
+  // protocol events through this callback too -- a stray response arriving
+  // before an era was negotiated, a client claiming a revision this SDK does not
+  // implement. Exiting on one of those would let a single malformed frame from
+  // one client kill the server.
+  onerror: (err: Error) => {
+    process.stderr.write(`postgres-mcp: ${err.message}\n`);
+  },
+});
+
+// Startup banner on stderr - stdio MCP protocol uses stdout, so stderr is free for logs.
+const writesNote = isWritesAllowed() ? "writes ENABLED" : "read-only";
+console.error(`@yawlabs/postgres-mcp v${version} ready (${allTools.length} tools, ${writesNote})`);
 
 // Clean shutdown: release pool connections when the transport closes.
 // SIGINT, SIGTERM, and stdin 'end' can all fire near-simultaneously (e.g. a

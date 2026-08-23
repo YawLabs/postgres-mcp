@@ -190,7 +190,14 @@ function sandboxFlags() {
   // getApplicationName() in src/api.ts; PGAPPNAME is pg's own env fallback for
   // the same setting (connection-parameters.js: val('application_name', config,
   // 'PGAPPNAME')), so omitting it would drop a name set the driver's way.
-  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGCONNECT_TIMEOUT","PGSSLMODE","POSTGRES_APPLICATION_NAME","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
+  // POSTGRES_AUDIT_LOG_FILE is granted as a VARIABLE here, but the sandbox
+  // still denies the filesystem, so the file sink cannot actually open its
+  // target under POSTGRES_MCP_SANDBOX=1. The audit module fails loudly on an
+  // unopenable sink rather than silently dropping the trail, so the combination
+  // refuses to start -- which is the correct outcome (an audit control that
+  // quietly disables itself is worse than none), but it is a surprising one to
+  // hit at runtime. Use the stderr sink under the sandbox.
+  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGCONNECT_TIMEOUT","PGSSLMODE","POSTGRES_APPLICATION_NAME","POSTGRES_AUDIT_LOG","POSTGRES_AUDIT_LOG_FILE","POSTGRES_AUDIT_REDACT","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
 
   const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];
   return flags;

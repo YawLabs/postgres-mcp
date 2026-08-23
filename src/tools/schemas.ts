@@ -1,6 +1,34 @@
 import { z } from "zod";
 import { getServerVersionNum, PG18, runInternal, withSharedClient } from "../api.js";
+import { rowsOutput, warningsField } from "./output.js";
 import { identSchema } from "./params.js";
+
+/**
+ * Constraint metadata shared by the foreign_keys, referenced_by and
+ * constraints lists in pg_describe_table -- all three select the same
+ * `constraintMetaCols` fragment, so all three carry the same fields.
+ *
+ * `validated` is REQUIRED and the other two are optional, which is not the
+ * split the tool's description advertises: `convalidated` predates the PG18
+ * additions and is selected unconditionally, while only `conenforced` /
+ * `conperiod` are version-gated out. The `_warnings` text the handler emits on
+ * an unknown server version already names just those two, so this matches the
+ * code rather than the prose.
+ */
+const constraintMetaFields = {
+  validated: z.boolean().describe("False for a NOT VALID constraint: existing rows were never checked against it."),
+  enforced: z
+    .boolean()
+    .optional()
+    .describe(
+      "PostgreSQL 18+ only, absent below that. False means the constraint is recorded but " +
+        "enforces nothing -- do not lean on it as a guarantee.",
+    ),
+  has_period: z
+    .boolean()
+    .optional()
+    .describe("PostgreSQL 18+ only, absent below that. True for a temporal (PERIOD / WITHOUT OVERLAPS) key."),
+};
 
 export const schemaTools = [
   {
@@ -16,6 +44,12 @@ export const schemaTools = [
       openWorldHint: true,
     },
     inputSchema: z.object({}),
+    outputSchema: rowsOutput(
+      z.object({
+        schema_name: z.string(),
+        owner: z.string().describe("Role name from pg_get_userbyid; never null, even for a dropped owner oid."),
+      }),
+    ),
     handler: async () => {
       return runInternal<{ schema_name: string; owner: string }>(
         `SELECT
@@ -50,6 +84,26 @@ export const schemaTools = [
       limit: z.number().int().min(1).max(10_000).default(500).describe("Max rows to return (default 500, max 10000)."),
       offset: z.number().int().min(0).default(0).describe("Rows to skip for pagination (default 0)."),
     }),
+    outputSchema: rowsOutput(
+      z.object({
+        name: z.string(),
+        type: z
+          .string()
+          .describe("table | view | materialized_view | foreign_table | partitioned_table, or the raw relkind."),
+        // NULLABLE, despite what the row type on the runInternal call used to
+        // say: the SELECT is `NULLIF(round(reltuples), -1)`, which is exactly
+        // how PG14+ reports "this relation has never been ANALYZEd". Declaring
+        // it non-null here would reject the response for every un-analyzed
+        // table -- the case the description tells the caller to expect.
+        estimated_rows: z
+          .number()
+          .nullable()
+          .describe(
+            "Estimate from reltuples. Null = never ANALYZEd (PG14+); on PG<=13 a never-analyzed " +
+              "table reports 0 instead, indistinguishable from empty.",
+          ),
+      }),
+    ),
     handler: async (input: unknown) => {
       // Zod defaults re-applied for direct (non-MCP) callers, which bypass the
       // schema. Matches the precedent in pg_explain / pg_table_bloat.
@@ -65,7 +119,10 @@ export const schemaTools = [
         offset?: number;
       };
       const kinds = includeViews ? "('r', 'v', 'm', 'f', 'p')" : "('r', 'f', 'p')";
-      return runInternal<{ name: string; type: string; estimated_rows: number }>(
+      // `estimated_rows` is `number | null`, not `number`: the NULLIF below
+      // maps PG14+'s "never analyzed" sentinel (-1) to NULL, which is the case
+      // this tool's own description tells callers to expect.
+      return runInternal<{ name: string; type: string; estimated_rows: number | null }>(
         `SELECT
            c.relname AS name,
            CASE c.relkind
@@ -113,6 +170,98 @@ export const schemaTools = [
     inputSchema: z.object({
       schema: identSchema.default("public").describe("Schema name (defaults to 'public')."),
       table: identSchema.describe("Table name."),
+    }),
+    // The only tool here whose 9-way fanout can partially fail: a sub-query
+    // that errors leaves its list EMPTY and appends to `_warnings`, so every
+    // list below stays a required array. `partition_of` / `partitions` are the
+    // two genuinely conditional keys -- the handler spreads them in only when
+    // the relation actually participates in partitioning.
+    outputSchema: z.object({
+      schema: z.string(),
+      table: z.string(),
+      kind: z
+        .string()
+        .describe(
+          "table | partitioned_table | view | materialized_view | foreign_table, or the raw " +
+            "relkind. Defaults to 'table' with a `_warnings` entry when the kind fetch failed.",
+        ),
+      columns: z.array(
+        z.object({
+          name: z.string(),
+          type: z.string().describe("Formatted type, e.g. `character varying(64)`."),
+          nullable: z.boolean().describe("NOT attnotnull. On PG18+ read alongside `not_null_validated`."),
+          // PG18 made NOT NULL a real (possibly NOT VALID) constraint, so the
+          // column exists only from 18 on and is absent -- not null -- below.
+          not_null_validated: z
+            .boolean()
+            .optional()
+            .describe(
+              "PostgreSQL 18+ only, absent below that. False means a NOT VALID not-null " +
+                "constraint, so `nullable: false` can still hide NULLs.",
+            ),
+          default_value: z.string().nullable().describe("Null for a generated column -- see generation_expression."),
+          generation_expression: z.string().nullable().describe("Null unless `generated` is set."),
+          generated: z
+            .enum(["stored", "virtual"])
+            .nullable()
+            .describe("Non-null means the column is NOT writable; omit it from INSERT/UPDATE column lists."),
+          identity: z
+            .enum(["always", "by_default"])
+            .nullable()
+            .describe("'always' means the column is NOT writable without OVERRIDING SYSTEM VALUE."),
+          ordinal_position: z.number().describe("attnum, so dropped columns leave gaps."),
+        }),
+      ),
+      primary_key: z.array(z.string()).describe("Key columns in declared order; INCLUDE columns are excluded."),
+      foreign_keys: z.array(
+        z.object({
+          constraint_name: z.string(),
+          columns: z.array(z.string()),
+          foreign_table: z.string(),
+          foreign_schema: z.string(),
+          foreign_columns: z.array(z.string()),
+          ...constraintMetaFields,
+        }),
+      ),
+      referenced_by: z
+        .array(
+          z.object({
+            constraint_name: z.string(),
+            schema: z.string(),
+            table: z.string(),
+            columns: z.array(z.string()),
+            referenced_columns: z.array(z.string()),
+            ...constraintMetaFields,
+          }),
+        )
+        .describe("Other tables whose foreign keys point AT this one."),
+      constraints: z
+        .array(
+          z.object({
+            name: z.string(),
+            type: z.string().describe("check | unique | exclude, or the raw contype."),
+            definition: z.string(),
+            ...constraintMetaFields,
+          }),
+        )
+        .describe("CHECK / non-PK UNIQUE / EXCLUDE only; PK and FK have their own lists."),
+      indexes: z.array(
+        z.object({
+          name: z.string(),
+          definition: z.string(),
+          is_unique: z.boolean(),
+          is_primary: z.boolean(),
+        }),
+      ),
+      partition_of: z
+        .object({ schema: z.string(), table: z.string() })
+        .optional()
+        .describe("Present only when this relation is itself a partition."),
+      partitions: z
+        .array(z.object({ schema: z.string(), table: z.string(), bound: z.string() }))
+        .optional()
+        .describe("Present only when this relation is a partitioned parent WITH children."),
+      _warnings: warningsField,
     }),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_list_tables above.
@@ -471,6 +620,15 @@ export const schemaTools = [
       schema: identSchema.default("public").describe("Schema name (defaults to 'public')."),
       includeMaterialized: z.boolean().default(true).describe("If true, include materialized views."),
     }),
+    outputSchema: rowsOutput(
+      z.object({
+        name: z.string(),
+        // The CASE has no ELSE, but the relkind filter admits only 'v' and 'm',
+        // so it can never fall through to NULL.
+        type: z.enum(["view", "materialized_view"]),
+        definition: z.string().describe("Reconstructed view body from pg_get_viewdef."),
+      }),
+    ),
     handler: async (input: unknown) => {
       // Zod defaults re-applied for direct callers -- see pg_list_tables above.
       const { schema = "public", includeMaterialized = true } = input as {
@@ -508,13 +666,28 @@ export const schemaTools = [
     inputSchema: z.object({
       schema: identSchema.default("public").describe("Schema name (defaults to 'public')."),
     }),
+    outputSchema: rowsOutput(
+      z.object({
+        name: z.string(),
+        arguments: z.string().describe("Reconstructed argument list; empty string for a zero-argument routine."),
+        // NULLABLE: pg_get_function_result returns NULL for a PROCEDURE (it has
+        // no RETURNS clause to reconstruct), and this tool deliberately lists
+        // procedures alongside functions. A non-null declaration here would
+        // reject the whole response for any schema containing one procedure.
+        return_type: z.string().nullable().describe("Null for procedures, which have no return type."),
+        kind: z.string().describe("function | procedure | aggregate | window, or the raw prokind."),
+        language: z.string(),
+      }),
+    ),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_list_tables above.
       const { schema = "public" } = input as { schema?: string };
+      // `return_type` is `string | null`: pg_get_function_result yields NULL for
+      // a procedure, and prokind 'p' is one of the kinds this query returns.
       return runInternal<{
         name: string;
         arguments: string;
-        return_type: string;
+        return_type: string | null;
         kind: string;
         language: string;
       }>(
@@ -554,6 +727,15 @@ export const schemaTools = [
       openWorldHint: true,
     },
     inputSchema: z.object({}),
+    outputSchema: rowsOutput(
+      z.object({
+        name: z.string(),
+        version: z.string().describe("Installed extversion, e.g. `1.11` -- not the postgres version."),
+        schema: z.string(),
+        // LEFT JOIN on pg_description: an extension with no comment yields NULL.
+        description: z.string().nullable(),
+      }),
+    ),
     handler: async () => {
       return runInternal<{ name: string; version: string; schema: string; description: string | null }>(
         `SELECT
@@ -587,6 +769,15 @@ export const schemaTools = [
       schema: identSchema.optional().describe("Limit to this schema. If omitted, searches all user schemas."),
       limit: z.number().int().min(1).max(1000).default(100).describe("Max rows to return (default 100)."),
     }),
+    outputSchema: rowsOutput(
+      z.object({
+        schema: z.string(),
+        table: z.string().describe("Relation name; may be a view or materialized view, not only a table."),
+        column: z.string(),
+        type: z.string().describe("Formatted type from format_type."),
+        nullable: z.boolean(),
+      }),
+    ),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_list_tables above.
       const { pattern, schema, limit = 100 } = input as { pattern: string; schema?: string; limit?: number };

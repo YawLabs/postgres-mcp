@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { withSharedClient } from "../api.js";
+import { warningsField } from "./output.js";
 
 export const healthTools = [
   {
@@ -23,7 +24,11 @@ export const healthTools = [
       "means nothing without the cap; read `used_fraction` first.\n" +
       "- active_queries: `pid`, `state`, `query`, `application_name`, `backend_type`, " +
       "`wait_event_type` / `wait_event` (both NULL when the backend is running rather than " +
-      "waiting -- the single most diagnostic pair in pg_stat_activity), `duration_seconds` " +
+      "waiting -- the single most diagnostic pair in pg_stat_activity). Both are reported " +
+      "verbatim as the server spells them, and that spelling changes between majors: a backend " +
+      "waiting on a buffer pin reports `wait_event_type` 'BufferPin' through PostgreSQL 18 and " +
+      "'Buffer' from 19 on, with the `wait_event` names beneath it changing to match. Read them " +
+      "against the reported `version` rather than hard-coding a literal. `duration_seconds` " +
       "(since query_start) and `transaction_age_seconds` (since xact_start). A large " +
       "transaction_age_seconds next to a small duration_seconds is a long-open transaction, the " +
       "usual root cause behind lock waits, bloat, and stalled autovacuum.\n" +
@@ -49,6 +54,112 @@ export const healthTools = [
         .default(10)
         .describe("Max active queries to return (default 10, max 100)."),
     }),
+    // Three distinct "no value" states show up below and they are not
+    // interchangeable, so the schema keeps them apart:
+    //   - null      -> the sub-query FAILED (permission-gated view); the reason
+    //                  is in `_warnings`.
+    //   - key absent-> the sub-query SUCCEEDED but returned no row, so the
+    //                  handler's `?.[0]` yielded undefined and JSON dropped the
+    //                  key. Only `database`, `connections`, `version` and
+    //                  `table_count` can reach this state.
+    //   - a value   -> a real measurement.
+    // `database_stats` is the one single-row lookup that cannot go absent: the
+    // handler pins it with `?? null` because pg_stat_database legitimately has
+    // no row for a database the role cannot see.
+    outputSchema: z.object({
+      connected: z.boolean().describe("Always true on a success response -- the version probe answered."),
+      version: z
+        .string()
+        .optional()
+        .describe("Full `version()` banner. Absent (with a `_warnings` entry) if the row came back without it."),
+      database: z
+        .object({
+          database: z.string(),
+          size_pretty: z.string(),
+          size_bytes: z.string().describe("Bigint as a decimal string -- past 2^53 a JS number would lose digits."),
+        })
+        .nullable()
+        .optional(),
+      connections: z
+        .object({
+          total: z.string().describe("Sessions in the CURRENT database. The six state buckets below sum to this."),
+          active: z.string(),
+          idle: z.string(),
+          idle_in_transaction: z.string(),
+          idle_in_transaction_aborted: z
+            .string()
+            .describe("Holds locks and blocks vacuum while doing no work, and can never commit."),
+          other: z.string().describe("Catch-all: starting, fastpath function call, disabled, plus any future state."),
+          state_unavailable: z
+            .string()
+            .describe(
+              "Sessions whose `state` read NULL for lack of pg_read_all_stats / pg_monitor. Non-zero " +
+                "means every other bucket is under-counted -- do NOT read `active: 0` beside it as an idle database.",
+            ),
+          cluster_client_backends: z
+            .string()
+            .describe("Client backends across ALL databases -- the ones that actually consume connection slots."),
+          max_connections: z.number(),
+          superuser_reserved_connections: z.number(),
+          used_fraction: z
+            .number()
+            .nullable()
+            .describe("cluster_client_backends / max_connections. Null only if max_connections read as 0."),
+        })
+        .nullable()
+        .optional(),
+      active_queries: z
+        .array(
+          z.object({
+            pid: z.number(),
+            state: z.string().nullable(),
+            duration_seconds: z.number().nullable().describe("Since query_start."),
+            transaction_age_seconds: z
+              .number()
+              .nullable()
+              .describe(
+                "Since xact_start; null outside a transaction block. Large here beside a small " +
+                  "duration_seconds is a long-open transaction.",
+              ),
+            xact_start: z.string().nullable(),
+            wait_event_type: z
+              .string()
+              .nullable()
+              .describe(
+                "Null when the backend is RUNNING rather than waiting. Spelling changes between " +
+                  "majors ('BufferPin' through PG18, 'Buffer' from 19) -- read it against `version`.",
+              ),
+            wait_event: z.string().nullable(),
+            backend_type: z.string(),
+            query: z.string(),
+            application_name: z.string(),
+          }),
+        )
+        .describe("Empty array both when nothing is running and when the fetch failed -- check `_warnings`."),
+      database_stats: z
+        .object({
+          deadlocks: z.string(),
+          temp_files: z.string(),
+          temp_bytes: z.string(),
+          temp_bytes_pretty: z.string(),
+          conflicts: z.string().describe("Recovery conflicts; only ever non-zero on a replica."),
+          blks_hit: z.string(),
+          blks_read: z.string(),
+          cache_hit_ratio: z.number().nullable().describe("Null on a freshly reset database (both counters 0)."),
+          stats_reset: z
+            .string()
+            .nullable()
+            .describe("Every counter here is cumulative SINCE this timestamp. Null = never reset."),
+        })
+        .nullable()
+        .describe("Null when pg_stat_database is unreadable OR has no row for this database."),
+      table_count: z
+        .string()
+        .nullable()
+        .optional()
+        .describe("User tables and partitioned tables, as a decimal string."),
+      _warnings: warningsField,
+    }),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct (non-MCP) callers, which bypass the
       // schema -- an omitted activeQueryLimit would otherwise bind undefined
@@ -61,6 +172,10 @@ export const healthTools = [
       // integration matrix): wait_event_type / wait_event landed in 9.6,
       // backend_type in 10, and every pg_stat_database column used here
       // predates 9.6 -- so this handler needs no server-version gate.
+      //
+      // PG19 renames no column this handler reads either. The one vocabulary
+      // it DOES change is the wait-event pair, and that is passed through
+      // rather than matched on -- see the active-queries query below.
       return withSharedClient(async (run) => {
         const [versionRes, sizeRes, connsRes, activeRes, dbStatsRes, tableCountRes] = await Promise.all([
           run<{ version: string }>(`SELECT version() AS version`),
@@ -164,11 +279,21 @@ export const healthTools = [
             // query text. Both are NULL when the backend is actually running.
             //
             // The values are passed straight through, never filtered or
-            // switched on: postgres renames these literals between majors
-            // (PG19 renames the `BUFFERPIN` wait event type to `BUFFER`), so
-            // any `WHERE wait_event_type = '...'` or CASE over them here would
-            // silently stop matching on a newer server. Interpretation belongs
-            // to the caller, which can see the server version.
+            // switched on: postgres renames these literals between majors, so
+            // a `WHERE wait_event_type = '...'` or a CASE over them here would
+            // silently match nothing on a newer server -- rendering a database
+            // stalled on that exact wait as one with nothing waiting at all.
+            // PG19 is the live case: the type a buffer-pin wait reports is
+            // 'BufferPin' through PG18 and 'Buffer' from PG19 on, and the
+            // wait_event names beneath it change with it ('BufferPin' becomes
+            // BufferCleanup / BufferExclusive / BufferShared /
+            // BufferShareExclusive). Note the PG19 release note spells that
+            // rename `BUFFERPIN` -> `BUFFER`: those are the internal C enum
+            // names, NOT what pg_stat_activity emits, so a filter written from
+            // the release note would match nothing on ANY version.
+            // Interpretation belongs to the caller, which can see the server
+            // version. health.test.ts pins this passthrough, so adding a
+            // predicate or a CASE here fails a test rather than shipping.
             //
             // transaction_age_seconds comes from xact_start, not query_start:
             // a backend that has been idle-in-transaction for an hour shows a

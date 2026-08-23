@@ -226,6 +226,160 @@ describe("CLI: MCP stdio handshake with no args", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// Dual-era coverage.
+//
+// The 2026-07-28 spec's compatibility matrix makes "modern client against a
+// legacy server" a hard failure, not a downgrade -- and a server hand-wired as
+// `new McpServer().connect(new StdioServerTransport())` is legacy-only however
+// new the SDK it is built against. index.ts avoids that by serving both eras
+// from one factory through `serveStdio`, and NOTHING in the type system tells
+// the two wirings apart: the difference is visible only over the actual
+// protocol. So the 2025-era handshake above and the 2026-era one here are a
+// pair -- a regression to a single-era wiring breaks exactly one of them, and
+// keeping only the older test would let the modern half rot silently.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * The `_meta` envelope every 2026-07-28 request carries. There is no
+ * `initialize` in the modern era -- the opening message declares its own era
+ * inline, and that is what `serveStdio` pins the connection to.
+ *
+ * BOTH keys are required by the envelope validator. Dropping either one gets
+ * the request answered with -32602 before it reaches any handler, which would
+ * look exactly like the legacy-only rejection these tests exist to catch -- so
+ * a failure here means "read the envelope" before it means "the port broke".
+ */
+const MODERN_ENVELOPE = {
+  _meta: {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {},
+  },
+} as const;
+
+/** Start the emitted entrypoint with a syntactically valid DSN and nothing else. */
+function spawnServer(): ChildProcessWithoutNullStreams {
+  return spawn(process.execPath, [ENTRY], {
+    env: { ...process.env, DATABASE_URL: "postgres://stub-host/stubdb" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
+interface ToolsListResponse {
+  error?: { code: number; message: string };
+  result?: { tools?: { name: string; title?: string; annotations?: { title?: string } }[] };
+}
+
+describe("CLI: MCP stdio handshake with a 2026-07-28 client", () => {
+  it("serves tools/list to a modern client with no initialize at all", async () => {
+    const child = spawnServer();
+    try {
+      await waitForBanner(child);
+      const listed = (await rpc(child, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: { ...MODERN_ENVELOPE },
+      })) as ToolsListResponse;
+
+      // A legacy-only server answers this with an unsupported-protocol-version
+      // error instead of a tool list, so the ABSENCE of `error` is the dual-era
+      // assertion. The error body is reported because its code tells "wired to
+      // one era" apart from "the envelope above is malformed".
+      assert.equal(listed.error, undefined, `modern tools/list was rejected: ${JSON.stringify(listed.error)}`);
+
+      const tools = listed.result?.tools ?? [];
+      assert.ok(tools.length >= 15, `expected the full tool set, got ${tools.length}`);
+      assert.ok(
+        tools.every((t) => t.name.startsWith("pg_")),
+        `every tool name should be pg_-prefixed: ${JSON.stringify(tools.map((t) => t.name))}`,
+      );
+      // ONE factory registers the tools for both eras, so the display-name
+      // wiring has to survive here too. Asserting it only on the legacy path
+      // would still pass if a refactor registered the full set on one era and a
+      // stub on the other.
+      for (const tool of tools) {
+        assert.equal(typeof tool.title, "string", `${tool.name} advertised no top-level title`);
+        assert.equal(tool.title, tool.annotations?.title, `${tool.name}: title and annotations.title disagree`);
+      }
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("answers server/discover, which only a modern-capable server can", async () => {
+    // `server/discover` exists ONLY in the 2026 era: a legacy-only server has
+    // no handler for it. This is the narrowest single frame that separates the
+    // two wirings, so it fails loudly the moment someone "simplifies"
+    // serveStdio back into connect(new StdioServerTransport()).
+    const child = spawnServer();
+    try {
+      await waitForBanner(child);
+      const discovered = (await rpc(child, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "server/discover",
+        params: { ...MODERN_ENVELOPE },
+      })) as { error?: { code: number }; result?: { supportedVersions?: unknown } };
+
+      assert.equal(discovered.error, undefined, `server/discover was rejected: ${JSON.stringify(discovered.error)}`);
+      assert.ok(discovered.result?.supportedVersions, "server/discover answered without supportedVersions");
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+});
+
+describe("CLI: tools/call for a tool that does not exist", () => {
+  // A BEHAVIORAL BREAK in SDK v2, pinned here because nothing else would catch
+  // it. v1 RESOLVED an unknown or disabled tool call as an ordinary result
+  // carrying `isError: true`; v2 REJECTS it as a JSON-RPC error with
+  // ProtocolErrorCode.InvalidParams (-32602). mcp-wrapper.ts is not on this
+  // path at all -- dispatch fails before any handler runs -- so its own tests
+  // cannot see the change, and a caller that treated a missing tool as a soft
+  // error would silently start receiving a protocol-level rejection.
+  for (const era of ["legacy", "modern"] as const) {
+    it(`rejects with -32602 rather than an isError envelope (${era} era)`, async () => {
+      const child = spawnServer();
+      try {
+        await waitForBanner(child);
+        if (era === "legacy") {
+          await rpc(child, {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              clientInfo: { name: "coverage-test", version: "0" },
+            },
+          });
+          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+        }
+
+        const called = (await rpc(child, {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "pg_definitely_not_a_tool",
+            arguments: {},
+            ...(era === "modern" ? MODERN_ENVELOPE : {}),
+          },
+        })) as { error?: { code: number; message: string }; result?: { isError?: boolean } };
+
+        assert.equal(called.result, undefined, "an unknown tool must not resolve to a result envelope");
+        assert.equal(called.error?.code, -32602, `expected -32602, got ${JSON.stringify(called.error)}`);
+        // The tool name has to reach the message: a bare "Invalid params"
+        // leaves a host unable to tell a missing tool from a bad argument.
+        assert.match(called.error?.message ?? "", /pg_definitely_not_a_tool/);
+      } finally {
+        child.kill("SIGKILL");
+      }
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // bin/postgres-mcp.mjs -- the runtime launcher (oam preferred, node fallback).
 //
 // The launcher is what package.json `bin` points at, so it is the entrypoint
