@@ -11,6 +11,23 @@ Built and maintained by [Yaw Labs](https://yaw.sh).
 
 One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
+## What's new in 0.11.0
+
+PostgreSQL 18 support, a new I/O observability tool, and version-gated catalog queries. Full detail in the [CHANGELOG](CHANGELOG.md).
+
+**Three breaking changes if you are upgrading from 0.10.x:**
+
+1. **`pg_seq_scan_tables`, `pg_unused_indexes` and `pg_top_queries` return an envelope, not a bare row array.** Read `data.rows` where you used to read `data`. The envelope carries `stats_reset`, because a cumulative scan count means nothing without knowing when the counters were last reset -- if that happened an hour ago, every index looks unused, which is how a load-bearing index gets dropped.
+2. **`pg_explain` with `analyze: true` now emits `BUFFERS`**, matching what PostgreSQL 18 does server-side. Plans get longer; pass `buffers: false` for the old output.
+3. **Node 22 is the floor.** Node 20 reached end of life.
+
+**Worth knowing even if you are not upgrading yet:**
+
+- `pg_describe_table` now flags generated and identity columns. Previously a generated column's expression surfaced as `default_value` with nothing marking it, so an agent read the column as optional-with-a-default and wrote an `INSERT` that PostgreSQL rejects.
+- New `pg_io_stats` exposes `pg_stat_io` (PG16+) plus in-flight async I/O from `pg_aios` and the active `io_method` (PG18+).
+- `pg_advisor` checks multixact wraparound alongside transaction-ID wraparound. A lock-heavy workload can exhaust multixacts while `relfrozenxid` still looks healthy.
+- Every version-dependent column is gated on `server_version_num`, so older servers get a thinner answer rather than an error.
+
 ## Backstory
 
 Anthropic's reference Postgres MCP server, `@modelcontextprotocol/server-postgres`, was [archived in May 2025](https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres) and [marked deprecated on npm](https://www.npmjs.com/package/@modelcontextprotocol/server-postgres) in July 2025. Anthropic has not shipped a replacement. Despite the deprecation, the last published version (v0.6.2) is still pulled ~20,000 times per week - a lot of agents are pointed at an unmaintained package.
