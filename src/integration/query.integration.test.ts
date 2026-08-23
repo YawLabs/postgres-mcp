@@ -7,7 +7,8 @@
 
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { runInternal, shutdown } from "../api.js";
+import pg from "pg";
+import { getApplicationName, runInternal, shutdown } from "../api.js";
 import { explainTools } from "../tools/explain.js";
 import { healthTools } from "../tools/health.js";
 import { queryTools } from "../tools/query.js";
@@ -823,6 +824,98 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
   });
 
   describe("pg_health", () => {
+    // Row shapes of the health snapshot sections the cases below read.
+    // Named once rather than re-cast per test: with an inline cast, a field
+    // name that drifts in health.ts stops being a type error and becomes an
+    // `undefined` that every assertion happily passes.
+    type HealthConnections = {
+      total: string;
+      active: string;
+      idle: string;
+      idle_in_transaction: string;
+      idle_in_transaction_aborted: string;
+      other: string;
+      state_unavailable: string;
+      cluster_client_backends: string;
+      max_connections: number;
+      superuser_reserved_connections: number;
+      used_fraction: number | null;
+    };
+
+    type HealthActiveQuery = {
+      pid: number;
+      state: string | null;
+      duration_seconds: number | null;
+      transaction_age_seconds: number | null;
+      xact_start: string | null;
+      wait_event_type: string | null;
+      wait_event: string | null;
+      backend_type: string;
+      query: string;
+      application_name: string;
+    };
+
+    type HealthDatabaseStats = {
+      deadlocks: string;
+      temp_files: string;
+      temp_bytes: string;
+      temp_bytes_pretty: string;
+      conflicts: string;
+      blks_hit: string;
+      blks_read: string;
+      cache_hit_ratio: number | null;
+      stats_reset: string | null;
+    };
+
+    // The six state buckets health.ts documents as summing to `total`.
+    const STATE_BUCKETS = [
+      "active",
+      "idle",
+      "idle_in_transaction",
+      "idle_in_transaction_aborted",
+      "other",
+      "state_unavailable",
+    ] as const;
+
+    async function readConnections(): Promise<HealthConnections> {
+      const res = (await pgHealth.handler({ activeQueryLimit: 10 })) as {
+        ok: boolean;
+        data?: { connections: HealthConnections | null; _warnings?: string[] };
+      };
+      assert.equal(res.ok, true);
+      const conns = res.data?.connections;
+      assert.ok(conns, `connections must be present; _warnings: ${JSON.stringify(res.data?._warnings ?? [])}`);
+      return conns;
+    }
+
+    function sumBuckets(conns: HealthConnections): number {
+      return STATE_BUCKETS.reduce((acc, key) => acc + Number(conns[key]), 0);
+    }
+
+    /**
+     * Parks a SECOND connection in `idle in transaction (aborted)` for the
+     * duration of `fn`: BEGIN, a statement postgres rejects, then leave the
+     * block open. That state cannot be produced by the pool's own connections
+     * (they are idle or active between tool calls), and it is the one the
+     * snapshot singles out -- it holds locks and blocks vacuum while doing no
+     * work and can never commit. The backend reports the new state before the
+     * rejected query's promise settles, so no polling is needed here.
+     */
+    async function withAbortedTransaction<T>(fn: (pid: number) => Promise<T>): Promise<T> {
+      const side = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await side.connect();
+      try {
+        const pid = (await side.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+        await side.query("BEGIN");
+        // 42P01 undefined_table -- deliberately fatal to the transaction block.
+        await side.query("SELECT 1 FROM pg_catalog.no_such_relation_health_probe").catch(() => {});
+        return await fn(pid);
+      } finally {
+        await side.query("ROLLBACK").catch(() => {});
+        await side.end().catch(() => {});
+      }
+    }
+
     it("returns connected=true with a version string and database info", async () => {
       const res = (await pgHealth.handler({ activeQueryLimit: 10 })) as {
         ok: boolean;
@@ -851,6 +944,226 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       // May be 0 if no concurrent activity; must be <= 1.
       assert.ok((res.data?.active_queries ?? []).length <= 1);
     });
+
+    // The six buckets are documented to RECONCILE, and that sum is the only
+    // thing that makes an under-count detectable: a role without
+    // pg_read_all_stats reads NULL for every state, and without
+    // state_unavailable inside the sum the snapshot reports a confident
+    // `active: 0` for a busy database. A state literal renamed by a new major,
+    // or one dropped out of `other`'s NOT IN list, breaks the arithmetic here
+    // instead of silently vanishing from the snapshot.
+    it("connection buckets reconcile: the six states sum to total", async () => {
+      const conns = await readConnections();
+      for (const key of STATE_BUCKETS) {
+        assert.match(
+          conns[key],
+          /^\d+$/,
+          `${key} must arrive as a bigint ::text counter, got ${JSON.stringify(conns[key])}`,
+        );
+      }
+      assert.match(
+        conns.total,
+        /^\d+$/,
+        `total must arrive as a bigint ::text counter, got ${JSON.stringify(conns.total)}`,
+      );
+      assert.equal(sumBuckets(conns), Number(conns.total), `buckets must sum to total: ${JSON.stringify(conns)}`);
+      // This session is itself a row in the current database, so an empty
+      // count is never a legitimate answer.
+      assert.ok(Number(conns.total) >= 1, `total must count at least this session, got ${conns.total}`);
+    });
+
+    // A raw connection count means nothing without the cap. used_fraction
+    // divides by `backend_type = 'client backend'` rather than count(*) so
+    // autovacuum workers, walsenders and the checkpointer -- which draw on
+    // their own process limits -- cannot push it past 1.0 on an idle server;
+    // the cross-check against cluster_client_backends is what catches a revert
+    // to count(*), which no range assertion alone would notice.
+    it("reports a positive integer max_connections and a used_fraction within 0..1", async () => {
+      const conns = await readConnections();
+      assert.ok(
+        Number.isInteger(conns.max_connections) && conns.max_connections > 0,
+        `max_connections must be a positive integer, got ${JSON.stringify(conns.max_connections)}`,
+      );
+      const reserved = conns.superuser_reserved_connections;
+      assert.ok(
+        Number.isInteger(reserved) && reserved >= 0,
+        `superuser_reserved_connections must be a non-negative integer, got ${JSON.stringify(reserved)}`,
+      );
+      // NULLIF only nulls this when max_connections is 0, which postgres does
+      // not permit -- so a null here means the division changed, not that the
+      // server is unusual.
+      assert.equal(typeof conns.used_fraction, "number", `used_fraction must be a number, got ${conns.used_fraction}`);
+      const fraction = conns.used_fraction ?? Number.NaN;
+      assert.ok(fraction >= 0 && fraction <= 1, `used_fraction must be within 0..1, got ${fraction}`);
+      // Same aggregate, same snapshot -- exact arithmetic, not a race. The
+      // numeric(6, 4) cast is the only slack.
+      const expected = Number(conns.cluster_client_backends) / conns.max_connections;
+      assert.ok(
+        Math.abs(fraction - expected) < 1e-4,
+        `used_fraction ${fraction} must equal cluster_client_backends/max_connections (${expected})`,
+      );
+    });
+
+    // `idle in transaction (aborted)` earns its own bucket because it is
+    // diagnostically distinct -- locks held, vacuum blocked, no work done, no
+    // possible commit. Matching it with a prefix/LIKE instead of the exact
+    // equality health.ts uses would fold it into idle_in_transaction and hide
+    // exactly the session an operator is hunting.
+    it("parks an aborted transaction in its own bucket, not idle_in_transaction", async () => {
+      const baseline = await readConnections();
+      await withAbortedTransaction(async () => {
+        const parked = await readConnections();
+        assert.equal(
+          Number(parked.idle_in_transaction_aborted),
+          Number(baseline.idle_in_transaction_aborted) + 1,
+          `the parked backend must land in idle_in_transaction_aborted (baseline=${baseline.idle_in_transaction_aborted}, parked=${parked.idle_in_transaction_aborted})`,
+        );
+        assert.equal(
+          Number(parked.idle_in_transaction),
+          Number(baseline.idle_in_transaction),
+          `an aborted transaction must NOT be counted as idle_in_transaction (baseline=${baseline.idle_in_transaction}, parked=${parked.idle_in_transaction})`,
+        );
+        // The invariant has to survive the state most likely to break it.
+        assert.equal(
+          sumBuckets(parked),
+          Number(parked.total),
+          `buckets must still sum to total with an aborted session present: ${JSON.stringify(parked)}`,
+        );
+      });
+    });
+
+    // wait_event_type / wait_event are the diagnostic pair, and NULL is a
+    // legitimate value on both ("running, not waiting") -- so this asserts key
+    // PRESENCE and type, never non-null. A truthiness check would pass just as
+    // happily against a handler that dropped both columns from the SELECT.
+    it("active_queries rows carry the wait-event pair, backend_type and transaction_age_seconds", async () => {
+      await withAbortedTransaction(async (parkedPid) => {
+        // 100 rather than the default 10: the parked backend sorts last under
+        // `ORDER BY query_start ASC` and a busy cluster could crowd it out.
+        const res = (await pgHealth.handler({ activeQueryLimit: 100 })) as {
+          ok: boolean;
+          data?: { active_queries: HealthActiveQuery[] };
+        };
+        assert.equal(res.ok, true);
+        const rows = res.data?.active_queries ?? [];
+        const row = rows.find((r) => r.pid === parkedPid);
+        assert.ok(
+          row,
+          `expected parked backend ${parkedPid} in active_queries; got pids ${JSON.stringify(rows.map((r) => r.pid))}`,
+        );
+        assert.equal(row.state, "idle in transaction (aborted)");
+        assert.equal(row.backend_type, "client backend");
+        assert.ok(
+          "wait_event_type" in row,
+          `wait_event_type key must be present, got keys: ${Object.keys(row).join(", ")}`,
+        );
+        assert.ok("wait_event" in row, `wait_event key must be present, got keys: ${Object.keys(row).join(", ")}`);
+        if (row.wait_event_type !== null) assert.equal(typeof row.wait_event_type, "string");
+        if (row.wait_event !== null) assert.equal(typeof row.wait_event, "string");
+        // The backend sits inside a transaction block, so xact_start is set and
+        // the age derived from it must be a real number. A large
+        // transaction_age_seconds next to a small duration_seconds is the tell
+        // for the long-open transaction behind most lock waits and stalled
+        // autovacuum, so this field going null here is a real regression.
+        assert.ok(row.xact_start, `parked backend must report xact_start, got ${JSON.stringify(row.xact_start)}`);
+        assert.equal(typeof row.transaction_age_seconds, "number");
+        assert.ok(
+          (row.transaction_age_seconds ?? -1) >= 0,
+          `transaction_age_seconds must be non-negative, got ${row.transaction_age_seconds}`,
+        );
+      });
+    });
+
+    // Every counter in this rollup is a bigint carried as ::text on purpose:
+    // node-pg would hand back a JS number that silently loses precision past
+    // 2^53 on a long-lived cluster's temp_bytes. Asserting the digit-string
+    // form is what catches a revert to the raw bigint, which would arrive here
+    // as a number and fail the regex rather than pass a loose typeof check.
+    it("database_stats returns the pg_stat_database rollup with lossless counters", async () => {
+      const res = (await pgHealth.handler({ activeQueryLimit: 10 })) as {
+        ok: boolean;
+        data?: { database_stats: HealthDatabaseStats | null; _warnings?: string[] };
+      };
+      assert.equal(res.ok, true);
+      const stats = res.data?.database_stats;
+      assert.ok(stats, `database_stats must be present; _warnings: ${JSON.stringify(res.data?._warnings ?? [])}`);
+      for (const key of ["deadlocks", "temp_files", "temp_bytes", "conflicts", "blks_hit", "blks_read"] as const) {
+        assert.match(
+          stats[key],
+          /^\d+$/,
+          `${key} must arrive as a non-negative bigint ::text counter, got ${JSON.stringify(stats[key])}`,
+        );
+      }
+      assert.equal(typeof stats.temp_bytes_pretty, "string");
+      // Null only on a database whose stats were just reset -- NULLIF guards
+      // blks_hit + blks_read = 0, which is division by zero and not a 0% hit
+      // rate. When present it is a FRACTION of 1: the handler divides in
+      // numeric and never scales to a percentage.
+      if (stats.cache_hit_ratio !== null) {
+        assert.equal(typeof stats.cache_hit_ratio, "number");
+        assert.ok(
+          stats.cache_hit_ratio >= 0 && stats.cache_hit_ratio <= 1,
+          `cache_hit_ratio is a fraction of 1, not a percentage; got ${stats.cache_hit_ratio}`,
+        );
+      }
+      // Cumulative counters are uninterpretable without their start point, so
+      // stats_reset ships alongside them: a timestamp string, or null for
+      // "never reset / start point unknown" -- never undefined.
+      assert.ok(
+        stats.stats_reset === null || typeof stats.stats_reset === "string",
+        `stats_reset must be a string or null, got ${JSON.stringify(stats.stats_reset)}`,
+      );
+    });
+  });
+
+  // The pool sets application_name so agent traffic is attributable to this
+  // server in pg_stat_activity -- pg_health reports application_name for every
+  // OTHER session, so the server's own showing up blank was the gap. Nothing
+  // below the pool constructor can prove the option survives the trip to the
+  // server: a unit test can only show getApplicationName() returns a string,
+  // and a typo'd pg.Pool option key is silently ignored by node-pg.
+  describe("pool application_name", () => {
+    // An application_name inside DATABASE_URL WINS over the pool option --
+    // pg's ConnectionParameters does Object.assign({}, config, parse(dsn)), so
+    // parsed DSN keys override explicit config. Read it here so the expected
+    // value tracks whatever DSN the matrix runs against.
+    const dsnAppName = /[?&]application_name=([^&]*)/.exec(process.env.DATABASE_URL ?? "")?.[1];
+
+    it("reaches the server: pg_stat_activity reports it for the pool's own backend", async () => {
+      const expected = dsnAppName === undefined ? getApplicationName() : decodeURIComponent(dsnAppName);
+      const res = await runInternal<{ application_name: string }>(
+        `SELECT application_name FROM pg_stat_activity WHERE pid = pg_backend_pid()`,
+      );
+      assert.equal(res.ok, true, `application_name probe failed: ${res.error}`);
+      assert.equal(res.data?.[0]?.application_name, expected);
+    });
+
+    // POSTGRES_APPLICATION_NAME is snapshotted when the pool is CONSTRUCTED,
+    // so the override only lands across a shutdown(). That is also the
+    // regression this pins: re-reading the env per query would make an
+    // override test pass while the shipped stdio server -- whose environment
+    // is fixed at spawn by the MCP host -- behaves differently.
+    it("honors POSTGRES_APPLICATION_NAME across a pool rebuild", async () => {
+      // A DSN application_name outranks the env by design, so there is nothing
+      // to assert on such a matrix leg.
+      if (dsnAppName !== undefined) return;
+      const original = process.env.POSTGRES_APPLICATION_NAME;
+      process.env.POSTGRES_APPLICATION_NAME = "postgres-mcp-appname-probe";
+      try {
+        await shutdown();
+        const res = await runInternal<{ application_name: string }>(
+          `SELECT application_name FROM pg_stat_activity WHERE pid = pg_backend_pid()`,
+        );
+        assert.equal(res.ok, true, `application_name probe failed: ${res.error}`);
+        assert.equal(res.data?.[0]?.application_name, "postgres-mcp-appname-probe");
+      } finally {
+        if (original === undefined) delete process.env.POSTGRES_APPLICATION_NAME;
+        else process.env.POSTGRES_APPLICATION_NAME = original;
+        // Rebuild on the default so neither the rest of this file nor the next
+        // file in this process runs under the probe name.
+        await shutdown();
+      }
+    });
   });
 
   describe("pg_top_queries", () => {
@@ -864,28 +1177,65 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       // extension is actually present first.
       const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as {
         ok: boolean;
-        data?: { query: string; calls: string }[];
+        data?: { rows: { query: string; calls: string }[] };
         error?: string;
       };
       if (!res.ok) {
         assert.match(res.error ?? "", /pg_stat_statements/);
         return;
       }
-      assert.ok(Array.isArray(res.data));
+      // The success shape is the {rows, stats_reset, ...} stats-window envelope,
+      // not a bare row array -- `data` itself is never an array.
+      assert.ok(Array.isArray(res.data?.rows), `expected data.rows array, got ${JSON.stringify(res.data)}`);
       // The fixture setup ran a handful of queries - there should be at least one row.
-      assert.ok((res.data ?? []).length > 0);
-      assert.ok(res.data?.[0].query);
+      assert.ok((res.data?.rows ?? []).length > 0);
+      assert.ok(res.data?.rows[0].query);
     });
 
-    it("supports all three orderBy values without error", async () => {
+    // Falsifiable version of what used to assert only inside `if (!res.ok)`:
+    // on an installed extension the old test ran three handler calls and
+    // checked nothing at all. The ordering itself is the claim worth pinning,
+    // because the handler has to dodge an alias-shadowing trap -- the SELECT
+    // aliases `calls::text AS calls`, and postgres resolves a bare `ORDER BY
+    // calls` to that TEXT alias first, which sorts "9" above "10".
+    it("ranks DESC by the requested orderBy column (total_time / mean_time / calls)", async () => {
+      type TopQueryRow = { query: string; calls: string; total_time_ms: number; mean_time_ms: number };
+      const rankOf = {
+        total_time: (r: TopQueryRow) => r.total_time_ms,
+        mean_time: (r: TopQueryRow) => r.mean_time_ms,
+        calls: (r: TopQueryRow) => Number(r.calls),
+      } as const;
       for (const orderBy of ["total_time", "mean_time", "calls"] as const) {
         const res = (await pgTopQueries.handler({ orderBy, limit: 3 })) as {
           ok: boolean;
+          data?: { rows: TopQueryRow[] };
           error?: string;
         };
         // Either installed-and-ok, or extension missing - both acceptable.
         if (!res.ok) {
           assert.match(res.error ?? "", /pg_stat_statements/);
+          continue;
+        }
+        const rows = res.data?.rows;
+        assert.ok(
+          Array.isArray(rows),
+          `orderBy=${orderBy} must return the {rows, ...} envelope, got ${JSON.stringify(res.data)}`,
+        );
+        // The suite has already run plenty of statements against this database,
+        // so an empty ranking means the dbid filter or the ORDER BY broke, not
+        // that there is nothing to rank.
+        assert.ok(rows.length > 0, `orderBy=${orderBy} returned no rows`);
+        assert.ok(rows.length <= 3, `orderBy=${orderBy} must respect limit=3, got ${rows.length} rows`);
+        const ranks = rows.map(rankOf[orderBy]);
+        for (const rank of ranks) {
+          assert.equal(
+            typeof rank,
+            "number",
+            `orderBy=${orderBy} ranking column must be numeric, got ${JSON.stringify(rank)}`,
+          );
+        }
+        for (let i = 1; i < ranks.length; i++) {
+          assert.ok(ranks[i - 1] >= ranks[i], `orderBy=${orderBy} must rank DESC, got ${JSON.stringify(ranks)}`);
         }
       }
     });
@@ -893,7 +1243,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     it("includes io_read_time_ms / io_write_time_ms when pg_stat_statements >= 1.10", async () => {
       const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as {
         ok: boolean;
-        data?: { query: string; io_read_time_ms?: number | null; io_write_time_ms?: number | null }[];
+        data?: { rows: { query: string; io_read_time_ms?: number | null; io_write_time_ms?: number | null }[] };
         error?: string;
       };
       if (!res.ok) {
@@ -916,7 +1266,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       const hasIoTiming = compareVersions(versionRes.data[0].version, "1.10") >= 0;
       if (!hasIoTiming) return; // old extension -- no columns expected, test passes
 
-      for (const row of res.data ?? []) {
+      for (const row of res.data?.rows ?? []) {
         assert.ok(
           "io_read_time_ms" in row,
           `io_read_time_ms must be present on pg_stat_statements >= 1.10, got keys: ${Object.keys(row).join(", ")}`,
@@ -945,14 +1295,14 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         // Ask for a large limit so the marker isn't merely ranked off the end.
         const res = (await pgTopQueries.handler({ orderBy: "calls", limit: 100 })) as {
           ok: boolean;
-          data?: { query: string }[];
+          data?: { rows: { query: string }[] };
           error?: string;
         };
         if (!res.ok) {
           assert.match(res.error ?? "", /pg_stat_statements/);
           return;
         }
-        const leaked = (res.data ?? []).filter((r) => r.query.includes(FIXTURE_OTHER_DB_MARKER));
+        const leaked = (res.data?.rows ?? []).filter((r) => r.query.includes(FIXTURE_OTHER_DB_MARKER));
         assert.deepEqual(
           leaked,
           [],
@@ -976,6 +1326,109 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       } finally {
         await dropOtherDatabase();
       }
+    });
+
+    // The stats-window envelope. pg_top_queries' reset clock is read from
+    // pg_stat_statements_info -- pg_stat_statements' OWN clock, moved by
+    // pg_stat_statements_reset(). It is NOT the pg_stat_database.stats_reset
+    // that pg_seq_scan_tables / pg_unused_indexes report, so nothing below may
+    // assert any relationship between the two; they are independent clocks and
+    // a test tying them together would fail the moment either is reset alone.
+    type TopQueriesEnvelope = {
+      ok: boolean;
+      data?: {
+        rows: { query: string }[];
+        stats_reset?: string | null;
+        stats_reset_age_seconds?: number | null;
+        dealloc?: string | null;
+        _warnings?: string[];
+      };
+      error?: string;
+    };
+
+    it("carries stats_reset / stats_reset_age_seconds / dealloc on pg_stat_statements >= 1.9", async () => {
+      const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as TopQueriesEnvelope;
+      if (!res.ok) {
+        assert.match(res.error ?? "", /pg_stat_statements/);
+        return;
+      }
+
+      // Same capability gate the io-timing test above uses: probe extversion,
+      // then bail when the extension predates the view rather than asserting
+      // fields this cluster cannot produce.
+      const versionRes = await runInternal<{ version: string }>(
+        `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
+      );
+      if (!versionRes.ok || !versionRes.data?.length) return;
+      const { hasStatementsInfo } = await import("../tools/stats.js");
+      if (!hasStatementsInfo(versionRes.data[0].version)) return; // pre-1.9 -- the test below covers it
+
+      const data = res.data;
+      assert.ok(data, "a successful call must return the envelope");
+      assert.ok(Array.isArray(data.rows), "`rows` is the only field guaranteed on every extension version");
+
+      // A failed info probe degrades to _warnings + null context instead of
+      // failing the tool (stats.ts:withStatsReset). Accept that shape, but only
+      // when it actually says so -- a silent null would be the bug.
+      if (data._warnings) {
+        assert.match(data._warnings.join(" "), /pg_stat_statements_info|stats_reset/);
+        return;
+      }
+
+      // Key presence, NOT non-null: the counters may legitimately have never
+      // been reset, and pg_stat_statements_info reports NULL for that.
+      const keys = Object.keys(data).join(", ");
+      assert.ok("stats_reset" in data, `stats_reset must be present on >= 1.9, got keys: ${keys}`);
+      assert.ok("stats_reset_age_seconds" in data, `stats_reset_age_seconds must be present on >= 1.9, got: ${keys}`);
+      if (data.stats_reset !== null) assert.equal(typeof data.stats_reset, "string");
+      const age = data.stats_reset_age_seconds;
+      if (age !== null) {
+        assert.equal(typeof age, "number");
+        assert.ok((age ?? -1) >= 0, `stats_reset_age_seconds must not be negative, got ${age}`);
+      }
+      // The age is EXTRACT(EPOCH FROM (now() - stats_reset)), so it is null
+      // exactly when the timestamp is -- one without the other is a bug.
+      assert.equal(
+        data.stats_reset === null,
+        age === null,
+        `stats_reset and its age must be null together, got ${JSON.stringify(data.stats_reset)} / ${age}`,
+      );
+
+      // `"0"` is the common HEALTHY value ("nothing evicted, ranking complete"),
+      // so a truthiness check here would wrongly read it as missing. Assert key
+      // presence + string-ness, then that it parses as a non-negative integer.
+      assert.ok("dealloc" in data, `dealloc must be present on >= 1.9, got keys: ${keys}`);
+      assert.equal(typeof data.dealloc, "string", `dealloc is a ::text bigint, got ${JSON.stringify(data.dealloc)}`);
+      const dealloc = Number.parseInt(data.dealloc ?? "", 10);
+      assert.ok(
+        Number.isInteger(dealloc) && dealloc >= 0,
+        `dealloc must parse as a non-negative integer, got ${JSON.stringify(data.dealloc)}`,
+      );
+    });
+
+    it("omits the three context fields with a _warnings entry on pg_stat_statements < 1.9", async () => {
+      const versionRes = await runInternal<{ version: string }>(
+        `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
+      );
+      if (!versionRes.ok || !versionRes.data?.length) return; // extension absent -- nothing to assert
+      const { hasStatementsInfo } = await import("../tools/stats.js");
+      if (hasStatementsInfo(versionRes.data[0].version)) return; // >= 1.9 -- the test above covers it
+
+      const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as TopQueriesEnvelope;
+      assert.equal(res.ok, true, `pre-1.9 must still succeed with rows only, got error: ${res.error}`);
+      const data = res.data;
+      assert.ok(data, "a successful call must return the envelope");
+      assert.ok(Array.isArray(data.rows), "`rows` survives even without pg_stat_statements_info");
+
+      // Absent, not null: `stats_reset: null` means "never reset / unknown
+      // start point" everywhere else, and `dealloc: null` would read as
+      // "nothing was ever evicted" -- a claim this version cannot support.
+      const keys = Object.keys(data).join(", ");
+      assert.ok(!("stats_reset" in data), `stats_reset must be absent below 1.9, got keys: ${keys}`);
+      assert.ok(!("stats_reset_age_seconds" in data), `stats_reset_age_seconds must be absent below 1.9, got: ${keys}`);
+      assert.ok(!("dealloc" in data), `dealloc must be absent below 1.9, got keys: ${keys}`);
+      assert.ok((data._warnings ?? []).length > 0, "the omission must be explained by a _warnings entry");
+      assert.match((data._warnings ?? []).join(" "), /pg_stat_statements_info/);
     });
 
     // Note: an integration test for the orderBy=calls numeric-vs-lexical

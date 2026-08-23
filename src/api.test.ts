@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type pg from "pg";
 import {
+  getApplicationName,
   getConnectionTimeoutMs,
   getMaxRows,
   getPool,
   getPoolMax,
+  getServerVersionNum,
   getSslConfig,
   getStatementTimeoutMs,
   isWritesAllowed,
@@ -274,6 +276,50 @@ describe("getSslConfig stderr warning on unrecognized values", () => {
   });
 });
 
+describe("getApplicationName", () => {
+  const original = process.env.POSTGRES_APPLICATION_NAME;
+  afterEach(() => {
+    if (original === undefined) delete process.env.POSTGRES_APPLICATION_NAME;
+    else process.env.POSTGRES_APPLICATION_NAME = original;
+  });
+
+  it("defaults to 'postgres-mcp' when unset", () => {
+    delete process.env.POSTGRES_APPLICATION_NAME;
+    assert.equal(getApplicationName(), "postgres-mcp");
+  });
+
+  it("accepts a configured value", () => {
+    process.env.POSTGRES_APPLICATION_NAME = "my-agent";
+    assert.equal(getApplicationName(), "my-agent");
+  });
+
+  // An empty or whitespace-only assignment is the shape you get from
+  // `POSTGRES_APPLICATION_NAME=` in a shell profile, or an MCP host env block
+  // whose value was left blank. Passing that through would make the server
+  // anonymous in pg_stat_activity -- the exact thing this var exists to
+  // prevent -- so blank falls back to the default rather than to "".
+  it("falls back to the default for blank values", () => {
+    for (const v of ["", " ", "   ", "\t", "\n"]) {
+      process.env.POSTGRES_APPLICATION_NAME = v;
+      assert.equal(
+        getApplicationName(),
+        "postgres-mcp",
+        `POSTGRES_APPLICATION_NAME=${JSON.stringify(v)} should default`,
+      );
+    }
+  });
+
+  // trim() is used only as a blankness TEST, not as a normalizer: a non-blank
+  // value reaches pg verbatim, padding included. Pinned because the obvious
+  // "consistency" refactor (`raw.trim() || "postgres-mcp"`) silently rewrites
+  // an operator's configured name, and the only place that difference shows
+  // up is a remote server's pg_stat_activity.
+  it("returns a non-blank value verbatim, without trimming", () => {
+    process.env.POSTGRES_APPLICATION_NAME = "  padded-name  ";
+    assert.equal(getApplicationName(), "  padded-name  ");
+  });
+});
+
 // safeResolveTypeNames is the wrapper around resolveTypeNames whose entire
 // reason for existing is: a pg_type lookup failure must not lose the user's
 // successful query rows. Engineering that failure against a real DB
@@ -416,5 +462,157 @@ describe("getPool without DATABASE_URL", () => {
         err instanceof Error && /DATABASE_URL is not set/.test(err.message) && !/\.mcp\.json/.test(err.message),
       "non-win32 must not carry the Windows hint",
     );
+  });
+});
+
+// getServerVersionNum gates nearly every version-dependent catalog query in
+// the codebase, and its whole contract lives in module-scoped cache state:
+// what is cached, what deliberately is not, and what a concurrent shutdown()
+// is allowed to publish. Same stub-client approach as the safeResolveTypeNames
+// tests above -- the probe is a single GUC read, so a stub whose .query
+// resolves or rejects on demand reaches every branch without a live server.
+describe("getServerVersionNum", () => {
+  const original = process.env.DATABASE_URL;
+
+  // Every test here starts from a cleared cache and leaves one behind, so a
+  // stubbed version can never leak into another suite in this file.
+  beforeEach(async () => {
+    await shutdown();
+  });
+  afterEach(async () => {
+    if (original === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = original;
+    await shutdown();
+  });
+
+  /** Stub probe that resolves `server_version_num` and counts its calls. */
+  function countingProbe(value: string) {
+    const state = { queries: 0 };
+    const client = {
+      query: async () => {
+        state.queries++;
+        return { rows: [{ v: value }] };
+      },
+    } as unknown as pg.PoolClient;
+    return { client, state };
+  }
+
+  it("returns the parsed server_version_num from a successful probe", async () => {
+    const { client } = countingProbe("180000");
+    assert.equal(await getServerVersionNum(client), 180_000);
+  });
+
+  it("caches a successful read -- a second call does not re-probe", async () => {
+    const { client, state } = countingProbe("160000");
+    assert.equal(await getServerVersionNum(client), 160_000);
+    assert.equal(await getServerVersionNum(client), 160_000);
+    assert.equal(state.queries, 1, "second call re-queried; the version cache is not being consulted");
+  });
+
+  // Failures are deliberately NOT cached. Caching the 0 sentinel would pin the
+  // process to degraded (pre-feature) output for its whole lifetime after one
+  // transient blip on the very first tool call -- the probe is a single cheap
+  // GUC read, so retrying costs far less than being permanently wrong.
+  it("does not cache a failed probe -- a later call still gets the real version", async () => {
+    const failing = {
+      query: () => Promise.reject(new Error("simulated probe failure")),
+    } as unknown as pg.PoolClient;
+    assert.equal(await getServerVersionNum(failing), 0, "a throwing probe must report the assume-oldest sentinel");
+
+    const { client, state } = countingProbe("170000");
+    assert.equal(await getServerVersionNum(client), 170_000, "0 was cached; the process is stuck on degraded output");
+    assert.equal(state.queries, 1);
+  });
+
+  // Same reasoning as the throwing probe, one branch over: a probe that
+  // RESOLVES but with something unusable (empty result set, non-numeric GUC,
+  // a non-positive number) also reports 0, and must not be cached either.
+  it("does not cache an unparseable or non-positive reading", async () => {
+    for (const bad of ["", "not-a-number", "0", "-1"]) {
+      const stub = {
+        query: async () => ({ rows: [{ v: bad }] }),
+      } as unknown as pg.PoolClient;
+      assert.equal(await getServerVersionNum(stub), 0, `v=${JSON.stringify(bad)} should report the 0 sentinel`);
+    }
+
+    const empty = { query: async () => ({ rows: [] }) } as unknown as pg.PoolClient;
+    assert.equal(await getServerVersionNum(empty), 0, "an empty result set should report the 0 sentinel");
+
+    const { client, state } = countingProbe("180000");
+    assert.equal(await getServerVersionNum(client), 180_000, "a bad reading was cached and now serves 0 forever");
+    assert.equal(state.queries, 1);
+  });
+
+  // getPool() throws when DATABASE_URL is missing, and that throw happens
+  // INSIDE the try -- so a misconfigured server degrades to pre-feature
+  // queries instead of every version-gated tool call blowing up.
+  it("returns 0 rather than throwing when DATABASE_URL is unset", async () => {
+    delete process.env.DATABASE_URL;
+    assert.equal(await getServerVersionNum(), 0);
+  });
+
+  // The explicit-client overload is what lets the probe ride along on the
+  // shared client inside withSharedClient instead of checking out a second
+  // connection. Deleting DATABASE_URL first makes the assertion load-bearing:
+  // if the argument were ignored, getPool() would throw and this would be 0.
+  it("uses an explicitly passed client instead of the pool", async () => {
+    delete process.env.DATABASE_URL;
+    const { client, state } = countingProbe("180000");
+    assert.equal(await getServerVersionNum(client), 180_000);
+    assert.equal(state.queries, 1, "the explicit client was never queried");
+  });
+
+  // A rebuilt pool may point at a different DATABASE_URL (tests in this file
+  // do exactly that), so a version surviving shutdown() would gate catalog
+  // queries against the wrong server.
+  it("shutdown() clears the cached version", async () => {
+    const first = countingProbe("160000");
+    assert.equal(await getServerVersionNum(first.client), 160_000);
+    assert.equal(await getServerVersionNum(first.client), 160_000);
+    assert.equal(first.state.queries, 1);
+
+    await shutdown();
+
+    const second = countingProbe("180000");
+    assert.equal(await getServerVersionNum(second.client), 180_000, "the pre-shutdown version survived the reset");
+    assert.equal(second.state.queries, 1);
+  });
+
+  // Generation-counter race, the scalar twin of the "shutdown() lands
+  // mid-bootstrap" case in safeResolveTypeNames above. A probe suspended on
+  // its await when shutdown() lands describes a pool that no longer exists;
+  // publishing that reading hands the NEW pool the OLD server's version. The
+  // gate releases the probe only AFTER shutdown() has run, so the interleaving
+  // is reproduced exactly rather than by timing luck.
+  //
+  // Correct behavior is split: the caller that asked still gets the reading
+  // (it was true when it asked), but the cache stays empty so the next caller
+  // re-probes the new pool.
+  it("does not publish a version read across a shutdown() that landed mid-probe", async () => {
+    let releaseProbe: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseProbe = resolve;
+    });
+    const stale = {
+      query: async () => {
+        await gate;
+        return { rows: [{ v: "160000" }] };
+      },
+    } as unknown as pg.PoolClient;
+
+    const inFlight = getServerVersionNum(stale);
+    // Lands while the probe is parked on `gate` -- SIGTERM mid-tool-call, or
+    // a test tearing the pool down between calls.
+    await shutdown();
+    releaseProbe();
+    assert.equal(await inFlight, 160_000, "the caller that asked must still get its own reading");
+
+    const fresh = countingProbe("180000");
+    assert.equal(
+      await getServerVersionNum(fresh.client),
+      180_000,
+      "the pre-shutdown version was republished into the new pool's cache",
+    );
+    assert.equal(fresh.state.queries, 1, "the stale reading short-circuited the fresh probe");
   });
 });

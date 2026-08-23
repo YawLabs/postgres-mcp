@@ -1,7 +1,10 @@
 import { z } from "zod";
 import {
   type ApiResponse,
+  getServerVersionNum,
   isWritesAllowed,
+  PG16,
+  PG17,
   type RunHooks,
   runInternal,
   runReadOnly,
@@ -9,7 +12,26 @@ import {
 } from "../api.js";
 import { identSchema, paramsArray } from "./params.js";
 
-const indexAccessMethod = z.enum(["btree", "hash", "gin", "gist", "brin", "spgist"]);
+/**
+ * Two more `server_version_num` cut points, in the same major * 10000 shape as
+ * the `PG16`/`PG17`/`PG18` constants api.ts exports. They live here rather than
+ * there because nothing else in the codebase gates on 12 or 13 -- and a bare
+ * `120_000` in a version comparison reads as a row count, not a major version.
+ */
+const PG12 = 120_000;
+const PG13 = 130_000;
+
+// EXPLAIN's SERIALIZE is an enum, not a boolean: it picks how far the executor
+// takes the result rows (skip serialization / build text / build binary).
+const SERIALIZE_MODES = ["none", "text", "binary"] as const;
+const serializeMode = z.enum(SERIALIZE_MODES);
+
+// Kept as a plain const array rather than living only inside the z.enum for
+// the same reason SERIALIZE_MODES is: `using` is interpolated into the
+// CREATE INDEX text, and validateHypoIndex has to re-check membership for
+// callers who never run Zod.
+const INDEX_ACCESS_METHODS = ["btree", "hash", "gin", "gist", "brin", "spgist"] as const;
+const indexAccessMethod = z.enum(INDEX_ACCESS_METHODS);
 
 const hypotheticalIndex = z.object({
   // `table` is `schema.table` or `table`. The 127-char ceiling is a generous
@@ -63,7 +85,21 @@ function quoteQualifiedTable(name: string): string {
  * still get the same protection -- matches the precedent set by the `using`
  * default re-application in buildHypopgHooks.
  */
-function validateHypoIndex(idx: { table: string; columns: string[] }): string | null {
+function validateHypoIndex(idx: { table: string; columns: string[]; using?: string }): string | null {
+  // `using` is the second value in this file (after `serialize`) whose VALUE
+  // reaches raw SQL text -- it is interpolated into the CREATE INDEX string
+  // handed to hypopg_create_index. The Zod enum narrows it on the MCP path,
+  // but buildHypopgHooks only re-applies the `?? "btree"` DEFAULT, so an
+  // explicitly supplied garbage value from a direct caller sailed past both
+  // and landed inside the statement. `serialize` gets exactly this membership
+  // re-check in the handler; without the matching one here the two paths were
+  // asymmetrically guarded.
+  if (idx.using !== undefined && !(INDEX_ACCESS_METHODS as readonly string[]).includes(idx.using)) {
+    return (
+      `Unsupported \`using\` value ${JSON.stringify(idx.using)}; ` +
+      `expected one of: ${INDEX_ACCESS_METHODS.join(", ")}.`
+    );
+  }
   // Check the RAW string for pre-quoting BEFORE splitting on `.`: a pre-quoted
   // name with an embedded dot (`public."odd.name"`) splits into 3+ pieces, and
   // the over-qualified message alone gives the caller no hint that removing
@@ -150,6 +186,22 @@ export const explainTools = [
       "executed during EXPLAIN ANALYZE are always rolled back, so you can inspect a plan for " +
       "an INSERT/UPDATE/DELETE without persisting the mutation. Format is `text` (default) or " +
       "`json`. Pass the raw SQL (not an EXPLAIN-prefixed statement). " +
+      "Planner options (all optional): `buffers` reports shared/local/temp block hits and is the " +
+      "fastest way to tell a bad plan from a cold cache - it defaults to TRUE whenever `analyze` " +
+      "is true (matching PostgreSQL 18, which turns it on for you), pass `buffers: false` to " +
+      "suppress it; requesting it WITHOUT `analyze` needs PostgreSQL 13+. `verbose` adds output " +
+      "columns and schema-qualified names. `settings` (PostgreSQL 12+) lists planner GUCs set away " +
+      "from their defaults - the usual explanation for a plan that looks impossible. `wal` " +
+      "(PostgreSQL 13+) reports WAL generated and `serialize` (`none`|`text`|`binary`, " +
+      "PostgreSQL 17+) charges the cost of building the result rows; both require `analyze`. " +
+      "`memory` (PostgreSQL 17+) reports memory used by the PLANNER, so it works with or without " +
+      "`analyze` - use it alone to ask why planning a statement is expensive. " +
+      "`generic_plan` (PostgreSQL 16+) plans a " +
+      "parameterized statement WITHOUT values for its $1/$2 placeholders and cannot be combined " +
+      "with `analyze` or `params`. `costs` and `timing` default to true (as in postgres); set " +
+      "either to false to drop those columns, and note `timing` only applies with `analyze`. " +
+      "Options that need a newer server than the one connected are rejected with an explicit " +
+      "error naming the required version instead of a confusing parse failure. " +
       "Set `hypothetical_indexes` to a list of `{table, columns, using?}` to ask the planner " +
       "'what would the plan be if these indexes existed?' -- requires the HypoPG extension " +
       "(`CREATE EXTENSION hypopg`). The hypothetical indexes are torn down at the end of the " +
@@ -165,6 +217,53 @@ export const explainTools = [
       sql: z.string().min(1).max(1_000_000).describe("The SQL statement to explain. Do NOT prefix with EXPLAIN."),
       analyze: z.boolean().default(false).describe("Run EXPLAIN ANALYZE (actually executes the query)."),
       format: z.enum(["text", "json"]).default("text").describe("Output format."),
+      // Deliberately NOT `.default(false)`: the effective default is "on when
+      // analyzing", which Zod cannot express in terms of a sibling field. An
+      // absent value means "follow analyze"; an explicit false still wins.
+      buffers: z
+        .boolean()
+        .optional()
+        .describe(
+          "Report buffer hits/reads/dirtied. Defaults to TRUE when `analyze` is true (PostgreSQL 18 does " +
+            "the same); pass false to suppress. Requesting it without `analyze` requires PostgreSQL 13+.",
+        ),
+      verbose: z.boolean().default(false).describe("Include output columns, schema-qualified names, and triggers."),
+      settings: z
+        .boolean()
+        .default(false)
+        .describe("Report planner GUCs set away from their defaults - explains a weird plan (PostgreSQL 12+)."),
+      wal: z
+        .boolean()
+        .default(false)
+        .describe("Report WAL generated by the statement. Requires `analyze` (PostgreSQL 13+)."),
+      memory: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Report memory used by the planner (PostgreSQL 17+). Works with or without `analyze`, " +
+            "since planning happens either way.",
+        ),
+      serialize: serializeMode
+        .optional()
+        .describe(
+          "Charge the cost of serializing result rows (network-bound queries hide it otherwise). " +
+            "Requires `analyze` (PostgreSQL 17+).",
+        ),
+      generic_plan: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Plan the statement with UNKNOWN values for its $1/$2 placeholders - the plan a prepared " +
+            "statement would get. Cannot be combined with `analyze` or `params` (PostgreSQL 16+).",
+        ),
+      costs: z.boolean().default(true).describe("Include estimated cost/rows/width. Set false for a terser plan."),
+      timing: z
+        .boolean()
+        .default(true)
+        .describe(
+          "Include per-node actual timing. Setting it to false REQUIRES `analyze: true` (it is " +
+            "rejected otherwise, not silently ignored); false lowers measurement overhead.",
+        ),
       params: paramsArray.optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
       hypothetical_indexes: z
         .array(hypotheticalIndex)
@@ -184,12 +283,33 @@ export const explainTools = [
         sql,
         analyze = false,
         format = "text",
+        buffers,
+        verbose = false,
+        settings = false,
+        wal = false,
+        memory = false,
+        serialize,
+        generic_plan = false,
+        costs = true,
+        timing = true,
         params,
         hypothetical_indexes,
       } = input as {
         sql: string;
         analyze?: boolean;
         format?: "text" | "json";
+        buffers?: boolean;
+        verbose?: boolean;
+        settings?: boolean;
+        wal?: boolean;
+        memory?: boolean;
+        // Widened to `string` on purpose: the Zod enum does not run for direct
+        // callers, and this is the one option whose VALUE reaches the SQL text.
+        // The membership check below is what narrows it.
+        serialize?: string;
+        generic_plan?: boolean;
+        costs?: boolean;
+        timing?: boolean;
         params?: unknown[];
         hypothetical_indexes?: { table: string; columns: string[]; using?: string }[];
       };
@@ -206,21 +326,144 @@ export const explainTools = [
         };
       }
 
-      const flags: string[] = [];
-      if (analyze) flags.push("ANALYZE");
-      if (format === "json") flags.push("FORMAT JSON");
-      const explainSql = flags.length > 0 ? `EXPLAIN (${flags.join(", ")}) ${sql}` : `EXPLAIN ${sql}`;
+      // `serialize` is the only option whose VALUE is interpolated into the
+      // option list, and direct (non-MCP) callers never run the Zod enum -- so
+      // re-check membership here. Without it, an arbitrary string would be
+      // pasted inside `EXPLAIN (...)`.
+      if (serialize !== undefined && !(SERIALIZE_MODES as readonly string[]).includes(serialize)) {
+        return {
+          ok: false,
+          error:
+            `Unsupported \`serialize\` value ${JSON.stringify(serialize)}; ` +
+            `expected one of: ${SERIALIZE_MODES.join(", ")}.`,
+        };
+      }
+
+      // BUFFERS is the single most useful number in a slow-query plan (it
+      // separates "the plan is bad" from "the data was not cached"), and
+      // PostgreSQL 18 enables it for EXPLAIN ANALYZE by default. Match that on
+      // every server version while leaving `buffers: false` a real opt-out --
+      // hence `??` rather than `||`.
+      const wantBuffers = buffers ?? analyze;
+
+      // Options postgres rejects outright without ANALYZE ("EXPLAIN option WAL
+      // requires ANALYZE") or that have nothing to measure when the statement
+      // never runs. Named here so the caller gets the fix, not a server error.
+      // `memory` is deliberately NOT in this list. It reports memory consumed
+      // by the PLANNING phase, which happens whether or not the statement is
+      // executed, and postgres accepts `EXPLAIN (MEMORY)` standalone. Rejecting
+      // it here would make this tool stricter than the server and block a
+      // legitimate question ("why is planning this thing expensive?").
+      const analyzeOnly: string[] = [];
+      if (!analyze) {
+        if (wal) analyzeOnly.push("wal");
+        if (serialize !== undefined) analyzeOnly.push("serialize");
+        if (!timing) analyzeOnly.push("timing");
+      }
+      if (analyzeOnly.length > 0) {
+        const named = analyzeOnly.map((o) => `\`${o}\``).join(", ");
+        return {
+          ok: false,
+          error:
+            `These EXPLAIN options only apply with \`analyze: true\`: ${named}. ` +
+            "Set `analyze: true` (the statement is executed, and any write is rolled back) or drop them.",
+        };
+      }
+
+      // GENERIC_PLAN asks the planner to plan with UNKNOWN parameter values;
+      // ANALYZE has to execute, which needs real ones. Postgres errors on the
+      // combination, so reject it here rather than paying a round trip to be
+      // told the same thing less clearly.
+      if (generic_plan && analyze) {
+        return {
+          ok: false,
+          error:
+            "`generic_plan` and `analyze` cannot be combined: GENERIC_PLAN plans the statement without " +
+            "parameter values, while ANALYZE has to execute it with real ones. Pick one.",
+        };
+      }
+
+      // Supplying `params` alongside generic_plan contradicts the whole point
+      // of the option -- the placeholders must stay unbound for the planner to
+      // produce the generic plan.
+      if (generic_plan && (params?.length ?? 0) > 0) {
+        return {
+          ok: false,
+          error:
+            "`generic_plan` plans the statement WITHOUT parameter values -- drop `params` (leave the " +
+            "$1/$2 placeholders in the SQL), or drop `generic_plan` and pass the values.",
+        };
+      }
 
       const hypoIndexes = hypothetical_indexes ?? [];
 
-      // Validate identifier shapes before anything else -- pre-quoted names
-      // (`"odd.name"`, `weird"col`) would split incorrectly on `.` or produce
-      // confusing planner errors. Faster to reject here than to round-trip
-      // a connection acquire and a CREATE INDEX failure.
+      // Validate identifier shapes before we open a connection -- pre-quoted
+      // names (`"odd.name"`, `weird"col`) would split incorrectly on `.` or
+      // produce confusing planner errors. Faster to reject here than to
+      // round-trip a connection acquire and a CREATE INDEX failure.
       for (const idx of hypoIndexes) {
         const err = validateHypoIndex(idx);
         if (err) return { ok: false, error: err };
       }
+
+      // Options that do not parse at all on an older server: postgres answers
+      // with `unrecognized EXPLAIN option "generic_plan"`, which reads like the
+      // caller typed a garbage keyword rather than "your server is too old".
+      // Collect the floors first so one probe covers however many were asked
+      // for, and so the probe runs ONLY when a gated option was requested --
+      // `analyze`/`format`/`params`/`hypothetical_indexes` must keep working on
+      // a server we cannot version-probe (getServerVersionNum returns the 0
+      // "assume oldest" sentinel on any failure, and does not cache it).
+      const gated: { option: string; min: number; since: string }[] = [];
+      if (settings) gated.push({ option: "settings", min: PG12, since: "12" });
+      if (wal) gated.push({ option: "wal", min: PG13, since: "13" });
+      if (generic_plan) gated.push({ option: "generic_plan", min: PG16, since: "16" });
+      if (memory) gated.push({ option: "memory", min: PG17, since: "17" });
+      if (serialize !== undefined) gated.push({ option: "serialize", min: PG17, since: "17" });
+      // BUFFERS itself is ancient; only PG13+ accepts it WITHOUT ANALYZE (older
+      // servers: `EXPLAIN option BUFFERS requires ANALYZE`). Unreachable unless
+      // the caller passed `buffers: true` explicitly, since the default tracks
+      // `analyze` -- so the version-gated default never blocks anyone.
+      // Label carries no backticks: the error formatter wraps `option` in them,
+      // so an inner pair renders as `buffers (without `analyze`)` -- nested and
+      // unreadable in every markdown-rendering host.
+      if (wantBuffers && !analyze) gated.push({ option: "buffers without analyze", min: PG13, since: "13" });
+
+      if (gated.length > 0) {
+        const serverVersion = await getServerVersionNum();
+        const unsupported = gated.filter((g) => serverVersion < g.min);
+        if (unsupported.length > 0) {
+          const server =
+            serverVersion === 0
+              ? "the server version could not be determined, so the oldest supported behavior is assumed"
+              : `this server reports PostgreSQL ${Math.floor(serverVersion / 10_000)}`;
+          return {
+            ok: false,
+            error: `Unsupported EXPLAIN option for this server: ${unsupported
+              .map((g) => `\`${g.option}\` requires PostgreSQL ${g.since}+`)
+              .join("; ")} (${server}). Drop the option and re-run.`,
+          };
+        }
+      }
+
+      // Every entry renders as a bare `EXPLAIN (...)` option token. COSTS and
+      // TIMING default ON in postgres, so only their OFF form is emitted --
+      // and `TIMING OFF` is legal only alongside ANALYZE, which the
+      // analyze-only guard above already enforced. FORMAT JSON stays last so
+      // the option list reads the way postgres documents it.
+      const flags: string[] = [];
+      if (analyze) flags.push("ANALYZE");
+      if (wantBuffers) flags.push("BUFFERS");
+      if (verbose) flags.push("VERBOSE");
+      if (settings) flags.push("SETTINGS");
+      if (wal) flags.push("WAL");
+      if (memory) flags.push("MEMORY");
+      if (generic_plan) flags.push("GENERIC_PLAN");
+      if (!costs) flags.push("COSTS OFF");
+      if (!timing) flags.push("TIMING OFF");
+      if (serialize !== undefined) flags.push(`SERIALIZE ${serialize.toUpperCase()}`);
+      if (format === "json") flags.push("FORMAT JSON");
+      const explainSql = flags.length > 0 ? `EXPLAIN (${flags.join(", ")}) ${sql}` : `EXPLAIN ${sql}`;
 
       const hooks: RunHooks = hypoIndexes.length > 0 ? buildHypopgHooks(hypoIndexes) : {};
 

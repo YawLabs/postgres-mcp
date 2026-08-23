@@ -15,6 +15,13 @@
  *   - POSTGRES_SSL_REJECT_UNAUTHORIZED     - "false" to disable TLS cert verification (for managed
  *                                            databases using private-CA certs: Supabase, Neon,
  *                                            RDS with a custom CA). Connection is still encrypted.
+ *   - POSTGRES_APPLICATION_NAME            - value reported in pg_stat_activity.application_name
+ *                                            (default: "postgres-mcp"). An `application_name` in
+ *                                            DATABASE_URL wins over this: pg's ConnectionParameters
+ *                                            does `Object.assign({}, config, parse(connectionString))`,
+ *                                            so parsed DSN keys override explicit config. A DSN with
+ *                                            no application_name emits no such key, so it cannot
+ *                                            clobber this default with undefined.
  *
  * Safety model:
  *   User-provided SQL runs in a `BEGIN READ ONLY` transaction by default, so
@@ -79,6 +86,80 @@ export function isWritesAllowed(): boolean {
   return v === "1" || v === "true";
 }
 
+export function getApplicationName(): string {
+  const raw = process.env.POSTGRES_APPLICATION_NAME;
+  return raw && raw.trim() !== "" ? raw : "postgres-mcp";
+}
+
+/**
+ * `server_version_num` cut points, as postgres reports them: major * 10000.
+ * Used to gate catalog columns that do not exist on older servers. Naming a
+ * constant beats an inline 160000 -- the number alone reads as a row count.
+ */
+export const PG16 = 160_000;
+export const PG17 = 170_000;
+export const PG18 = 180_000;
+
+/**
+ * Minimal structural type satisfied by both `pg.Pool` and `pg.PoolClient`, so
+ * the version probe can run on a shared client (inside `withSharedClient`)
+ * or on the pool directly.
+ */
+interface VersionProbeRunner {
+  query<R extends pg.QueryResultRow>(sql: string): Promise<pg.QueryResult<R>>;
+}
+
+// Cached server_version_num. Only a successful, positive read is cached --
+// see getServerVersionNum for why failures deliberately are not.
+let serverVersionNum: number | null = null;
+
+// Bumped by shutdown(). A probe suspended on its await when shutdown lands
+// would otherwise republish the OLD server's version into the cache the NEW
+// pool uses -- gating catalog queries against the wrong server, which is the
+// exact failure the reset in shutdown() exists to prevent. Same hazard
+// resolveTypeNames guards by binding a local before its first await; this
+// counter is the equivalent for a scalar.
+let poolGeneration = 0;
+
+/**
+ * Returns `server_version_num` (e.g. 180000 for PG 18), or 0 when it cannot
+ * be determined.
+ *
+ * 0 is the "assume oldest" sentinel: every caller gates with `>= PGxx`, so an
+ * unknown version falls through to the conservative pre-feature query rather
+ * than emitting SQL that references a column the server does not have. That
+ * fails to a slightly poorer answer, never to a broken one.
+ *
+ * Failures are NOT cached. Caching 0 would pin the process to degraded output
+ * for its whole lifetime after one transient hiccup (a pool blip during the
+ * very first tool call), and the probe is a single cheap GUC read -- retrying
+ * on the next call costs far less than being permanently wrong.
+ *
+ * Concurrency: two callers racing before the cache is populated both run the
+ * probe and both write the same value. Harmless duplicate work, same tradeoff
+ * as the typeNameCache bootstrap above.
+ */
+export async function getServerVersionNum(client?: VersionProbeRunner): Promise<number> {
+  if (serverVersionNum !== null) return serverVersionNum;
+  // Snapshot BEFORE the await -- see poolGeneration.
+  const generation = poolGeneration;
+  try {
+    const runner: VersionProbeRunner = client ?? getPool();
+    const res = await runner.query<{ v: string }>("SELECT current_setting('server_version_num') AS v");
+    const parsed = Number.parseInt(res.rows[0]?.v ?? "", 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      // Only publish if no shutdown() landed while we were suspended. If one
+      // did, this reading describes a pool that no longer exists; return it to
+      // THIS caller (it was true when asked) but do not cache it for the next.
+      if (generation === poolGeneration) serverVersionNum = parsed;
+      return parsed;
+    }
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
 export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
   const raw = process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
   if (raw === undefined) return undefined;
@@ -118,6 +199,11 @@ export function getPool(): pg.Pool {
   const ssl = getSslConfig();
   pool = new pg.Pool({
     connectionString: getDatabaseUrl(),
+    // Identify this server in pg_stat_activity. Without it, agent traffic is
+    // anonymous to whoever is watching the database -- while pg_health itself
+    // reports application_name for every OTHER session. See getApplicationName
+    // for why a DSN-supplied application_name still wins.
+    application_name: getApplicationName(),
     statement_timeout: getStatementTimeoutMs(),
     connectionTimeoutMillis: getConnectionTimeoutMs(),
     max: getPoolMax(),
@@ -577,6 +663,13 @@ export async function withSharedClient<T>(
 
 export async function shutdown(): Promise<void> {
   typeNameCache = null;
+  // Reset alongside the pool: a rebuilt pool may point at a different
+  // DATABASE_URL (tests do exactly this), and a stale version would then gate
+  // catalog queries against the wrong server.
+  serverVersionNum = null;
+  // Invalidate any probe still in flight so it cannot republish the version of
+  // the pool being torn down here.
+  poolGeneration++;
   if (!pool) return;
   // pool.end() waits for in-flight queries with no upper bound. If a query is
   // wedged below the statement_timeout (network hang, frozen NFS, etc.), the

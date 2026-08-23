@@ -170,7 +170,15 @@ describe("CLI: MCP stdio handshake with no args", () => {
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
       const listed = (await rpc(child, { jsonrpc: "2.0", id: 2, method: "tools/list" })) as {
-        result?: { tools?: { name: string; description?: string; inputSchema?: unknown }[] };
+        result?: {
+          tools?: {
+            name: string;
+            title?: string;
+            description?: string;
+            inputSchema?: unknown;
+            annotations?: { title?: string };
+          }[];
+        };
       };
       const tools = listed.result?.tools ?? [];
       // Assert on the contract (shape + a couple of load-bearing names) rather
@@ -190,6 +198,26 @@ describe("CLI: MCP stdio handshake with no args", () => {
       for (const tool of tools) {
         assert.equal(typeof tool.description, "string");
         assert.ok(tool.inputSchema, `${tool.name} advertised no inputSchema`);
+      }
+      // The registerTool migration emits the display name in BOTH places on
+      // purpose: `title` is where the current spec puts it, `annotations.title`
+      // is the older location some hosts still read. Emitting only one leaves
+      // half the hosts showing the raw `pg_*` name, and nothing else in the
+      // suite looks at either field -- the wiring is only observable here, over
+      // the actual protocol.
+      for (const tool of tools) {
+        assert.equal(typeof tool.title, "string", `${tool.name} advertised no top-level title`);
+        assert.ok((tool.title ?? "").length > 0, `${tool.name} advertised an empty top-level title`);
+        // Same string in both locations: a host that reads one and a host that
+        // reads the other must not disagree about what the tool is called.
+        assert.equal(
+          tool.title,
+          tool.annotations?.title,
+          `${tool.name}: top-level title and annotations.title disagree`,
+        );
+        // A title that is just the tool name means the human-readable label was
+        // lost somewhere and the raw identifier got copied in as a stand-in.
+        assert.notEqual(tool.title, tool.name, `${tool.name} advertised its own name as its title`);
       }
     } finally {
       child.kill("SIGKILL");
@@ -351,3 +379,55 @@ function rpc(child: ChildProcessWithoutNullStreams, request: { id: number; [k: s
     child.stdin.write(`${JSON.stringify(request)}\n`);
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// oam sandbox env allowlist.
+//
+// Under POSTGRES_MCP_SANDBOX=1 the launcher passes `--allow-env=<list>`, and
+// oam DELETES any variable outside that list from process.env rather than
+// throwing. So a config var added to src/ but forgotten in the launcher does
+// not fail loudly -- the server reads undefined and silently takes its
+// default. That already happened once: POSTGRES_APPLICATION_NAME shipped in
+// api.ts without a matching allowlist entry, and the operator's configured
+// name would have vanished under the sandbox with no diagnostic.
+//
+// This pins the invariant the CHANGELOG claims: the allowlist is derived from
+// what the shipped bundle actually reads. Only STATICALLY literal reads can be
+// checked -- the pg driver builds some of its own names by concatenation
+// (`process.env['PG' + key.toUpperCase()]`), which no static scan can see, so
+// those stay a manual entry.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("oam sandbox --allow-env allowlist", () => {
+  it("covers every literal process.env read in the shipped bundle", async () => {
+    const { readFileSync } = await import("node:fs");
+    const launcherSrc = readFileSync(LAUNCHER, "utf8");
+    const bundleSrc = readFileSync(ENTRY, "utf8");
+
+    const listMatch = launcherSrc.match(/--allow-env=\$\{env\.join\(","\)\}/);
+    assert.ok(listMatch, "launcher no longer builds --allow-env from an `env` array; update this test");
+
+    const arrayMatch = launcherSrc.match(/const env = \[([^\]]*)\]/);
+    assert.ok(arrayMatch, "could not locate the `env` array literal in the launcher");
+    const allowed = new Set((arrayMatch[1].match(/"([^"]+)"/g) ?? []).map((s) => s.slice(1, -1)));
+    assert.ok(allowed.size > 0, "parsed an empty allowlist");
+
+    // Both spellings esbuild can emit for a literal read.
+    const read = new Set<string>();
+    for (const m of bundleSrc.matchAll(/process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g)) read.add(m[1]);
+    for (const m of bundleSrc.matchAll(/process\.env\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]/g)) read.add(m[1]);
+
+    // NODE_ENV and friends are read by bundled deps and are not ours to grant;
+    // restrict the assertion to the config surface this server documents.
+    const ours = [...read].filter((n) => n.startsWith("POSTGRES_") || n.startsWith("PG") || n === "ALLOW_WRITES");
+    assert.ok(ours.length > 0, "found no config env reads in the bundle -- scan is broken");
+
+    const missing = ours.filter((n) => !allowed.has(n));
+    assert.deepEqual(
+      missing,
+      [],
+      `these env vars are read by dist/index.js but absent from the launcher allowlist, ` +
+        `so POSTGRES_MCP_SANDBOX=1 would silently drop them: ${JSON.stringify(missing)}`,
+    );
+  });
+});
