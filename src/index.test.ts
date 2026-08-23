@@ -289,8 +289,17 @@ describe("launcher: runtime selection", () => {
     // deployment -- the operator asked for a specific runtime and did not get it.
     const res = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "oam", OAM_BIN: NO_OAM });
     assert.equal(res.code, 1);
-    assert.match(res.stderr, /no oam binary was found/);
+    // "runnable", not merely "present": the launcher now distinguishes a
+    // binary that is absent from one that is unreadable or too old, and this
+    // assertion drifted behind that wording. Kept specific rather than
+    // loosened to /oam binary/ -- the word carries the distinction, so a
+    // revert to a bare existsSync check should fail here.
+    assert.match(res.stderr, /no runnable oam binary was found/);
     assert.match(res.stderr, /oamjs\.org/);
+    // The remedies are the actionable half: an operator who demanded oam and
+    // got an error needs the three ways out, not just the diagnosis.
+    assert.match(res.stderr, /OAM_BIN/);
+    assert.match(res.stderr, /POSTGRES_MCP_RUNTIME=node/);
   });
 
   it("passes the argv guard through to the server", async () => {
