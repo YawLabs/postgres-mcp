@@ -16,9 +16,7 @@ import { identSchema } from "./params.js";
  * code rather than the prose.
  */
 const constraintMetaFields = {
-  validated: z
-    .boolean()
-    .describe("False for a NOT VALID constraint: existing rows were never checked against it."),
+  validated: z.boolean().describe("False for a NOT VALID constraint: existing rows were never checked against it."),
   enforced: z
     .boolean()
     .optional()

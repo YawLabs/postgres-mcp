@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pg_index_advisor`, an index RECOMMENDATION tool.** The server already had
+  every input -- HypoPG for hypothetical indexes, `pg_stat_statements` via
+  `pg_top_queries`, and `pg_seq_scan_tables` -- and lacked only the search layer.
+  Candidates are costed by creating hypothetical indexes, re-running EXPLAIN, and
+  keeping what actually lowers cost, under a caller-set bound on candidates and
+  EXPLAIN round trips. Hypothetical indexes are session-scoped, so `hypopg_reset()`
+  runs in a teardown that fires even on error; leaking them would poison every
+  later plan in the session.
+
+  Encoded correctness note: PostgreSQL 18's skip scan means a multi-column btree
+  with an unconstrained LEADING column can now be used, so the classic "leading
+  column never filtered = dead index" heuristic is wrong on PG18+. That reasoning
+  is version-gated.
+
+- **Structured tool output.** Every tool now declares an `outputSchema` and
+  returns `structuredContent` alongside the existing serialized text block.
+  Tools that return a bare array wrap it as `{ rows: [...] }`, because
+  `structuredContent` must be a JSON object; the `content` block is unchanged, so
+  nothing that reads it today breaks. Version-gated fields are modelled as
+  OPTIONAL rather than nullable -- absence is a deliberate signal in this codebase
+  and a nullable schema would erase the distinction.
+
+- **Opt-in audit logging of agent SQL** via `POSTGRES_AUDIT_LOG` /
+  `POSTGRES_AUDIT_LOG_FILE` / `POSTGRES_AUDIT_REDACT`, off by default. One JSON
+  line per statement: timestamp, tool, SQL, parameter COUNT, duration, rows, and
+  ok/SQLSTATE. Parameter VALUES are never logged -- they routinely carry PII and
+  credentials. A redacting mode logs only the leading keyword plus a hash for
+  operators who want the trail without the content. An unopenable sink fails
+  LOUDLY at startup rather than degrading to no trail, since an audit control that
+  quietly disables itself is worse than none.
+
+- **PostgreSQL 19 forward-compatibility.** PG19 renames
+  `pg_stat_subscription_stats.sync_error_count` to `sync_table_error_count` and
+  wait event type `BUFFERPIN` to `BUFFER`. Wait-event values are asserted to pass
+  through untouched, so a future filter on the old literal -- which would silently
+  match nothing on PG19 -- cannot be added without failing a test.
+
+### Changed
+
+- **Dual-era MCP protocol support.** The server was legacy-only: it pinned SDK
+  v1, which tops out at protocol revision 2025-11-25, and the current revision's
+  compatibility matrix states that a modern client talking to a legacy server
+  FAILS. It now serves both eras via SDK v2's `serveStdio`. The existing
+  process-level tests still drive a real `initialize` handshake against the
+  emitted bundle, which is what proves the legacy path still works.
+
+### Fixed
+
+- **`release.sh` could report a failed release as a success.** The status lived
+  in a value a caller could easily discard, and a pipeline returns its LAST
+  command's status -- so a release that died at the push step read as exit 0. The
+  failure banner is now the final thing written, on both streams, naming the step
+  and its remedy. Re-entry is also guarded: a local tag that does not match the
+  commit being released now fails loudly instead of building a GitHub release
+  from an orphaned tag.
+
+- **`wsl-test-matrix.sh` tested against stale dependencies.** It ran `npm ci`
+  only when `node_modules` was ABSENT, so a branch that changed a dependency was
+  silently tested against the previous branch's tree. It reinstalls on a
+  lockfile-hash change, and a failing install aborts instead of proceeding. This
+  produced a red matrix on all three majors during this very change set.
+
+- **The oam sandbox allowlist dropped the new audit variables.** oam removes an
+  undeclared variable rather than denying it, so `POSTGRES_MCP_SANDBOX=1` would
+  have silently disabled the audit trail. Caught by the bundle-scanning test
+  added in 0.11.0. Also documented that the sandbox denies the filesystem, so a
+  FILE audit sink cannot open under it -- use the stderr sink there.
+
+- **Integration tests called handlers with arguments no MCP client could send.**
+  Several call sites passed a `limit` above the declared schema maximum; direct
+  handler calls bypass Zod, so they silently worked and a cap regression would
+  not have been caught. Bounds are now respected, and a schema-level test pins
+  the cap.
+
+
 ## [0.11.2] - 2026-08-23
 
 ### Fixed

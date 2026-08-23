@@ -4,6 +4,7 @@ import { z } from "zod";
 import { adminTools } from "./admin.js";
 import { explainTools } from "./explain.js";
 import { healthTools } from "./health.js";
+import { indexAdvisorTools } from "./index-advisor.js";
 import { ioTools } from "./io.js";
 import { queryTools } from "./query.js";
 import { schemaTools } from "./schemas.js";
@@ -17,6 +18,7 @@ const allTools = [
   ...queryTools,
   ...schemaTools,
   ...explainTools,
+  ...indexAdvisorTools,
   ...healthTools,
   ...statsTools,
   ...ioTools,
@@ -54,6 +56,35 @@ describe("Tool definitions", () => {
         assert.ok(tool.inputSchema);
         assert.ok(tool.inputSchema instanceof z.ZodObject);
         assert.ok(tool.inputSchema.shape !== null && typeof tool.inputSchema.shape === "object");
+      });
+
+      // MCP structured tool output: index.ts passes `tool.outputSchema.shape`
+      // to registerTool, so a tool that forgets the field is a hard TypeScript
+      // error -- but a tool whose schema is not a ZodObject would still compile
+      // and then break at runtime, because `structuredContent` must be a JSON
+      // OBJECT. Tools returning a bare array declare that through
+      // output.ts:rowsOutput, which is why every schema here is an object.
+      it("should have an output schema, and it must be a ZodObject", () => {
+        assert.ok(tool.outputSchema);
+        assert.ok(tool.outputSchema instanceof z.ZodObject);
+        assert.ok(tool.outputSchema.shape !== null && typeof tool.outputSchema.shape === "object");
+        assert.ok(
+          Object.keys(tool.outputSchema.shape).length > 0,
+          `${tool.name} declared an empty outputSchema, which advertises a response with no fields`,
+        );
+      });
+
+      // The SDK converts every outputSchema to JSON Schema to answer
+      // tools/list. Zod 4's converter THROWS on a type it cannot represent
+      // (z.date, z.bigint, z.never, z.custom), and that throw takes down
+      // tools/list for the WHOLE server -- every tool becomes unlistable, not
+      // just the offending one. Reproduce the conversion here so an
+      // unrepresentable type fails a unit test instead of a host's handshake.
+      it("outputSchema converts to JSON Schema (what tools/list serves)", () => {
+        const json = z.toJSONSchema(z.object(tool.outputSchema.shape), { io: "output" }) as {
+          type?: string;
+        };
+        assert.equal(json.type, "object", `${tool.name} outputSchema did not convert to a JSON Schema object`);
       });
 
       it("should have a handler function", () => {

@@ -68,9 +68,7 @@ const wraparoundTableRowOutput = z.object({
   table: z.string(),
   relkind: z.string().describe("Raw relkind: 'r' heap, 'm' materialized view, 't' TOAST -- the only three checked."),
   xid_age: z.number().describe("age(relfrozenxid)."),
-  freeze_max_age: z
-    .number()
-    .describe("EFFECTIVE limit: a per-table storage parameter wins over the cluster GUC."),
+  freeze_max_age: z.number().describe("EFFECTIVE limit: a per-table storage parameter wins over the cluster GUC."),
   pct_of_freeze_max_age: z.number().nullable().describe("At 1.0 autovacuum forces an anti-wraparound VACUUM."),
   mxid_age: z.number().nullable().describe("mxid_age(relminmxid). Null when no multixact was ever recorded."),
   multixact_freeze_max_age: z.number().describe("EFFECTIVE limit, resolved the same way as freeze_max_age."),
@@ -1153,6 +1151,10 @@ export const adminTools = [
             "Both 'approx' and 'exact' require the pgstattuple extension.",
         ),
     }),
+    // One schema for all three methods on purpose: the estimate / approx / exact
+    // queries are built to return the SAME row shape on the same server, so a
+    // caller comparing two runs never watches a key appear and disappear.
+    outputSchema: rowsOutput(bloatRowOutput),
     handler: async (input: unknown) => {
       // Direct (non-MCP) callers bypass Zod, so its defaults never run for
       // them. Re-applied in the destructure -- matches the precedent in

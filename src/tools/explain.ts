@@ -283,7 +283,7 @@ export const explainTools = [
       plan: z
         .union([z.string(), z.array(z.unknown())])
         .describe(
-          "Newline-joined plan text for `format: \"text\"` (with a trailing truncation marker when " +
+          'Newline-joined plan text for `format: "text"` (with a trailing truncation marker when ' +
             'POSTGRES_MAX_ROWS chopped it), or the parsed plan array for `format: "json"`.',
         ),
     }),

@@ -147,6 +147,102 @@ describe("wrapToolHandler: a THROWN exception -> its own isError block", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// MCP structured tool output (spec revision 2025-06-18).
+//
+// index.ts declares an `outputSchema` on every tool, and from that point the
+// SDK REJECTS any successful result whose `structuredContent` is missing or
+// fails to parse. These tests pin the half of that contract this module owns:
+// what goes into the key, that `content` keeps its pre-existing form beside it,
+// and that no error path acquires one.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("wrapToolHandler: structuredContent mirrors the content text", () => {
+  it("carries an object payload through unchanged, byte-identical to the text block", async () => {
+    const data = { rows: [{ id: 1 }], rowCount: 1, nested: { a: [1, 2] } };
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+    const res = await wrapped({});
+    assert.deepEqual(res.structuredContent, data);
+    // The two halves must never disagree -- a client reading `content` and one
+    // reading `structuredContent` have to see the same answer.
+    assert.deepEqual(res.structuredContent, JSON.parse(res.content[0]!.text));
+  });
+
+  it("wraps a BARE ARRAY payload as { rows } while content keeps the unwrapped array", async () => {
+    // structuredContent must be a JSON object, but the list tools resolve to
+    // arrays. The wrap lives here and in tools/output.ts:rowsOutput; `content`
+    // stays unwrapped so no client reading it today sees a changed payload.
+    const data = [{ schema_name: "public" }, { schema_name: "app" }];
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+    const res = await wrapped({});
+    assert.deepEqual(res.structuredContent, { rows: data });
+    assert.equal(res.content[0]!.text, JSON.stringify(data, null, 2));
+    assert.equal(Array.isArray(JSON.parse(res.content[0]!.text)), true, "content must stay a bare array");
+  });
+
+  it("wraps an EMPTY array too (an empty list is a real answer, not a missing one)", async () => {
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: [] }));
+    const res = await wrapped({});
+    assert.deepEqual(res.structuredContent, { rows: [] });
+    assert.equal(res.content[0]!.text, "[]");
+  });
+
+  it("carries the { success: true } sentinel when ok is true but data is absent", async () => {
+    const wrapped = wrapToolHandler(async () => ({ ok: true }));
+    const res = await wrapped({});
+    assert.deepEqual(res.structuredContent, { success: true });
+  });
+
+  it("omits structuredContent for a scalar payload rather than inventing a wrapper key", async () => {
+    // 0/false/'' have no object form. Inventing one (`{ value: 0 }`) would
+    // advertise a shape no tool's outputSchema declares, so the key is left
+    // off and `content` still carries the value verbatim.
+    for (const data of [0, false, "", 42, "plain"] as const) {
+      const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+      const res = await wrapped({});
+      assert.equal("structuredContent" in res, false, `scalar ${JSON.stringify(data)} produced structuredContent`);
+      assert.equal(res.content[0]!.text, JSON.stringify(data, null, 2));
+      assert.equal(res.isError, undefined);
+    }
+  });
+
+  it("stringifies bigints INSIDE structuredContent, not only in the text block", async () => {
+    // structuredContent is a live object the transport serializes later. A
+    // bigint left in it throws "Do not know how to serialize a BigInt" inside
+    // the SDK, outside this module's try/catch, where nothing is left to shape
+    // it into an error envelope -- so the value must already be a string here.
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: { id: 9007199254740993n, ok: true } }));
+    const res = await wrapped({});
+    assert.equal(res.isError, undefined);
+    assert.deepEqual(res.structuredContent, { id: "9007199254740993", ok: true });
+    // The whole envelope has to survive the transport's own JSON.stringify.
+    assert.doesNotThrow(() => JSON.stringify(res));
+  });
+});
+
+describe("wrapToolHandler: no error path carries structuredContent", () => {
+  it("omits it on { ok: false }, on a throw, and on a malformed result", async () => {
+    // The SDK skips output validation once isError is set, so a structured
+    // body there would be an unvalidated object matching no outputSchema. The
+    // error text is the entire answer an error response has.
+    const handlers: ((input: unknown) => Promise<unknown>)[] = [
+      async () => ({ ok: false, error: "permission denied" }),
+      async () => ({ ok: false }),
+      async () => {
+        throw new Error("boom");
+      },
+      async () => null,
+      async () => 42,
+    ];
+    for (const handler of handlers) {
+      const res = await wrapToolHandler(handler)({});
+      assert.equal(res.isError, true);
+      assert.equal("structuredContent" in res, false, "an error envelope must not carry structuredContent");
+      assert.match(res.content[0]!.text, /^Error: /);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // GAP 2: withSharedClient connect failure propagates as a THROW (not
 // {ok:false}); the index.ts wrapper's outer catch shapes it into an error
 // response rather than crashing.

@@ -31,8 +31,19 @@ rsync -a --delete \
   "${REPO_SRC}/" "${REPO_DST}/"
 
 cd "${REPO_DST}"
-if [ ! -d node_modules ]; then
-  npm ci --no-audit --no-fund >/dev/null
+# Re-install when the lockfile CHANGES, not merely when node_modules is absent.
+# The old `[ ! -d node_modules ]` guard cached the install forever, so a branch
+# that changed a dependency was silently tested against the PREVIOUS branch's
+# node_modules. That is a false-result generator in both directions: it produced
+# a red matrix on all three majors when the MCP SDK went v1 -> v2 (TS2307, the
+# new packages were simply not there), and it would just as happily go green
+# against a dependency the branch had actually removed.
+LOCK_STAMP=".npm-ci-lock-stamp"
+LOCK_HASH="$(sha256sum package-lock.json 2>/dev/null | cut -d' ' -f1)"
+if [ ! -d node_modules ] || [ "$(cat "$LOCK_STAMP" 2>/dev/null)" != "$LOCK_HASH" ]; then
+  echo "  installing dependencies (lockfile changed or node_modules absent)"
+  npm ci --no-audit --no-fund >/dev/null || { echo "npm ci FAILED"; exit 1; }
+  printf '%s' "$LOCK_HASH" > "$LOCK_STAMP"
 fi
 
 service postgresql start >/dev/null 2>&1 || true

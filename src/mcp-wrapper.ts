@@ -22,11 +22,22 @@
  *      failures propagate as exceptions rather than `{ ok: false }`
  *      (see api.ts:withSharedClient). The try/catch below shapes either
  *      into an `isError` envelope so the process never crashes.
+ *
+ * A third failure does NOT reach this module at all, and used to. A call naming
+ * an unknown or disabled tool fails inside the SDK's own dispatch, before any
+ * handler runs -- and as of SDK v2 that REJECTS with ProtocolError(-32602)
+ * instead of resolving `{ isError: true }` the way v1 did. Nothing here can
+ * reshape it, so a caller that read "no such tool" as a soft error now gets a
+ * JSON-RPC error frame instead of a result. index.test.ts pins that over the
+ * wire, because no unit test of this module can observe it.
  */
 
-// The MCP SDK's `server.tool` callback return type carries an index signature
-// (`[x: string]: unknown`) alongside `content` / `isError`. Keep that here so
-// the wrapped function stays assignable to `server.tool` in index.ts.
+// The SDK's `CallToolResult` carries an index signature (`[x: string]: unknown`)
+// alongside `content` / `isError`, so this interface has to as well. Dropping it
+// does not merely loosen the type, it breaks the build: `registerTool`'s callback
+// returns `CallToolResult | InputRequiredResult`, and without the index signature
+// TypeScript matches this shape against the InputRequiredResult arm and reports a
+// missing `resultType` -- an error that names neither `content` nor this file.
 export interface McpToolResponse {
   [x: string]: unknown;
   content: { type: "text"; text: string }[];
