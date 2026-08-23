@@ -6,7 +6,7 @@
  * Gated on POSTGRES_MCP_INTEGRATION=1 so `npm test` without a DB stays fast.
  */
 
-import { runInternal, shutdown } from "../api.js";
+import { runInternal, shutdown, withSharedClient } from "../api.js";
 
 export const FIXTURE_SCHEMA = "test_fixture";
 
@@ -392,12 +392,41 @@ let _pg18: Pg18FixtureState = {
  * than rolling it back; the probe reports false either way, and DROP SCHEMA
  * CASCADE reclaims the remnant.
  */
+/**
+ * Run a best-effort statement group ATOMICALLY: either every statement lands
+ * or none does.
+ *
+ * The atomicity is load-bearing, not tidiness. These groups are shaped as
+ * `CREATE TABLE ...` followed by a PG18-only `ALTER TABLE ...`, so running
+ * them statement-by-statement on PG15/17 left the TABLE behind after the
+ * ALTER failed. The probe correctly returned false, but the orphan relation
+ * stayed in the fixture schema and showed up in `pg_list_tables` on every
+ * older major -- which broke an exact-match assertion in
+ * schemas.integration.test.ts that had nothing to do with PG18.
+ *
+ * Wrapping in a transaction works because PostgreSQL has transactional DDL:
+ * the ROLLBACK unwinds the CREATE as cleanly as it unwinds the ALTER. Note
+ * `runInternal` runs each call on a pooled connection, so BEGIN/ROLLBACK must
+ * ride the SAME client -- hence withSharedClient rather than bare runInternal.
+ */
 async function tryStatementGroup(statements: string[]): Promise<boolean> {
-  for (const sql of statements) {
-    const res = await runInternal(sql);
-    if (!res.ok) return false;
-  }
-  return true;
+  return withSharedClient(async (run) => {
+    const begun = await run("BEGIN");
+    if (!begun.ok) return false;
+    for (const sql of statements) {
+      const res = await run(sql);
+      if (!res.ok) {
+        await run("ROLLBACK");
+        return false;
+      }
+    }
+    const committed = await run("COMMIT");
+    if (!committed.ok) {
+      await run("ROLLBACK");
+      return false;
+    }
+    return true;
+  });
 }
 
 /**

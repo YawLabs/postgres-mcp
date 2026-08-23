@@ -3,7 +3,20 @@
 # Ubuntu has clusters for. Reports pass/fail per version. Exits non-zero if
 # any version fails.
 #
-#   wsl -d Ubuntu -u root bash /mnt/c/path/to/postgres-mcp/scripts/wsl-test-matrix.sh
+#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root bash \
+#     /mnt/c/path/to/postgres-mcp/scripts/wsl-test-matrix.sh
+#
+# The MSYS_NO_PATHCONV=1 prefix is REQUIRED when invoking from Git Bash on
+# Windows, and its absence fails silently in the worst way. Git Bash rewrites
+# a Unix-shaped argument bound for a native .exe before wsl.exe sees it, so
+# `/mnt/c/...` arrives as `C:/Users/<you>/scoop/apps/git/<ver>/mnt/c/...` and
+# bash reports "No such file or directory" -- having run no tests at all.
+# Invoking from PowerShell or a real Linux shell needs no prefix.
+#
+# Do NOT pipe this script into `tail`/`head` to trim its output. The pipeline's
+# exit status is the LAST command's, so a failing matrix (or the path failure
+# above) reports success and a red run reads as green. Redirect to a file and
+# grep it instead.
 #
 # Assumes wsl-pg-setup.sh has already been run.
 set -uo pipefail

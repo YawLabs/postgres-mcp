@@ -916,6 +916,33 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       }
     }
 
+    /**
+     * Park a backend in a HEALTHY open transaction (`idle in transaction`).
+     *
+     * Distinct from withAbortedTransaction for a reason that is not obvious and
+     * cost a red matrix to learn: PostgreSQL CLEARS `pg_stat_activity.xact_start`
+     * once a transaction aborts. Probed directly on PG17 --
+     *   idle in transaction (aborted) -> xact_start NULL
+     *   idle in transaction           -> xact_start set
+     * -- so an aborted backend can only ever exercise the state bucket, never
+     * `transaction_age_seconds`. Anything asserting a real transaction age has
+     * to park a transaction that is still good.
+     */
+    async function withOpenTransaction<T>(fn: (pid: number) => Promise<T>): Promise<T> {
+      const side = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await side.connect();
+      try {
+        const pid = (await side.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+        await side.query("BEGIN");
+        // Touch a real relation so the transaction is unambiguously underway.
+        await side.query("SELECT 1");
+        return await fn(pid);
+      } finally {
+        await side.query("ROLLBACK").catch(() => {});
+        await side.end().catch(() => {});
+      }
+    }
+
     it("returns connected=true with a version string and database info", async () => {
       const res = (await pgHealth.handler({ activeQueryLimit: 10 })) as {
         ok: boolean;
@@ -1037,7 +1064,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     // PRESENCE and type, never non-null. A truthiness check would pass just as
     // happily against a handler that dropped both columns from the SELECT.
     it("active_queries rows carry the wait-event pair, backend_type and transaction_age_seconds", async () => {
-      await withAbortedTransaction(async (parkedPid) => {
+      await withOpenTransaction(async (parkedPid) => {
         // 100 rather than the default 10: the parked backend sorts last under
         // `ORDER BY query_start ASC` and a busy cluster could crowd it out.
         const res = (await pgHealth.handler({ activeQueryLimit: 100 })) as {
@@ -1051,7 +1078,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           row,
           `expected parked backend ${parkedPid} in active_queries; got pids ${JSON.stringify(rows.map((r) => r.pid))}`,
         );
-        assert.equal(row.state, "idle in transaction (aborted)");
+        assert.equal(row.state, "idle in transaction");
         assert.equal(row.backend_type, "client backend");
         assert.ok(
           "wait_event_type" in row,
@@ -1060,8 +1087,8 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         assert.ok("wait_event" in row, `wait_event key must be present, got keys: ${Object.keys(row).join(", ")}`);
         if (row.wait_event_type !== null) assert.equal(typeof row.wait_event_type, "string");
         if (row.wait_event !== null) assert.equal(typeof row.wait_event, "string");
-        // The backend sits inside a transaction block, so xact_start is set and
-        // the age derived from it must be a real number. A large
+        // The backend sits inside a LIVE transaction block, so xact_start is set
+        // and the age derived from it must be a real number. A large
         // transaction_age_seconds next to a small duration_seconds is the tell
         // for the long-open transaction behind most lock waits and stalled
         // autovacuum, so this field going null here is a real regression.
@@ -1071,6 +1098,30 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           (row.transaction_age_seconds ?? -1) >= 0,
           `transaction_age_seconds must be non-negative, got ${row.transaction_age_seconds}`,
         );
+      });
+    });
+
+    // The companion to the case above, and the reason the two need separate
+    // helpers. PostgreSQL clears `xact_start` the moment a transaction aborts,
+    // so an `idle in transaction (aborted)` backend reports a NULL transaction
+    // age even though its transaction block is still open and still holding
+    // locks. Pinned because it is genuinely surprising: the obvious reading of
+    // "still in a transaction" says this should be set, and a test written on
+    // that assumption fails against every supported major.
+    it("reports a null transaction age for an ABORTED transaction (postgres clears xact_start)", async () => {
+      await withAbortedTransaction(async (parkedPid) => {
+        const res = (await pgHealth.handler({ activeQueryLimit: 100 })) as {
+          ok: boolean;
+          data?: { active_queries: HealthActiveQuery[] };
+        };
+        assert.equal(res.ok, true);
+        const row = (res.data?.active_queries ?? []).find((r) => r.pid === parkedPid);
+        assert.ok(row, `expected aborted backend ${parkedPid} in active_queries`);
+        assert.equal(row.state, "idle in transaction (aborted)");
+        // Still surfaced as a row with its state intact -- the backend is very
+        // much alive and blocking. Only the age is unavailable.
+        assert.equal(row.xact_start, null);
+        assert.equal(row.transaction_age_seconds, null);
       });
     });
 

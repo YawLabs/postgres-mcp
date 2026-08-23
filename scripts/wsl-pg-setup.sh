@@ -2,7 +2,14 @@
 # Configures a WSL Ubuntu install with PostgreSQL 15, 17 and 18 ready for the
 # integration test matrix. Run as root inside WSL:
 #
-#   wsl -d Ubuntu -u root bash /mnt/c/path/to/postgres-mcp/scripts/wsl-pg-setup.sh
+#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root bash \
+#     /mnt/c/path/to/postgres-mcp/scripts/wsl-pg-setup.sh
+#
+# The MSYS_NO_PATHCONV=1 prefix is REQUIRED from Git Bash on Windows: it stops
+# Git Bash rewriting the `/mnt/c/...` argument into
+# `C:/Users/<you>/scoop/apps/git/<ver>/mnt/c/...` before wsl.exe sees it, which
+# fails with "No such file or directory" having done nothing. Not needed from
+# PowerShell or a real Linux shell. See wsl-test-matrix.sh for the same note.
 #
 # Installs from the PGDG apt repo (Ubuntu's default ships PG16 only).
 # pg_createcluster auto-assigns ports (17 -> 5432, 18 -> 5433, 15 -> 5434 or

@@ -329,7 +329,9 @@ wsl -d Ubuntu -u root bash /mnt/c/path/to/postgres-mcp/scripts/wsl-pg-setup.sh
 wsl -d Ubuntu -u root bash /mnt/c/path/to/postgres-mcp/scripts/wsl-test-matrix.sh
 ```
 
-`wsl-pg-setup.sh` installs PG17 and PG18 from the PGDG apt repo on ports 5432 and 5433, sets the `postgres` password to `postgres`, and creates `postgres_mcp_test` in each. `wsl-test-matrix.sh` rsyncs the working tree into `/root/postgres-mcp`, runs `npm ci` once, and runs the integration suite against every cluster found via `pg_lsclusters`.
+`wsl-pg-setup.sh` installs PG15, PG17 and PG18 from the PGDG apt repo (ports are auto-assigned by `pg_createcluster` -- typically 17 on 5432, 18 on 5433, 15 on 5434), sets the `postgres` password to `postgres`, and creates `postgres_mcp_test` in each. `wsl-test-matrix.sh` rsyncs the working tree into `/root/postgres-mcp`, runs `npm ci` once, and runs the integration suite against every cluster found via `pg_lsclusters`.
+
+**Running these from Git Bash instead of PowerShell?** Prefix both script invocations with `MSYS_NO_PATHCONV=1`. Git Bash rewrites the `/mnt/c/...` argument before `wsl.exe` sees it, so the script arrives as `C:/Users/<you>/scoop/apps/git/<ver>/mnt/c/...` and bash exits with "No such file or directory" having run nothing. Also avoid piping either script into `tail`/`head` -- the pipeline's exit status is the last command's, so a failing matrix reports success.
 
 Tear down when finished: `wsl --unregister Ubuntu`.
 
