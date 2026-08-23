@@ -8,6 +8,7 @@ import { wrapToolHandler } from "./mcp-wrapper.js";
 import { adminTools } from "./tools/admin.js";
 import { explainTools } from "./tools/explain.js";
 import { healthTools } from "./tools/health.js";
+import { ioTools } from "./tools/io.js";
 import { queryTools } from "./tools/query.js";
 import { schemaTools } from "./tools/schemas.js";
 import { statsTools } from "./tools/stats.js";
@@ -86,19 +87,41 @@ if (subcommand !== undefined && !subcommand.startsWith("-")) {
 
 // ─── No subcommand - start the MCP server ───
 
-const allTools = [...queryTools, ...schemaTools, ...explainTools, ...healthTools, ...statsTools, ...adminTools];
+const allTools = [
+  ...queryTools,
+  ...schemaTools,
+  ...explainTools,
+  ...healthTools,
+  ...statsTools,
+  ...ioTools,
+  ...adminTools,
+];
 
 const server = new McpServer({
   name: "@yawlabs/postgres-mcp",
   version,
 });
 
+// `server.tool()` is deprecated as of SDK 1.30 -- every one of its six
+// overloads carries `@deprecated Use registerTool instead`, and it is gone in
+// the v2 packages. registerTool takes the same information as a config object
+// and is the only form that can carry `outputSchema`, so moving now is what
+// makes structured tool output reachable later without touching this loop
+// again.
 for (const tool of allTools) {
-  server.tool(
+  server.registerTool(
     tool.name,
-    tool.description,
-    tool.inputSchema.shape,
-    tool.annotations,
+    {
+      // `title` at the top level is where the current spec puts a tool's
+      // display name; `annotations.title` is the older location. Emit BOTH --
+      // dropping the annotations copy would regress hosts that only read it,
+      // and omitting the top-level one leaves newer hosts showing the raw
+      // `pg_*` name.
+      title: tool.annotations.title,
+      description: tool.description,
+      inputSchema: tool.inputSchema.shape,
+      annotations: tool.annotations,
+    },
     wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>),
   );
 }

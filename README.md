@@ -167,22 +167,23 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 | `pg_query` | Run a SQL query. Writes gated by the role in `DATABASE_URL` first, `ALLOW_WRITES` second. Supports parameterized queries via `params`. Result fields include `dataTypeName` (e.g. `int4`, `jsonb`) alongside `dataTypeID`. |
 | `pg_list_schemas` | List non-system schemas. |
 | `pg_list_tables` | List tables (and optionally views) in a schema with estimated row counts. Paginated via `limit`/`offset`. |
-| `pg_describe_table` | Kind, columns, PK, outgoing FKs, incoming FKs (`referenced_by`), CHECK / UNIQUE / EXCLUDE constraints, indexes, and partition parent/children for a relation. |
+| `pg_describe_table` | Kind, columns, PK, outgoing FKs, incoming FKs (`referenced_by`), CHECK / UNIQUE / EXCLUDE constraints, indexes, and partition parent/children for a relation. Generated and identity columns are flagged (`generated`, `identity`, `generation_expression`) so an agent doesn't try to write to them. Constraints carry `validated`, plus `enforced` / `has_period` on PG18+. |
 | `pg_list_views` | List views and materialized views in a schema, including their SQL definitions. |
 | `pg_list_functions` | List functions, procedures, and aggregates in a schema with signatures and return types. |
 | `pg_list_extensions` | List installed extensions (pgvector, postgis, pg_stat_statements, etc.) with versions. |
 | `pg_search_columns` | Find columns by name pattern across all user schemas. Case-insensitive, supports SQL LIKE wildcards. |
-| `pg_explain` | `EXPLAIN` or `EXPLAIN ANALYZE` for a SQL statement. Text or JSON output. Optional `hypothetical_indexes` (requires the [HypoPG](https://github.com/HypoPG/hypopg) extension) lets you ask "what would the plan be with these indexes?" without creating them on disk. |
-| `pg_health` | Server version, database size, connection count, active queries, table count. |
-| `pg_top_queries` | Top N queries by total/mean execution time. Requires the `pg_stat_statements` extension. |
-| `pg_seq_scan_tables` | Tables with heavy sequential scans - missing-index candidates. |
-| `pg_unused_indexes` | Non-unique, non-primary indexes with low scan counts - drop candidates. |
+| `pg_explain` | `EXPLAIN` or `EXPLAIN ANALYZE` for a SQL statement. Text or JSON output. Planner options: `buffers` (on by default with `analyze`), `settings`, `verbose`, `wal`, `costs`, `timing`, plus `generic_plan` (PG16+, plan a parameterized query with no values) and `memory` / `serialize` (PG17+). Optional `hypothetical_indexes` (requires the [HypoPG](https://github.com/HypoPG/hypopg) extension) lets you ask "what would the plan be with these indexes?" without creating them on disk. |
+| `pg_health` | Server version, database size, connections against `max_connections`, active queries with wait events and transaction age, `pg_stat_database` rollup (deadlocks, temp files, cache hit ratio), table count. |
+| `pg_top_queries` | Top N queries by total/mean execution time. Requires the `pg_stat_statements` extension. Returns `stats_reset` (from `pg_stat_statements_info`, a different clock from the other stats tools) and `dealloc` on extension 1.9+ - a non-zero `dealloc` means entries were evicted past `pg_stat_statements.max`, so the ranking is drawn from an incomplete population. |
+| `pg_seq_scan_tables` | Tables with heavy sequential scans - missing-index candidates. Returns the `stats_reset` window alongside the rows, since the counters mean nothing without it. `last_seq_scan` / `last_idx_scan` on PG16+. |
+| `pg_unused_indexes` | Non-unique, non-primary indexes with low scan counts - drop candidates. Also returns `stats_reset`: a recently reset counter makes every index look unused, which is how a load-bearing index gets dropped. `last_idx_scan` on PG16+. |
+| `pg_io_stats` | I/O observability: `pg_stat_io` read/write/extend/fsync counts, bytes and times per backend type and context (PG16+), plus in-flight async I/O handles from `pg_aios` and the active `io_method` (PG18+). |
 | `pg_inspect_locks` | Who is blocking whom right now (blocked PID, blocker PID, lock type, queries). |
 | `pg_list_roles` | Database roles with login/superuser/createdb flags and group memberships. |
 | `pg_table_privileges` | Who has SELECT/INSERT/UPDATE/DELETE/etc. on a table or whole schema. |
 | `pg_table_bloat` | Tables with high dead-tuple ratios - VACUUM candidates. |
 | `pg_replication_status` | Replication slots, connected replicas, and current WAL position. |
-| `pg_advisor` | Rolled-up DBA lints in one call: sequence-exhaustion candidates, tables without a primary key, and (configurable) public tables with RLS disabled. The "what should I be looking at?" starting point. |
+| `pg_advisor` | Rolled-up DBA lints in one call: sequence-exhaustion candidates, wraparound risk for both counters (per-database and per-table `age(relfrozenxid)` against `autovacuum_freeze_max_age`, and `mxid_age(relminmxid)` against `autovacuum_multixact_freeze_max_age` -- a lock-heavy workload can exhaust multixacts while xids look healthy; `triggered_by` says which), tables without a primary key, and (configurable) public tables with RLS disabled. The "what should I be looking at?" starting point. |
 | `pg_kill` | Cancel a running query or terminate a backend connection. Requires `ALLOW_WRITES=1`. |
 
 ## Configuration
@@ -198,12 +199,25 @@ All env vars are read from the MCP server's environment:
 | `POSTGRES_MAX_ROWS` | `1000` | Cap on rows returned by `pg_query`. |
 | `POSTGRES_POOL_MAX` | `5` | Max pool connections. Set to `1` for single-threaded backends (pglite-socket, PgBouncer transaction mode). |
 | `POSTGRES_SSL_REJECT_UNAUTHORIZED` | unset | Set to `false` to skip TLS cert verification (for managed DBs using private-CA certs). Connection is still encrypted. |
+| `POSTGRES_APPLICATION_NAME` | `postgres-mcp` | Value reported in `pg_stat_activity.application_name`, so agent traffic is identifiable to whoever is watching the database. An `application_name` in `DATABASE_URL` takes precedence over this. |
 | `POSTGRES_MCP_RUNTIME` | `auto` | Which JS runtime executes the server: `auto` (prefer [oam](https://oamjs.org), fall back to Node), `oam` (require oam, fail if absent), `node` (never use oam). See [Runtime](#runtime). |
 | `OAM_BIN` | unset | Explicit path to an `oam` binary, checked before PATH and the default install locations. |
 
 ### Supported Postgres versions
 
-Tested on **PostgreSQL 15, 17 and 18** in the integration matrix. Should work on PG13+ -- a few tools (`pg_replication_status` reading `wal_status`, `pg_top_queries` reading `*_exec_time`) rely on columns that landed in PG13. PG12 and below are out of upstream support and not exercised here.
+Tested on **PostgreSQL 15, 17 and 18** in the integration matrix.
+
+Works on PG13+, but note where upstream support actually sits: **PG13 reached end of life on 2025-11-13 and PG14 does so on 2026-11-12.** PG13/14 are not exercised here and are not a compatibility target going forward. PG12 and below are further out of support and some tools rely on columns that landed in PG13 (`pg_replication_status` reading `wal_status`, `pg_top_queries` reading `*_exec_time`).
+
+Newer server versions unlock extra fields rather than being required. Every version-dependent column is gated on `server_version_num` and simply omitted on servers that predate it, so nothing errors -- you get a slightly thinner answer. The cut points that matter:
+
+| Server | What it adds |
+|--------|--------------|
+| PG16+ | `last_idx_scan` / `last_seq_scan` in the stats tools (index/table staleness rather than a bare counter), `pg_explain` `generic_plan` |
+| PG17+ | `pg_explain` `memory` and `serialize` |
+| PG18+ | Generated-column form (`stored` vs `virtual`), NOT NULL constraint validity, `conenforced` / `conperiod` constraint metadata in `pg_describe_table`, `relallfrozen` freeze coverage in `pg_advisor`. `BUFFERS` is on by default with `EXPLAIN ANALYZE` server-side |
+
+If the version probe fails, the server assumes the oldest supported shape rather than emitting SQL a server might reject.
 
 ### Runtime
 
@@ -211,7 +225,7 @@ The published `postgres-mcp` command is a small launcher that prefers the [oam](
 
 **If you do not have oam, nothing changes.** The fallback is not a re-exec: npm already started Node to run the launcher, so falling back is a plain `import()` of the server into that same process. It costs a few `existsSync` calls and no subprocess, and behaves identically to running `dist/index.js` under Node directly.
 
-**If you do have oam,** the server runs under it. Verified equivalent on both runtimes: all 21 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
+**If you do have oam,** the server runs under it. Verified equivalent on both runtimes: all 22 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
 
 **Startup cost, measured.** windows-arm64, 1.4 MB bundle, `postgres-mcp version` (full module init), every binary warmed first, mean of 12 runs:
 
@@ -262,6 +276,14 @@ To allow the connection while keeping traffic encrypted, add `POSTGRES_SSL_REJEC
 ```
 
 This disables certificate chain verification only -- the TCP connection is still TLS-encrypted end-to-end. For production setups where you can install the CA, prefer putting the cert in the Node trust store (`NODE_EXTRA_CA_CERTS`) over disabling verification globally.
+
+**Shaving a round trip on PG17+.** Postgres 17 added direct TLS negotiation, which skips the plaintext `SSLRequest` handshake before the TLS one. The bundled driver supports it, so append `sslnegotiation=direct` to your `DATABASE_URL`:
+
+```
+postgres://user:pass@host:5432/db?sslmode=require&sslnegotiation=direct
+```
+
+It is opt-in rather than a default because a PG16-or-older server will reject the connection outright, and the saving is one round trip per pooled connection -- worth it on a distant managed database, invisible on a local one.
 
 ## Troubleshooting
 

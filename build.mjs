@@ -16,6 +16,11 @@ await build({
   entryPoints: ["src/index.ts"],
   bundle: true,
   platform: "node",
+  // Deliberately BELOW the `engines` floor (>=22). This target only controls
+  // how far esbuild downlevels syntax, so a lower value is a compatibility
+  // floor, not a bug: the emitted bundle stays runnable under alternate
+  // runtimes (oam) and older hosts that npm's engines check only warns about.
+  // Raising it would buy nothing -- the source uses no syntax newer than this.
   target: "node20",
   format: "esm",
   outfile: "dist/index.js",

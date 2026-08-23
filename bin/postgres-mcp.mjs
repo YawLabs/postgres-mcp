@@ -179,7 +179,15 @@ function sandboxFlags() {
     }
   }
 
-  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGCONNECT_TIMEOUT","PGSSLMODE","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
+  // Every variable the SHIPPED BUNDLE reads, including the pg driver's own
+  // lookups. Adding a config env var to src/ without adding it here is a silent
+  // regression under the sandbox, not a loud one: oam removes an undeclared var
+  // from process.env rather than denying access, so the server reads undefined
+  // and quietly takes its default. POSTGRES_APPLICATION_NAME is read by
+  // getApplicationName() in src/api.ts; PGAPPNAME is pg's own env fallback for
+  // the same setting (connection-parameters.js: val('application_name', config,
+  // 'PGAPPNAME')), so omitting it would drop a name set the driver's way.
+  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGCONNECT_TIMEOUT","PGSSLMODE","POSTGRES_APPLICATION_NAME","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
 
   const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];
   return flags;

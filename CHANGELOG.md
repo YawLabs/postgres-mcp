@@ -7,6 +7,177 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pg_io_stats`, a new tool for I/O observability.** `pg_stat_io` read /
+  write / extend / fsync counts, bytes and times per backend type and context
+  (PG16+), plus in-flight async I/O handles from `pg_aios` and the active
+  `io_method` (PG18+). Byte accounting differs by server: PG16-17 expose
+  `op_bytes` to multiply against operation counts, and PG18 removed it in favour
+  of direct `read_bytes` / `write_bytes` / `extend_bytes`. Both branches are
+  normalized to one figure, and neither ever names the other's column.
+
+- **Server-version gating.** `getServerVersionNum()` in `api.ts` caches
+  `server_version_num` per process and every version-dependent column now routes
+  through it. A failed probe returns 0, the "assume oldest" sentinel, so an
+  unknown server falls through to the conservative query rather than emitting
+  SQL referencing a column it may not have. Probe failures are deliberately not
+  cached: one transient blip during the first tool call would otherwise pin the
+  process to degraded output for its whole lifetime.
+
+- **`pg_describe_table` flags generated and identity columns.** `pg_attrdef`
+  stores generation expressions alongside plain defaults, so a generated
+  column's expression was surfacing as `default_value` with nothing marking it
+  -- an agent read that as "optional column, has a default" and wrote an INSERT
+  postgres rejects. Identity columns failed the other way: no `pg_attrdef` row
+  at all, so they reported `default_value: null, nullable: false` and the agent
+  supplied a value into `GENERATED ALWAYS AS IDENTITY`. Columns now carry
+  `generated`, `identity`, and `generation_expression`.
+
+- **PG18 constraint metadata in `pg_describe_table`.** Constraints carry
+  `validated` on every version, plus `enforced` and `has_period` on PG18+. A
+  `NOT ENFORCED` foreign key looks present but validates nothing, and a temporal
+  `WITHOUT OVERLAPS` primary key previously rendered as an ordinary one. PG18
+  also made NOT NULL a real `pg_constraint` row that can be `NOT VALID` -- its
+  `attnotnull` docs now read "possibly invalid" -- so `not_null_validated` is
+  reported on PG18+, where the question can arise.
+
+- **`pg_explain` gained the planner options that actually diagnose a slow
+  query**: `buffers`, `settings`, `verbose`, `wal`, `costs`, `timing`, plus
+  `generic_plan` (PG16+) for planning a parameterized query with no values, and
+  `memory` / `serialize` (PG17+). Options below the server's version are
+  rejected up front by name and required major, rather than as a parse error
+  from the server.
+
+- **`pg_health` reports what a health check needs.** `max_connections` and a
+  used-fraction (so a connection count is readable), `wait_event_type` /
+  `wait_event` / `backend_type` / transaction age on active queries, and a
+  `pg_stat_database` rollup: deadlocks, temp files and bytes, conflicts, cache
+  hit ratio, `stats_reset`.
+
+- **`pg_advisor` checks wraparound risk**, the classic pageable incident:
+  per-database and per-table `age(relfrozenxid)` measured against
+  `autovacuum_freeze_max_age`, with a `wraparoundThreshold` parameter mirroring
+  the existing sequence-exhaustion one. Freeze coverage via `relallfrozen` on
+  PG18+.
+
+  Multixact wraparound is checked alongside it, on the same rows and with no
+  extra round trip: `mxid_age(relminmxid)` against
+  `autovacuum_multixact_freeze_max_age`. Multixacts are consumed by row-level
+  locking (`SELECT ... FOR SHARE/UPDATE`, foreign-key checks), so a lock-heavy
+  workload can exhaust them while `relfrozenxid` still looks perfectly healthy
+  -- checking only xids reports such a cluster as clean. A row is flagged when
+  EITHER counter crosses the threshold, and `triggered_by` (`xid` /
+  `multixact` / `both`) says which, because the remediation differs.
+
+- **`pg_health` connection buckets now reconcile against `total`.** Two
+  separate ways the old breakdown lied. First, `pg_stat_activity` does not hide
+  other users' sessions from an unprivileged role -- it returns the rows with
+  `state` NULL -- so `total` was complete while `active` / `idle` counted only
+  the caller's own sessions, and an operator could read `active: 0` on a busy
+  database. A `state_unavailable` counter now makes that shortfall visible.
+  Second, `idle in transaction (aborted)`, `starting`, `fastpath function
+  call`, and `disabled` matched no filter and vanished from the breakdown; the
+  aborted state is the one that holds locks and blocks vacuum, so it gets its
+  own field, and an `other` catch-all absorbs the rest (a `NOT IN` list, so a
+  future major's new state cannot silently disappear again).
+
+- **`POSTGRES_APPLICATION_NAME`** (default `postgres-mcp`), so agent traffic is
+  identifiable in `pg_stat_activity` instead of anonymous -- while `pg_health`
+  itself reports `application_name` for every other session. An
+  `application_name` in `DATABASE_URL` still wins.
+
+### Changed
+
+- **BREAKING: `pg_seq_scan_tables` and `pg_unused_indexes` return an envelope,
+  not a bare row array.** `data` is now
+  `{rows, stats_reset, stats_reset_age_seconds}`; callers read `data.rows`.
+  The reason is `pg_unused_indexes` could tell an agent to drop a load-bearing
+  index: a scan count is meaningless without knowing when the counters were
+  reset, and if that happened an hour ago every index looks unused. Both tools
+  also report `last_idx_scan` / `last_seq_scan` on PG16+, where "not scanned
+  since March" beats a bare counter.
+
+- **BREAKING: `pg_top_queries` returns the same envelope**, for the same
+  reason -- it ranks cumulative `total_exec_time` / `calls`. Its clock is NOT
+  `pg_stat_database.stats_reset` but `pg_stat_statements_info.stats_reset`, a
+  genuinely independent reset point; using the wrong one would have been worse
+  than omitting it. The same view supplies `dealloc`, which is the subtler
+  trap: it counts how often entries for the least-executed statements were
+  evicted for exceeding `pg_stat_statements.max`, so a non-zero value means
+  the "top queries" ranking is drawn from an incomplete population. Both
+  require extension 1.9 (PostgreSQL 14) and are omitted below it rather than
+  returned as nulls that would read as "never reset".
+
+- **BREAKING: `pg_explain` with `analyze: true` now emits `BUFFERS`.** PG18
+  turns it on by default server-side; on PG15-17 it had to be requested and was
+  absent. Plans gain buffer lines, so text plans roughly double in length and
+  `POSTGRES_MAX_ROWS` truncation can fire where it previously did not. Pass
+  `buffers: false` for the old output.
+
+- **BREAKING: the Node floor is now 22.** Node 20 reached end of life; the
+  supported lines are 22, 24 and 26. The esbuild target deliberately stays at
+  `node20` -- it only controls syntax downleveling, so a lower floor keeps the
+  bundle runnable under alternate runtimes.
+
+- **Tools register through `registerTool` instead of `server.tool`.** All six
+  `server.tool` overloads are deprecated as of SDK 1.30 and are gone in the v2
+  packages. `registerTool` is also the only form that can carry `outputSchema`,
+  so this is what makes structured tool output reachable later. Tools now
+  advertise a top-level `title` as well as `annotations.title`; both are emitted,
+  since dropping either regresses hosts that read only one.
+
+- **`@modelcontextprotocol/sdk` 1.29.0 -> 1.30.0** (the final v1.x release) and
+  **`pg` ^8.14.0 -> ^8.23.0**. The pg bump makes `sslnegotiation=direct`
+  available in `DATABASE_URL`, which skips a round trip against PG17+ servers;
+  it stays opt-in because a PG16-or-older server rejects the connection.
+
+- **Documented where PostgreSQL support actually sits.** PG13 reached end of
+  life on 2025-11-13 and PG14 does so on 2026-11-12. The integration matrix
+  remains 15 / 17 / 18.
+
+### Fixed
+
+- **`POSTGRES_APPLICATION_NAME` was missing from the oam sandbox allowlist.**
+  Under `POSTGRES_MCP_SANDBOX=1`, oam removes an undeclared variable from
+  `process.env` rather than denying access, so the operator's configured name
+  would have silently vanished and the server would have reported the default
+  -- precisely the silent-misbehaviour failure the launcher's own comment warns
+  about. `PGAPPNAME` is now granted too, since the pg driver reads it as its
+  own fallback for the same setting. A new test scans the shipped bundle for
+  literal `process.env` reads and fails if any config variable is absent from
+  the allowlist, so the next one cannot ship silently.
+
+- **`pg_io_stats` had no test coverage at all.** `tools.test.ts` builds its own
+  `allTools` array separate from `index.ts`, and the new tool was added to one
+  and not the other -- exempting it from every structural check, including the
+  duplicate-name guard. Both arrays now agree, and the tool has a unit suite
+  covering its version branches.
+
+- **A version probe suspended across `shutdown()` could republish a stale
+  server version.** `shutdown()` clears the cache, but a probe already awaiting
+  its query would resolve afterwards and write the OLD server's version into
+  the cache the NEW pool uses -- gating catalog queries against the wrong
+  server, the exact failure the reset exists to prevent. A generation counter
+  now invalidates in-flight probes, matching the guard `resolveTypeNames`
+  already had.
+
+- **Four `pg_explain` tests asserted the wrong thing whenever `DATABASE_URL`
+  was set.** Their helper cleared the env var to force the version probe's
+  "unknown" sentinel, but the pool and the version cache are module-scoped and
+  survive that, so on any machine with `DATABASE_URL` exported the probe never
+  re-ran. The suite passed or failed depending on the developer's environment.
+  The helper now calls `shutdown()` on both edges.
+
+### Security
+
+- **`fast-uri` bumped past the host-confusion advisory (GHSA, high).** It
+  reaches the published artifact rather than staying a build-time concern: the
+  MCP SDK depends on `ajv`, which depends on `fast-uri`, and esbuild bundles the
+  whole graph into `dist/index.js`. "It is only a devDependency" is not the
+  right test for this package -- the bundle is what ships, and the dependency
+  tree is flattened into it. `npm audit` now reports zero vulnerabilities.
+
 ## [0.10.0] - 2026-08-08
 
 ### Added

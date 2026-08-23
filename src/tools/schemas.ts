@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { runInternal, withSharedClient } from "../api.js";
+import { getServerVersionNum, PG18, runInternal, withSharedClient } from "../api.js";
 import { identSchema } from "./params.js";
 
 export const schemaTools = [
@@ -92,11 +92,17 @@ export const schemaTools = [
     name: "pg_describe_table",
     description:
       "Describe a relation: kind (table / view / materialized_view / partitioned_table / foreign_table), " +
-      "columns (name, type, nullable, default), primary key, foreign keys (outgoing), `referenced_by` " +
-      "(other tables whose FKs point at this one), `constraints` (CHECK / UNIQUE non-PK / EXCLUDE), " +
-      "indexes, and partition info (`partition_of` parent, `partitions` children). Works on views and " +
-      "materialized views too -- PK/FK/constraint/index lists will simply be empty for a plain view. " +
-      "Use `kind` to disambiguate before assuming you can write to the relation.",
+      "columns (name, type, nullable, default, `generated`, `identity`), primary key, foreign keys " +
+      "(outgoing), `referenced_by` (other tables whose FKs point at this one), `constraints` " +
+      "(CHECK / UNIQUE non-PK / EXCLUDE), indexes, and partition info (`partition_of` parent, " +
+      "`partitions` children). Works on views and materialized views too -- PK/FK/constraint/index " +
+      "lists will simply be empty for a plain view. Use `kind` to disambiguate before assuming you " +
+      "can write to the relation. Generated columns (`generated`: 'stored' / 'virtual') and " +
+      "`identity`: 'always' columns are NOT writable -- omit them from INSERT/UPDATE column lists; " +
+      "a generated column's expression is reported as `generation_expression`, never as " +
+      "`default_value`. On PostgreSQL 18+ constraints also report `validated` / `enforced` / " +
+      "`has_period`, and columns report `not_null_validated` -- a NOT VALID not-null constraint " +
+      "means `nullable: false` can still hide NULLs.",
     annotations: {
       title: "Describe table",
       readOnlyHint: true,
@@ -112,6 +118,15 @@ export const schemaTools = [
       // Zod default re-applied for direct callers -- see pg_list_tables above.
       // `table` has no default (it's required), so it stays as-is.
       const { schema = "public", table } = input as { schema?: string; table: string };
+
+      // The catalog shape depends on the server version, and naming a column
+      // the server doesn't have is a hard "column does not exist" error -- the
+      // whole sub-query fails and reports as an empty list, so the gate has to
+      // be on the version, not on a NULL check. One cached GUC read (see
+      // getServerVersionNum); 0 = unknown, which falls through to the
+      // conservative pre-18 queries.
+      const serverVersion = await getServerVersionNum();
+      const isPg18 = serverVersion >= PG18;
 
       // Identify the relation kind first so the response signals "this is a
       // view" -- without this, an LLM sees columns + empty PK/FK/indexes and
@@ -131,12 +146,41 @@ export const schemaTools = [
         WHERE n.nspname = $1 AND c.relname = $2
       `;
 
+      // PG18 made NOT NULL a real pg_constraint row (contype 'n') that can be
+      // NOT VALID -- attnotnull's own docs now read "a (possibly invalid)
+      // not-null constraint". So `nullable: false` no longer proves the column
+      // is NULL-free, and an agent that skips a null check on it meets rows it
+      // believed could not exist. No matching row means nothing is pending
+      // validation (the column is nullable, or its NOT NULL comes from a PK),
+      // hence COALESCE to true. Omitted below PG18, where a not-null
+      // constraint cannot be invalid and the question does not arise.
+      const notNullValidatedCol = isPg18
+        ? `,
+          (SELECT COALESCE(bool_and(nn.convalidated), true)
+             FROM pg_catalog.pg_constraint nn
+            WHERE nn.contype = 'n'
+              AND nn.conrelid = a.attrelid
+              AND nn.conkey = ARRAY[a.attnum]) AS not_null_validated`
+        : "";
+
+      // pg_attrdef stores generation expressions alongside plain defaults, so
+      // routing on attgenerated is what keeps a generated column's expression
+      // out of `default_value`: reported there it reads as "optional, has a
+      // default" and the agent writes an INSERT postgres rejects. Identity
+      // columns have no pg_attrdef row at all, so without attidentity they
+      // look like an ordinary NOT NULL column with no default and the agent
+      // supplies a value into GENERATED ALWAYS AS IDENTITY. Both catalog
+      // fields are "char" and use '' (never NULL) for "not set", so the test
+      // is against ''. attgenerated = 'v' only occurs on PG18+; 's' since PG12.
       const columnsQuery = `
         SELECT
           a.attname AS name,
           pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
-          NOT a.attnotnull AS nullable,
-          pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_value,
+          NOT a.attnotnull AS nullable${notNullValidatedCol},
+          CASE WHEN a.attgenerated = '' THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid) END AS default_value,
+          CASE WHEN a.attgenerated <> '' THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid) END AS generation_expression,
+          CASE a.attgenerated WHEN 's' THEN 'stored' WHEN 'v' THEN 'virtual' END AS generated,
+          CASE a.attidentity WHEN 'a' THEN 'always' WHEN 'd' THEN 'by_default' END AS identity,
           a.attnum AS ordinal_position
         FROM pg_catalog.pg_attribute a
         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
@@ -170,13 +214,36 @@ export const schemaTools = [
         ORDER BY k.ord
       `;
 
+      // convalidated / conenforced / conperiod decide what a constraint
+      // actually does, and none of it shows up in the column lists: a NOT VALID
+      // or NOT ENFORCED foreign key looks like a live referential guarantee an
+      // agent can lean on while enforcing nothing, and a temporal
+      // (PERIOD / WITHOUT OVERLAPS) key renders as an ordinary equality key.
+      // conenforced and conperiod are PG18-only columns, so they are gated out
+      // rather than defaulted -- naming them on an older server errors the
+      // whole sub-query out to an empty list. convalidated predates them and is
+      // always selected.
+      const constraintMetaCols = isPg18
+        ? `,
+          con.convalidated AS validated,
+          con.conenforced AS enforced,
+          con.conperiod AS has_period`
+        : `,
+          con.convalidated AS validated`;
+      // The FK query aggregates, so every added non-aggregated column must also
+      // reach its GROUP BY -- postgres recognizes no functional dependency on a
+      // system catalog's OID, so omitting one is a plan-time error.
+      const constraintMetaGroupBy = isPg18
+        ? ", con.convalidated, con.conenforced, con.conperiod"
+        : ", con.convalidated";
+
       const foreignKeysQuery = `
         SELECT
           con.conname AS constraint_name,
           array_agg(att.attname::text ORDER BY u.attposition) AS columns,
           cl.relname AS foreign_table,
           fn.nspname AS foreign_schema,
-          array_agg(fatt.attname::text ORDER BY u.attposition) AS foreign_columns
+          array_agg(fatt.attname::text ORDER BY u.attposition) AS foreign_columns${constraintMetaCols}
         FROM pg_catalog.pg_constraint con
         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -193,7 +260,7 @@ export const schemaTools = [
         WHERE n.nspname = $1
           AND c.relname = $2
           AND con.contype = 'f'
-        GROUP BY con.conname, cl.relname, fn.nspname
+        GROUP BY con.conname, cl.relname, fn.nspname${constraintMetaGroupBy}
         ORDER BY con.conname
       `;
 
@@ -223,7 +290,7 @@ export const schemaTools = [
             WHEN 'x' THEN 'exclude'
             ELSE con.contype::text
           END AS type,
-          pg_catalog.pg_get_constraintdef(con.oid, true) AS definition
+          pg_catalog.pg_get_constraintdef(con.oid, true) AS definition${constraintMetaCols}
         FROM pg_catalog.pg_constraint con
         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -243,7 +310,7 @@ export const schemaTools = [
           srcn.nspname AS schema,
           src.relname AS "table",
           array_agg(srcatt.attname::text ORDER BY u.attposition) AS columns,
-          array_agg(refatt.attname::text ORDER BY u.attposition) AS referenced_columns
+          array_agg(refatt.attname::text ORDER BY u.attposition) AS referenced_columns${constraintMetaCols}
         FROM pg_catalog.pg_constraint con
         JOIN pg_catalog.pg_class src ON src.oid = con.conrelid
         JOIN pg_catalog.pg_namespace srcn ON srcn.oid = src.relnamespace
@@ -260,7 +327,7 @@ export const schemaTools = [
         WHERE refn.nspname = $1
           AND ref.relname = $2
           AND con.contype = 'f'
-        GROUP BY con.conname, srcn.nspname, src.relname
+        GROUP BY con.conname, srcn.nspname, src.relname${constraintMetaGroupBy}
         ORDER BY srcn.nspname, src.relname, con.conname
       `;
 
@@ -334,6 +401,19 @@ export const schemaTools = [
         // an empty `foreign_keys` could mean "no FKs" or "fetch failed", and an
         // LLM will treat the former and the latter identically without this hint.
         const warnings: string[] = [];
+        // An unknown server version degrades to the pre-18 query shape (see
+        // getServerVersionNum's "assume oldest" contract). Unannounced, the
+        // absent PG18 fields read as "this server is older than 18" rather than
+        // "we could not tell".
+        if (serverVersion === 0) {
+          // Names BOTH gated groups: the version probe also drops the
+          // column-level `not_null_validated`, and a warning that mentions
+          // only constraints reads as "your columns are complete" when they
+          // are not.
+          warnings.push(
+            "server version unknown; PG18-only fields omitted (constraint `enforced`/`has_period`, column `not_null_validated`)",
+          );
+        }
         // `kind` is reported as a top-level field, so a silent default to
         // "table" would mislabel a view or materialized view. Emit a warning
         // when the fetch failed so the caller sees the kind isn't trustworthy.

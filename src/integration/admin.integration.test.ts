@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
-import { runInternal, shutdown } from "../api.js";
+import { PG16, PG18, runInternal, shutdown } from "../api.js";
 import { adminTools } from "../tools/admin.js";
 import { statsTools } from "../tools/stats.js";
 import {
@@ -18,6 +18,10 @@ import {
   FIXTURE_LIMITED_ROLE,
   FIXTURE_MEMBER_ROLE,
   FIXTURE_SCHEMA,
+  FIXTURE_WRAPAROUND_CONTROL_TABLE,
+  FIXTURE_WRAPAROUND_FREEZE_MAX_AGE,
+  FIXTURE_WRAPAROUND_MULTIXACT_FREEZE_MAX_AGE,
+  FIXTURE_WRAPAROUND_OVERRIDE_TABLE,
   fdwFixtureAvailable,
   integrationEnabled,
   setupFixtures,
@@ -33,6 +37,200 @@ const replicationStatus = adminTools.find((t) => t.name === "pg_replication_stat
 const pgKill = adminTools.find((t) => t.name === "pg_kill")!;
 const seqScanTables = statsTools.find((t) => t.name === "pg_seq_scan_tables")!;
 const unusedIndexes = statsTools.find((t) => t.name === "pg_unused_indexes")!;
+
+// Server-version capability probe for the PG16-gated last_*_scan columns.
+// Asks the server directly rather than importing the handler's own
+// getServerVersionNum(), for the same reason the pgstattuple check in
+// pg_table_bloat re-queries pg_extension instead of trusting the tool: a
+// regression in the probe the handler uses to gate those columns must not
+// also move the test's expectation. Returns 0 when the probe itself fails,
+// which callers treat as "cannot tell" and skip -- matching this file's habit
+// of skipping rather than failing when a capability can't be established.
+async function probeServerVersionNum(): Promise<number> {
+  const res = await runInternal<{ v: string }>("SELECT current_setting('server_version_num') AS v");
+  if (!res.ok || !res.data?.length) return 0;
+  const parsed = Number.parseInt(res.data[0].v, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// pg_seq_scan_tables and pg_unused_indexes return the same stats-window
+// envelope, so the window assertions live here instead of being duplicated in
+// both describes (same rationale as waitForActiveSleep in pg_kill below).
+//
+// stats_reset is legitimately null on a cluster whose counters were never
+// reset, or whose stats were discarded by crash recovery / an immediate
+// shutdown / a major-version upgrade -- so this asserts the KEY is present and
+// the TYPE is right, never that the value is non-null.
+function assertStatsWindow(
+  data: { stats_reset: string | null; stats_reset_age_seconds: number | null; _warnings?: string[] } | undefined,
+  label: string,
+): void {
+  assert.ok(data, `${label}: expected a stats-window envelope, got ${JSON.stringify(data)}`);
+  assert.ok(
+    "stats_reset" in data,
+    `${label}: stats_reset key must be present, got keys: ${Object.keys(data).join(", ")}`,
+  );
+  assert.ok(
+    "stats_reset_age_seconds" in data,
+    `${label}: stats_reset_age_seconds key must be present, got keys: ${Object.keys(data).join(", ")}`,
+  );
+  assert.ok(
+    data.stats_reset === null || typeof data.stats_reset === "string",
+    `${label}: stats_reset must be string | null, got ${JSON.stringify(data.stats_reset)}`,
+  );
+  assert.ok(
+    data.stats_reset_age_seconds === null || typeof data.stats_reset_age_seconds === "number",
+    `${label}: stats_reset_age_seconds must be number | null, got ${JSON.stringify(data.stats_reset_age_seconds)}`,
+  );
+  if (data.stats_reset_age_seconds !== null) {
+    assert.ok(
+      Number.isFinite(data.stats_reset_age_seconds) && data.stats_reset_age_seconds >= 0,
+      `${label}: stats_reset_age_seconds must be finite and non-negative, got ${data.stats_reset_age_seconds}`,
+    );
+  }
+  // The two fields move together: an age without a reset point (or vice
+  // versa) means the envelope was assembled from a half-read probe row.
+  assert.equal(
+    data.stats_reset === null,
+    data.stats_reset_age_seconds === null,
+    `${label}: stats_reset and stats_reset_age_seconds must both be null or both be set, got ${JSON.stringify({
+      stats_reset: data.stats_reset,
+      stats_reset_age_seconds: data.stats_reset_age_seconds,
+    })}`,
+  );
+  // The probe reads pg_stat_database for current_database(), which the test
+  // role can always see -- so the degraded path must not fire here. Mirrors
+  // the "no warnings on a healthy standalone instance" pin in
+  // pg_replication_status.
+  assert.equal(data._warnings, undefined, `${label}: no _warnings expected, got ${JSON.stringify(data._warnings)}`);
+}
+
+// pg_advisor's wraparound_risk row shapes. Split so the tables and databases
+// halves can share assertTriggeredByConsistent below: the triggered_by CASE is
+// duplicated across the two sub-queries, so a fix applied to one and not the
+// other is a live regression that a per-list assertion would miss.
+type WraparoundRatios = {
+  xid_age: number;
+  mxid_age: number | null;
+  pct_of_freeze_max_age: number | null;
+  pct_of_multixact_freeze_max_age: number | null;
+  triggered_by: string;
+};
+
+type WraparoundTableRow = WraparoundRatios & {
+  schema: string;
+  table: string;
+  relkind: string;
+  freeze_max_age: number;
+  multixact_freeze_max_age: number;
+  // PG18+ only, and ABSENT rather than null on older servers -- see the
+  // freeze-coverage test in the pg_advisor describe.
+  pages?: number;
+  all_frozen_pages?: number;
+  frozen_page_fraction?: number | null;
+};
+
+type AdvisorResult = {
+  ok: boolean;
+  data?: {
+    sequence_exhaustion: unknown[];
+    wraparound_risk: {
+      autovacuum_freeze_max_age: number | null;
+      autovacuum_multixact_freeze_max_age: number | null;
+      databases: (WraparoundRatios & { database: string })[];
+      tables: WraparoundTableRow[];
+    };
+    tables_without_primary_key: { schema: string; table: string }[];
+    public_tables_without_rls: { schema: string; table: string }[];
+    _warnings?: string[];
+  };
+  error?: string;
+};
+
+// pct_of_* ship as numeric(10, 4) while the WHERE clause and the triggered_by
+// CASE both compare the UNROUNDED ratio, so a reported value can legitimately
+// sit up to half a ten-thousandth on the wrong side of the threshold. Exactly
+// that much slack and no more -- anything wider stops catching a genuinely
+// mislabelled row.
+const WRAPAROUND_PCT_SLACK = 5e-5;
+
+/**
+ * Ratio the wraparound control table currently sits at: age(relfrozenxid) over
+ * the cluster GUC. Neither term is controllable from a test -- the XID counter
+ * moves with every statement the suite runs -- so the wraparound cases derive
+ * their threshold from the live number instead of hardcoding one. Half of it is
+ * a threshold both fixture tables clear, and age() only ever grows between the
+ * probe and the handler call, so the margin cannot close underneath them.
+ *
+ * Returns 0 when the probe fails or the table is missing; callers treat that as
+ * "cannot tell" and skip, matching probeServerVersionNum above.
+ */
+async function probeControlXidRatio(): Promise<number> {
+  const res = await runInternal<{ ratio: string | null }>(
+    `SELECT (age(c.relfrozenxid)::numeric
+               / NULLIF(current_setting('autovacuum_freeze_max_age')::numeric, 0))::text AS ratio
+     FROM pg_catalog.pg_class c
+     WHERE c.oid = to_regclass($1)`,
+    [`${FIXTURE_SCHEMA}.${FIXTURE_WRAPAROUND_CONTROL_TABLE}`],
+  );
+  if (!res.ok || !res.data?.length) return 0;
+  const parsed = Number(res.data[0].ratio ?? "0");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/**
+ * triggered_by must agree with the row's OWN ratios. The label is what tells an
+ * operator whether to chase a freeze VACUUM or the lock-heavy workload burning
+ * multixact members, and the unit tests only ever see the literal a stubbed
+ * client handed back -- the CASE has never been evaluated by a server.
+ */
+function assertTriggeredByConsistent(row: WraparoundRatios, threshold: number, label: string): void {
+  assert.ok(
+    ["xid", "multixact", "both"].includes(row.triggered_by),
+    `${label}: triggered_by must be xid | multixact | both, got ${JSON.stringify(row.triggered_by)}`,
+  );
+  const xid = row.pct_of_freeze_max_age;
+  const mxid = row.pct_of_multixact_freeze_max_age;
+  // 'xid' is the CASE's ELSE arm, reached only when the multixact side did not
+  // clear the threshold -- which the WHERE's OR then makes an assertion that
+  // the xid side did.
+  if (row.triggered_by !== "multixact") {
+    assert.ok(
+      xid !== null && xid + WRAPAROUND_PCT_SLACK >= threshold,
+      `${label}: triggered_by=${row.triggered_by} claims the xid side cleared threshold=${threshold}, but ` +
+        `pct_of_freeze_max_age=${xid}`,
+    );
+  }
+  if (row.triggered_by !== "xid") {
+    assert.ok(
+      mxid !== null && mxid + WRAPAROUND_PCT_SLACK >= threshold,
+      `${label}: triggered_by=${row.triggered_by} claims the multixact side cleared threshold=${threshold}, but ` +
+        `pct_of_multixact_freeze_max_age=${mxid}`,
+    );
+  }
+  if (row.triggered_by === "multixact") {
+    // Arm ordering: 'multixact' fires only when the xid side did NOT clear the
+    // threshold; a row over both belongs in 'both'. Collapsing that ordering
+    // sends the operator after a locking workload while the xid horizon is the
+    // thing about to stop writes.
+    assert.ok(
+      xid === null || xid - WRAPAROUND_PCT_SLACK < threshold,
+      `${label}: triggered_by=multixact but pct_of_freeze_max_age=${xid} also clears threshold=${threshold}; ` +
+        `that row should be labelled 'both'`,
+    );
+  }
+  if (row.mxid_age === null) {
+    // InvalidMultiXactId rows get a null multixact ratio, and null can never
+    // satisfy `>= $1` -- so they can only ever be xid-triggered. A regression
+    // that dropped the guard would report a ~4.2-billion mxid_age here and
+    // relabel every never-locked relation as multixact-critical.
+    assert.equal(
+      row.triggered_by,
+      "xid",
+      `${label}: mxid_age is null (no multixact horizon) so triggered_by must be 'xid', got ${row.triggered_by}`,
+    );
+  }
+}
 
 // One setup/teardown for the whole file - every describe below shares the
 // same fixture schema, so running DROP/CREATE per-describe is wasted work.
@@ -368,12 +566,17 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 20 });
       const res = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 20 })) as {
         ok: boolean;
-        data?: { schema: string; table: string; seq_scans: string; idx_scans: string }[];
+        data?: {
+          rows: { schema: string; table: string; seq_scans: string; idx_scans: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+          _warnings?: string[];
+        };
       };
       assert.equal(res.ok, true);
-      assert.ok(Array.isArray(res.data));
+      assert.ok(Array.isArray(res.data?.rows));
       // Should find the fixture tables (minSize=0 includes everything).
-      const tables = (res.data ?? []).map((r) => r.table);
+      const tables = (res.data?.rows ?? []).map((r) => r.table);
       assert.ok(tables.length > 0, "expected some stats rows from fixture schema");
     });
 
@@ -392,10 +595,14 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
       const baseline = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 100 })) as {
         ok: boolean;
-        data?: { table: string; live_tuples: string }[];
+        data?: {
+          rows: { table: string; live_tuples: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
       };
       assert.equal(baseline.ok, true);
-      const empty = (baseline.data ?? []).filter((r) => Number(r.live_tuples) === 0);
+      const empty = (baseline.data?.rows ?? []).filter((r) => Number(r.live_tuples) === 0);
       // If the cluster happens to have no zero-tuple tables in the fixture
       // schema, the test is vacuous -- threshold-filtering has nothing to
       // bite on. The fixture's no_pk_table / no_pk_partitioned / matview /
@@ -404,13 +611,17 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
       const filtered = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 1, limit: 100 })) as {
         ok: boolean;
-        data?: { table: string }[];
+        data?: {
+          rows: { table: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
       };
       assert.equal(filtered.ok, true);
       // Property: every baseline row with live_tuples=0 is absent at minSize=1.
       for (const b of empty) {
         assert.ok(
-          !(filtered.data ?? []).some((f) => f.table === b.table),
+          !(filtered.data?.rows ?? []).some((f) => f.table === b.table),
           `${b.table} (live_tuples=0) should be excluded at minSize=1`,
         );
       }
@@ -424,10 +635,14 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     it("reports ratio=null when idx_scans=0 (no division by zero)", async () => {
       const res = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 100 })) as {
         ok: boolean;
-        data?: { table: string; idx_scans: string; ratio: number | null }[];
+        data?: {
+          rows: { table: string; idx_scans: string; ratio: number | null }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
       };
       assert.equal(res.ok, true);
-      for (const row of res.data ?? []) {
+      for (const row of res.data?.rows ?? []) {
         if (row.idx_scans === "0") {
           assert.equal(row.ratio, null, `${row.table} has idx_scans=0 but ratio=${row.ratio}; CASE guard regression`);
         }
@@ -441,20 +656,93 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     it("with no schema arg spans all user schemas and excludes pg_*/information_schema", async () => {
       const res = (await seqScanTables.handler({ minSize: 0, limit: 100 })) as {
         ok: boolean;
-        data?: { schema: string }[];
+        data?: {
+          rows: { schema: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
       };
       assert.equal(res.ok, true);
-      assert.ok(Array.isArray(res.data));
-      for (const row of res.data ?? []) {
+      assert.ok(Array.isArray(res.data?.rows));
+      for (const row of res.data?.rows ?? []) {
         assert.ok(!row.schema.startsWith("pg_"), `pg_* schema leaked: ${row.schema}`);
         assert.notEqual(row.schema, "information_schema", "information_schema leaked");
       }
       // Fixture schema must appear -- proves the "all user schemas" path
       // isn't accidentally restrictive.
       assert.ok(
-        (res.data ?? []).some((r) => r.schema === FIXTURE_SCHEMA),
-        `expected ${FIXTURE_SCHEMA} in unfiltered result, got ${JSON.stringify((res.data ?? []).map((r) => r.schema))}`,
+        (res.data?.rows ?? []).some((r) => r.schema === FIXTURE_SCHEMA),
+        `expected ${FIXTURE_SCHEMA} in unfiltered result, got ${JSON.stringify(
+          (res.data?.rows ?? []).map((r) => r.schema),
+        )}`,
       );
+    });
+
+    // The counters this tool ranks on are cumulative since the last stats
+    // reset, so the reset point ships in the envelope alongside the rows.
+    // Nothing else in the suite pins it. stats_reset is legitimately null on a
+    // cluster that has never had its counters reset, so the assertion is on
+    // the key + type, not on a value -- see assertStatsWindow above.
+    it("returns the stats-reset window alongside the rows", async () => {
+      const res = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 20 })) as {
+        ok: boolean;
+        data?: {
+          rows: { table: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+          _warnings?: string[];
+        };
+        error?: string;
+      };
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      assert.ok(Array.isArray(res.data?.rows), `rows must be an array, got ${JSON.stringify(res.data?.rows)}`);
+      assertStatsWindow(res.data, "pg_seq_scan_tables");
+    });
+
+    // PG16 added pg_stat_user_tables.last_seq_scan / last_idx_scan. Below 16
+    // the handler must not name those columns at all (a 42703 would fail the
+    // whole tool), so the keys are ABSENT rather than null -- absence is the
+    // load-bearing half of the assertion. Probe-then-gate shape follows the
+    // pgstattuple check in pg_table_bloat below.
+    it("carries last_seq_scan / last_idx_scan on PG16+ and omits the keys below 16", async () => {
+      const version = await probeServerVersionNum();
+      if (version === 0) return; // version undeterminable -- nothing to gate on
+
+      const res = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 20 })) as {
+        ok: boolean;
+        data?: {
+          rows: { table: string; last_seq_scan?: string | null; last_idx_scan?: string | null }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
+        error?: string;
+      };
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      const rows = res.data?.rows ?? [];
+      // minSize=0 over the fixture schema normally returns rows; if this
+      // cluster somehow has none, there is nothing to inspect.
+      if (rows.length === 0) return;
+
+      for (const row of rows) {
+        const keys = Object.keys(row).join(", ");
+        if (version >= PG16) {
+          assert.ok("last_seq_scan" in row, `${row.table}: last_seq_scan must be present on PG16+, got keys: ${keys}`);
+          assert.ok("last_idx_scan" in row, `${row.table}: last_idx_scan must be present on PG16+, got keys: ${keys}`);
+          // null is the legitimate "no such scan since the reset" value; a
+          // non-null value is the ::text cast of a timestamptz.
+          if (row.last_seq_scan !== null) assert.equal(typeof row.last_seq_scan, "string");
+          if (row.last_idx_scan !== null) assert.equal(typeof row.last_idx_scan, "string");
+        } else {
+          assert.ok(
+            !("last_seq_scan" in row),
+            `${row.table}: last_seq_scan must be absent below PG16 (server_version_num=${version}), got keys: ${keys}`,
+          );
+          assert.ok(
+            !("last_idx_scan" in row),
+            `${row.table}: last_idx_scan must be absent below PG16 (server_version_num=${version}), got keys: ${keys}`,
+          );
+        }
+      }
     });
   });
 
@@ -725,6 +1013,256 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         `expected at least one partitioned parent (no_pk_partitioned or events) in public_tables_without_rls, got ${JSON.stringify([...tables])}`,
       );
     });
+
+    // The load-bearing assertion for everything else in this describe.
+    // pg_advisor swallows a failed sub-query into `_warnings` and still returns
+    // ok: true with that category empty, so an invalid GROUP BY, a bad cast, or
+    // a column that does not exist on this major is indistinguishable from
+    // "nothing to report" -- every other case here passes just as happily
+    // against a category that never ran. Nothing in this file looked at the key
+    // before, which is how a whole category could ship green while returning []
+    // against a real server.
+    it("returns no _warnings as the fixture superuser (a swallowed sub-query error lands here)", async () => {
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.5,
+        wraparoundThreshold: 0.5,
+        rlsSchemas: ["public"],
+        limit: 100,
+      })) as AdvisorResult;
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      assert.deepEqual(
+        res.data?._warnings ?? [],
+        [],
+        `every sub-query must succeed for the fixture superuser; got ${JSON.stringify(res.data?._warnings)}`,
+      );
+    });
+
+    // wraparound_risk's documented envelope. Both divisors collapse to null and
+    // both lists to [] when their sub-query fails, so a null divisor here is the
+    // same failure the _warnings case above catches, seen from the caller's
+    // side: an empty `databases` with no scale to interpret it against.
+    it("wraparound_risk reports both GUC divisors as positive integers and both lists as arrays", async () => {
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.99,
+        wraparoundThreshold: 0.5,
+        rlsSchemas: ["public"],
+        limit: 100,
+      })) as AdvisorResult;
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      const wrap = res.data?.wraparound_risk;
+      assert.ok(wrap, `expected a wraparound_risk envelope, got ${JSON.stringify(res.data)}`);
+      for (const key of ["autovacuum_freeze_max_age", "autovacuum_multixact_freeze_max_age"] as const) {
+        const value = wrap[key];
+        assert.ok(
+          typeof value === "number" && Number.isInteger(value) && value > 0,
+          `${key} must be a positive integer divisor, got ${JSON.stringify(value)}`,
+        );
+      }
+      assert.ok(Array.isArray(wrap.databases), `databases must be an array, got ${JSON.stringify(wrap.databases)}`);
+      assert.ok(Array.isArray(wrap.tables), `tables must be an array, got ${JSON.stringify(wrap.tables)}`);
+    });
+
+    // First execution of the wraparound LATERAL against a live server. The unit
+    // tests stub the client and assert SQL text, so the triggered_by CASE has
+    // only ever been read, never evaluated -- a wrong arm order or a bad
+    // mxid_age argument ships green there. At the 0.5 default a healthy fixture
+    // cluster returns nothing, hence the threshold derived from the live
+    // control-table ratio (see probeControlXidRatio).
+    it("returns real rows at a low threshold, each with a triggered_by consistent with its own ratios", async () => {
+      const controlRatio = await probeControlXidRatio();
+      if (controlRatio === 0) return; // no live ratio to derive a threshold from -- nothing to gate on
+
+      const threshold = controlRatio / 2;
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.99,
+        wraparoundThreshold: threshold,
+        rlsSchemas: ["public"],
+        limit: 500,
+      })) as AdvisorResult;
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      assert.deepEqual(
+        res.data?._warnings ?? [],
+        [],
+        `a threshold of ${threshold} must not break a sub-query; got ${JSON.stringify(res.data?._warnings)}`,
+      );
+
+      const tables = res.data?.wraparound_risk.tables ?? [];
+      const databases = res.data?.wraparound_risk.databases ?? [];
+      // Both lists are non-empty by construction at half the control table's own
+      // ratio: the control clears it, and datfrozenxid is the MINIMUM
+      // relfrozenxid in the database, so age(datfrozenxid) is at least the
+      // control's age and the database ratio at least as large. An empty list
+      // here means the sub-query returned nothing, not that the cluster is
+      // healthy.
+      assert.ok(tables.length > 0, `expected wraparound tables at threshold=${threshold}, got none`);
+      assert.ok(databases.length > 0, `expected wraparound databases at threshold=${threshold}, got none`);
+
+      for (const row of tables) {
+        assertTriggeredByConsistent(row, threshold, `tables/${row.schema}.${row.table}`);
+      }
+      for (const row of databases) {
+        assertTriggeredByConsistent(row, threshold, `databases/${row.database}`);
+      }
+    });
+
+    // The per-table storage-parameter branch of the freeze_max_age COALESCE.
+    // Only the GUC fallback was provable before, and the untested branch fails
+    // in the dangerous direction: a table with a LOWERED override reads as safe
+    // -- its age measured against 200000000 instead of 100000 -- while
+    // autovacuum is already force-freezing it.
+    it("resolves the per-table freeze-max-age override and falls back to the GUC on the control table", async () => {
+      const controlRatio = await probeControlXidRatio();
+      if (controlRatio === 0) return; // no live ratio to derive a threshold from -- nothing to gate on
+
+      const threshold = controlRatio / 2;
+      const limit = 500;
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.99,
+        wraparoundThreshold: threshold,
+        rlsSchemas: ["public"],
+        limit,
+      })) as AdvisorResult;
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      const wrap = res.data?.wraparound_risk;
+      assert.ok(wrap, `expected a wraparound_risk envelope, got ${JSON.stringify(res.data)}`);
+
+      const listed = wrap.tables.map((r) => `${r.schema}.${r.table}`);
+      const override = wrap.tables.find(
+        (r) => r.schema === FIXTURE_SCHEMA && r.table === FIXTURE_WRAPAROUND_OVERRIDE_TABLE,
+      );
+      // Safe to require: the override's ratio is 2000x the control's, so it
+      // sorts near the top of the GREATEST(...) DESC ordering and cannot be cut
+      // by the LIMIT.
+      assert.ok(
+        override,
+        `expected ${FIXTURE_WRAPAROUND_OVERRIDE_TABLE} at threshold=${threshold}, got ${JSON.stringify(listed)}`,
+      );
+      assert.equal(
+        override.freeze_max_age,
+        FIXTURE_WRAPAROUND_FREEZE_MAX_AGE,
+        `the reloption must win over the GUC, got ${override.freeze_max_age}`,
+      );
+      assert.equal(
+        override.multixact_freeze_max_age,
+        FIXTURE_WRAPAROUND_MULTIXACT_FREEZE_MAX_AGE,
+        `the multixact reloption must win over the GUC, got ${override.multixact_freeze_max_age}`,
+      );
+      // The reported field could be right while the ratio was still divided by
+      // the GUC -- the two come from different expressions. Recomputing the
+      // ratio from the row's own xid_age pins which divisor the LATERAL used.
+      assert.ok(
+        override.pct_of_freeze_max_age !== null &&
+          Math.abs(override.pct_of_freeze_max_age - override.xid_age / FIXTURE_WRAPAROUND_FREEZE_MAX_AGE) <=
+            WRAPAROUND_PCT_SLACK,
+        `pct_of_freeze_max_age=${override.pct_of_freeze_max_age} must be xid_age ${override.xid_age} over the ` +
+          `reloption ${FIXTURE_WRAPAROUND_FREEZE_MAX_AGE}, not over the GUC`,
+      );
+
+      const control = wrap.tables.find(
+        (r) => r.schema === FIXTURE_SCHEMA && r.table === FIXTURE_WRAPAROUND_CONTROL_TABLE,
+      );
+      // The control shares the GUC divisor with every catalog relation, so it
+      // sits at the bottom of the ordering: on a cluster carrying more frozen
+      // relations than `limit` it legitimately falls off the end. That is the
+      // LIMIT working, not a broken COALESCE -- but an untruncated result that
+      // is missing it is a real failure.
+      if (!control) {
+        assert.ok(
+          wrap.tables.length >= limit,
+          `${FIXTURE_WRAPAROUND_CONTROL_TABLE} missing from an untruncated result of ${wrap.tables.length} rows`,
+        );
+        return;
+      }
+      assert.equal(
+        control.freeze_max_age,
+        wrap.autovacuum_freeze_max_age,
+        `the control table has no reloption and must fall back to the GUC, got ${control.freeze_max_age}`,
+      );
+      assert.equal(
+        control.multixact_freeze_max_age,
+        wrap.autovacuum_multixact_freeze_max_age,
+        `the control table must fall back to the multixact GUC, got ${control.multixact_freeze_max_age}`,
+      );
+      const guc = wrap.autovacuum_freeze_max_age;
+      assert.ok(typeof guc === "number" && guc > 0, `expected a usable GUC divisor, got ${JSON.stringify(guc)}`);
+      assert.ok(
+        control.pct_of_freeze_max_age !== null &&
+          Math.abs(control.pct_of_freeze_max_age - control.xid_age / guc) <= WRAPAROUND_PCT_SLACK,
+        `pct_of_freeze_max_age=${control.pct_of_freeze_max_age} must be xid_age ${control.xid_age} over the GUC ${guc}`,
+      );
+      // Both tables were created back to back, so their ages match to within a
+      // few XIDs and the divisor is the only thing separating the two ratios.
+      assert.notEqual(
+        override.freeze_max_age,
+        control.freeze_max_age,
+        `override and control resolved the same freeze_max_age (${control.freeze_max_age}); the reloption branch ` +
+          `is not firing`,
+      );
+    });
+
+    // The PG18 relallfrozen branch is otherwise proven only by a string match on
+    // the generated SQL. A wrong column name there is a 42703 that takes the
+    // ENTIRE tables sub-query down -- on the newest major only, and silently:
+    // the category comes back [] with the failure parked in _warnings. The
+    // below-18 half is equally load-bearing, since naming the column there is
+    // what breaks first.
+    it("carries the relallfrozen freeze-coverage keys on PG18+ and omits them below 18", async () => {
+      const version = await probeServerVersionNum();
+      if (version === 0) return; // version undeterminable -- nothing to gate on
+      const controlRatio = await probeControlXidRatio();
+      if (controlRatio === 0) return; // no live ratio to derive a threshold from -- nothing to gate on
+
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.99,
+        wraparoundThreshold: controlRatio / 2,
+        rlsSchemas: ["public"],
+        limit: 500,
+      })) as AdvisorResult;
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      const tables = res.data?.wraparound_risk.tables ?? [];
+      if (tables.length === 0) return; // nothing to inspect
+
+      for (const row of tables) {
+        const label = `${row.schema}.${row.table}`;
+        const keys = Object.keys(row).join(", ");
+        if (version >= PG18) {
+          assert.ok("pages" in row, `${label}: pages must be present on PG18+, got keys: ${keys}`);
+          assert.ok(
+            "all_frozen_pages" in row,
+            `${label}: all_frozen_pages must be present on PG18+, got keys: ${keys}`,
+          );
+          assert.ok(
+            "frozen_page_fraction" in row,
+            `${label}: frozen_page_fraction must be present on PG18+, got keys: ${keys}`,
+          );
+          assert.equal(
+            typeof row.pages,
+            "number",
+            `${label}: pages must be a number, got ${JSON.stringify(row.pages)}`,
+          );
+          assert.equal(
+            typeof row.all_frozen_pages,
+            "number",
+            `${label}: all_frozen_pages must be a number, got ${JSON.stringify(row.all_frozen_pages)}`,
+          );
+          // null is the NULLIF(relpages, 0) guard firing: a zero-page relation
+          // has no coverage to report, which is not the same claim as 0% frozen.
+          if (row.frozen_page_fraction !== null && row.frozen_page_fraction !== undefined) {
+            assert.ok(
+              Number.isFinite(row.frozen_page_fraction) &&
+                row.frozen_page_fraction >= 0 &&
+                row.frozen_page_fraction <= 1,
+              `${label}: frozen_page_fraction must be a fraction in [0,1], got ${row.frozen_page_fraction}`,
+            );
+          }
+        } else {
+          const below = `must be absent below PG18 (server_version_num=${version}), got keys: ${keys}`;
+          assert.ok(!("pages" in row), `${label}: pages ${below}`);
+          assert.ok(!("all_frozen_pages" in row), `${label}: all_frozen_pages ${below}`);
+          assert.ok(!("frozen_page_fraction" in row), `${label}: frozen_page_fraction ${below}`);
+        }
+      }
+    });
   });
 
   describe("pg_replication_status", () => {
@@ -873,10 +1411,15 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     it("returns an array", async () => {
       const res = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 1000, limit: 50 })) as {
         ok: boolean;
-        data?: { index: string; scans: string }[];
+        data?: {
+          rows: { index: string; scans: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+          _warnings?: string[];
+        };
       };
       assert.equal(res.ok, true);
-      assert.ok(Array.isArray(res.data));
+      assert.ok(Array.isArray(res.data?.rows));
       // posts_user_id_idx is a non-unique, non-primary index - should be eligible
       // to appear at some maxScans threshold.
     });
@@ -889,10 +1432,14 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     it("never lists primary-key or unique-constraint indexes", async () => {
       const res = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 1_000_000, limit: 500 })) as {
         ok: boolean;
-        data?: { table: string; index: string }[];
+        data?: {
+          rows: { table: string; index: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
       };
       assert.equal(res.ok, true);
-      const indexes = (res.data ?? []).map((r) => r.index);
+      const indexes = (res.data?.rows ?? []).map((r) => r.index);
       // users.email is `UNIQUE` -> implicit unique index. Must not appear.
       assert.ok(
         !indexes.some((i) => i.includes("users_email")),
@@ -917,11 +1464,15 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     it("with no schema arg spans all user schemas and excludes pg_*/information_schema", async () => {
       const res = (await unusedIndexes.handler({ maxScans: 1_000_000, limit: 200 })) as {
         ok: boolean;
-        data?: { schema: string }[];
+        data?: {
+          rows: { schema: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
       };
       assert.equal(res.ok, true);
-      assert.ok(Array.isArray(res.data));
-      for (const row of res.data ?? []) {
+      assert.ok(Array.isArray(res.data?.rows));
+      for (const row of res.data?.rows ?? []) {
         assert.ok(!row.schema.startsWith("pg_"), `pg_* schema leaked: ${row.schema}`);
         assert.notEqual(row.schema, "information_schema", "information_schema leaked");
       }
@@ -938,15 +1489,80 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     it("respects the maxScans predicate (maxScans=0 excludes any non-zero-scan index)", async () => {
       const zero = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 500 })) as {
         ok: boolean;
-        data?: { index: string; scans: string }[];
+        data?: {
+          rows: { index: string; scans: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
       };
       assert.equal(zero.ok, true);
-      for (const r of zero.data ?? []) {
+      for (const r of zero.data?.rows ?? []) {
         assert.equal(
           r.scans,
           "0",
           `${r.index} reports scans=${r.scans} at maxScans=0 -- s.idx_scan <= $1 predicate may be broken`,
         );
+      }
+    });
+
+    // The stats-reset window is what keeps a zero-scan row from reading as
+    // "safe to drop": every `scans` value here only counts since that point.
+    // The probe deliberately runs even when the row list is empty, so this
+    // asserts the envelope on a query that can legitimately return no rows.
+    it("returns the stats-reset window alongside the rows", async () => {
+      // limit 200 is this tool's inputSchema max; direct handler calls bypass
+      // Zod, so staying inside it keeps the test on a shape an MCP caller
+      // could actually send.
+      const res = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 200 })) as {
+        ok: boolean;
+        data?: {
+          rows: { index: string }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+          _warnings?: string[];
+        };
+        error?: string;
+      };
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      assert.ok(Array.isArray(res.data?.rows), `rows must be an array, got ${JSON.stringify(res.data?.rows)}`);
+      assertStatsWindow(res.data, "pg_unused_indexes");
+    });
+
+    // PG16 added pg_stat_user_indexes.last_idx_scan; below 16 the handler must
+    // not name the column, so the key is ABSENT rather than null. Mirrors the
+    // pg_seq_scan_tables gate above.
+    it("carries last_idx_scan on PG16+ and omits the key below 16", async () => {
+      const version = await probeServerVersionNum();
+      if (version === 0) return; // version undeterminable -- nothing to gate on
+
+      const res = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 1_000_000, limit: 200 })) as {
+        ok: boolean;
+        data?: {
+          rows: { index: string; last_idx_scan?: string | null }[];
+          stats_reset: string | null;
+          stats_reset_age_seconds: number | null;
+        };
+        error?: string;
+      };
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      const rows = res.data?.rows ?? [];
+      // The fixture's non-unique, non-PK indexes normally land here at a
+      // 1,000,000 scan ceiling; an empty list leaves nothing to inspect.
+      if (rows.length === 0) return;
+
+      for (const row of rows) {
+        const keys = Object.keys(row).join(", ");
+        if (version >= PG16) {
+          assert.ok("last_idx_scan" in row, `${row.index}: last_idx_scan must be present on PG16+, got keys: ${keys}`);
+          // null = never scanned since the reset, which is the common case for
+          // an unused index; non-null is the ::text cast of a timestamptz.
+          if (row.last_idx_scan !== null) assert.equal(typeof row.last_idx_scan, "string");
+        } else {
+          assert.ok(
+            !("last_idx_scan" in row),
+            `${row.index}: last_idx_scan must be absent below PG16 (server_version_num=${version}), got keys: ${keys}`,
+          );
+        }
       }
     });
   });

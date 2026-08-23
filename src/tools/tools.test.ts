@@ -4,11 +4,24 @@ import { z } from "zod";
 import { adminTools } from "./admin.js";
 import { explainTools } from "./explain.js";
 import { healthTools } from "./health.js";
+import { ioTools } from "./io.js";
 import { queryTools } from "./query.js";
 import { schemaTools } from "./schemas.js";
 import { statsTools } from "./stats.js";
 
-const allTools = [...queryTools, ...schemaTools, ...explainTools, ...healthTools, ...statsTools, ...adminTools];
+// MUST mirror the `allTools` array in index.ts. A tool module missing here is
+// invisible to every structural check below -- duplicate names, the pg_ prefix,
+// annotations, and whether inputSchema even parses. pg_io_stats shipped with
+// zero coverage of any kind because ioTools was added to index.ts and not here.
+const allTools = [
+  ...queryTools,
+  ...schemaTools,
+  ...explainTools,
+  ...healthTools,
+  ...statsTools,
+  ...ioTools,
+  ...adminTools,
+];
 
 describe("Tool definitions", () => {
   it("should have no duplicate tool names", () => {

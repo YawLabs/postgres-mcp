@@ -1,5 +1,13 @@
 import { z } from "zod";
-import { formatPgError, getPool, isWritesAllowed, runInternal, withSharedClient } from "../api.js";
+import {
+  formatPgError,
+  getPool,
+  getServerVersionNum,
+  isWritesAllowed,
+  PG18,
+  runInternal,
+  withSharedClient,
+} from "../api.js";
 import { identSchema } from "./params.js";
 
 export const adminTools = [
@@ -391,14 +399,42 @@ export const adminTools = [
   {
     name: "pg_advisor",
     description:
-      "Rolled-up DBA lint pass. One call returns three categories of findings:\n" +
+      "Rolled-up DBA lint pass. One call returns four categories of findings:\n" +
       "- sequence_exhaustion: SERIAL / BIGSERIAL / IDENTITY sequences whose `last_value` is " +
       "above `seqExhaustionThreshold` of `max_value`. The classic incident class.\n" +
+      "- wraparound_risk: transaction-ID AND multixact wraparound pressure, the classic pageable " +
+      "incident. `{autovacuum_freeze_max_age, autovacuum_multixact_freeze_max_age, databases[], " +
+      "tables[]}`. Those two cluster GUCs are the divisors both lists are measured against (null " +
+      "if unreadable). Multixact IDs are a SEPARATE 32-bit counter, consumed by row-level locking " +
+      "(`SELECT ... FOR SHARE/UPDATE`, FK checks), so a lock-heavy workload can exhaust them while " +
+      "relfrozenxid stays perfectly healthy -- both counters are checked here. `databases` rows: " +
+      "`{database, xid_age (age(datfrozenxid)), mxid_age (mxid_age(datminmxid)), " +
+      "pct_of_freeze_max_age, pct_of_multixact_freeze_max_age, triggered_by}` -- template databases " +
+      "included, since template0 ages like any other and the cluster horizon is the minimum " +
+      "across all of them. `tables` rows: `{schema, table, relkind, xid_age " +
+      "(age(relfrozenxid)), freeze_max_age, pct_of_freeze_max_age, mxid_age (mxid_age(relminmxid)), " +
+      "multixact_freeze_max_age, pct_of_multixact_freeze_max_age, triggered_by}`, where " +
+      "`freeze_max_age` / `multixact_freeze_max_age` are the EFFECTIVE limits -- a per-table " +
+      "`autovacuum_freeze_max_age` / `autovacuum_multixact_freeze_max_age` storage parameter wins " +
+      "over the GUC. A row is returned when EITHER ratio is at or above `wraparoundThreshold`, and " +
+      "`triggered_by` ('xid' | 'multixact' | 'both') says which one did it: 'xid' means chase " +
+      "freezing/autovacuum, 'multixact' means chase the lock-heavy workload burning members. " +
+      "`mxid_age` and `pct_of_multixact_freeze_max_age` are null on rows whose minmxid is " +
+      "InvalidMultiXactId (no multixact ever recorded); such rows can only be xid-triggered. At " +
+      "pct_of_freeze_max_age 1.0 autovacuum forces an anti-wraparound VACUUM, and near 2.1 " +
+      "billion xids (or 4.2 billion multixacts) the server stops accepting writes. " +
+      "`tables` deliberately includes " +
+      "pg_catalog and pg_toast relations -- the culprit is more often a TOAST table or a system " +
+      "catalog than a user table. On PG18+ table rows also carry `pages` / `all_frozen_pages` / " +
+      "`frozen_page_fraction` from `pg_class.relallfrozen` (visibility-map freeze coverage); " +
+      "those three keys are ABSENT on older servers rather than null.\n" +
       "- tables_without_primary_key: user tables (plain and partitioned) with no PK defined. Bloat " +
       "candidates and a sign of design drift; some replication setups also need PKs. " +
       "Foreign tables are excluded -- PostgreSQL forbids declaring PKs on foreign tables.\n" +
       "- public_tables_without_rls: tables in `public` (or any schema in `rlsSchemas`) with " +
       "row-level security disabled. Useful as a security baseline check.\n" +
+      "Any category whose query fails (permission-gated catalogs on managed providers) appends to " +
+      "`_warnings` and returns empty; the other categories still return.\n" +
       "Use this as the 'what should I be looking at?' starting point, then drill into " +
       "`pg_unused_indexes`, `pg_table_bloat`, `pg_seq_scan_tables` for the perf side.",
     annotations: {
@@ -415,6 +451,17 @@ export const adminTools = [
         .max(1)
         .default(0.5)
         .describe("Minimum used-fraction (last_value / max_value) to flag a sequence (default 0.5 = 50%)."),
+      wraparoundThreshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .default(0.5)
+        .describe(
+          "Minimum used-fraction to flag a database or table for wraparound risk (default 0.5 = " +
+            "50%). Applied to BOTH ratios -- age(frozenxid) / autovacuum_freeze_max_age and " +
+            "mxid_age(minmxid) / autovacuum_multixact_freeze_max_age -- and a row is flagged if " +
+            "either one clears it. 1.0 is where autovacuum starts forcing anti-wraparound VACUUMs.",
+        ),
       rlsSchemas: z
         .array(identSchema)
         .default(["public"])
@@ -427,17 +474,85 @@ export const adminTools = [
       // `n.nspname = ANY($1)` errors at bind time rather than defaulting.
       const {
         seqExhaustionThreshold = 0.5,
+        wraparoundThreshold = 0.5,
         rlsSchemas = ["public"],
         limit = 50,
       } = input as {
         seqExhaustionThreshold?: number;
+        wraparoundThreshold?: number;
         rlsSchemas?: string[];
         limit?: number;
       };
 
-      // 3-way fanout sharing one connection -- see api.ts:withSharedClient.
+      // `pg_class.relallfrozen` (visibility-map freeze coverage) was added in
+      // PG18. Naming it on PG15-17 fails the whole wraparound_risk.tables
+      // sub-query with 42703 undefined_column, losing the age() numbers that
+      // DO exist there -- so the column list is built from the server version
+      // rather than selected unconditionally. getServerVersionNum returns 0
+      // when the probe fails, which falls through to the pre-PG18 shape: a
+      // slightly poorer answer instead of a broken one.
+      //
+      // Probed BEFORE withSharedClient, not inside it: the probe runs on its
+      // own pooled connection, so holding the shared client across it would
+      // put this one tool call at two concurrent connections out of a default
+      // pool of five. Sequentially it is one at a time, and the result is
+      // process-cached after the first success.
+      const versionNum = await getServerVersionNum();
+      const frozenCoverageCols =
+        versionNum >= PG18
+          ? `,
+               c.relpages AS pages,
+               c.relallfrozen AS all_frozen_pages,
+               (c.relallfrozen::numeric / NULLIF(c.relpages, 0))::numeric(6, 4)::float8 AS frozen_page_fraction`
+          : "";
+
+      // PG18+ only. Optional rather than `number | null` because the columns
+      // are ABSENT from the row on older servers, not null -- a caller that
+      // sees `frozen_page_fraction: null` would read it as "no pages frozen"
+      // (an alarming, actionable value) rather than "this server cannot
+      // report freeze coverage".
+      // Which of the two independent counters put the row over the threshold.
+      // Non-optional on every wraparound row: a table listed purely for
+      // multixact pressure needs a completely different remediation (find the
+      // row-locking workload) than one listed for xid age (get a freeze VACUUM
+      // through), and without this the operator cannot tell them apart from
+      // the numbers alone.
+      type WraparoundTrigger = "xid" | "multixact" | "both";
+
+      // mxid_age / pct_of_multixact_freeze_max_age are nullable, unlike their
+      // xid twins: rows whose minmxid is InvalidMultiXactId are excluded from
+      // the multixact evaluation (see the guard in the query below) but still
+      // returned when the xid side is dangerous. Null here means "no multixact
+      // horizon recorded", and triggered_by will never be 'multixact'/'both'
+      // on such a row.
+      type WraparoundTableRow = {
+        schema: string;
+        table: string;
+        relkind: string;
+        xid_age: number;
+        freeze_max_age: number;
+        pct_of_freeze_max_age: number | null;
+        mxid_age: number | null;
+        multixact_freeze_max_age: number;
+        pct_of_multixact_freeze_max_age: number | null;
+        triggered_by: WraparoundTrigger;
+        pages?: number;
+        all_frozen_pages?: number;
+        frozen_page_fraction?: number | null;
+      };
+
+      type WraparoundDatabaseRow = {
+        database: string;
+        xid_age: number;
+        mxid_age: number | null;
+        pct_of_freeze_max_age: number | null;
+        pct_of_multixact_freeze_max_age: number | null;
+        triggered_by: WraparoundTrigger;
+      };
+
+      // 6-way fanout sharing one connection -- see api.ts:withSharedClient.
       return withSharedClient(async (run) => {
-        const [seqRes, noPkRes, rlsRes] = await Promise.all([
+        const [seqRes, wrapGucRes, wrapDbRes, wrapTblRes, noPkRes, rlsRes] = await Promise.all([
           run<{
             schema: string;
             sequence: string;
@@ -468,6 +583,193 @@ export const adminTools = [
              ORDER BY pct_used DESC NULLS LAST
              LIMIT $2`,
             [seqExhaustionThreshold, limit],
+          ),
+          run<{ autovacuum_freeze_max_age: number; autovacuum_multixact_freeze_max_age: number }>(
+            // Fetched as its own row rather than repeated on every finding:
+            // both wraparound lists are threshold-filtered, so on a healthy
+            // cluster they are empty and a per-row copy of the GUC would leave
+            // the category with no scale at all. The caller needs the divisor
+            // to interpret an empty result as "nothing above the threshold"
+            // rather than "could not measure".
+            //
+            // Both GUCs come back in ONE row, not two sub-queries: they are
+            // the two divisors for the same category, and splitting them would
+            // add a seventh round trip to the fanout for a second scalar that
+            // fails or succeeds under exactly the same conditions as the first.
+            // autovacuum_multixact_freeze_max_age exists as far back as PG9.3,
+            // so unlike relallfrozen below it needs no version gate.
+            `SELECT
+               current_setting('autovacuum_freeze_max_age')::int AS autovacuum_freeze_max_age,
+               current_setting('autovacuum_multixact_freeze_max_age')::int AS autovacuum_multixact_freeze_max_age`,
+          ),
+          run<WraparoundDatabaseRow>(
+            // Template databases are deliberately NOT excluded. template0 has
+            // datallowconn = false and so is never autovacuumed through the
+            // normal path, but its datfrozenxid ages exactly like any other
+            // database and the cluster-wide wraparound horizon is the MINIMUM
+            // across all of pg_database. Filtering templates out is how a
+            // wraparound incident hides from the check that was meant to catch
+            // it.
+            //
+            // numeric(10, 4), not the numeric(6, 4) used for sequence
+            // exhaustion: that ratio is bounded by 1 (a sequence cannot pass
+            // its max_value), this one is not. age() tops out near 2.1e9 and
+            // autovacuum_freeze_max_age can legally be set as low as 1e5, so a
+            // ratio of ~21000 is reachable and would overflow a 6-digit
+            // numeric -- turning a wraparound alarm into a numeric field
+            // overflow error at the exact moment it matters. The multixact
+            // ratio fits the same width: mxid_age tops out near 4.3e9 and the
+            // GUC's floor is 10000, so ~430000 is the worst case.
+            //
+            // datminmxid is tracked SEPARATELY from datfrozenxid, and a
+            // database can hit autovacuum_multixact_freeze_max_age with a
+            // perfectly healthy relfrozenxid -- multixacts are burned by
+            // row-level locking (SELECT ... FOR SHARE/UPDATE, FK checks), not
+            // by transaction volume. Checking only the xid side reports a
+            // lock-heavy cluster as clean right up to the multixact shutdown.
+            //
+            // The InvalidMultiXactId guard is `<> '0'::xid` because
+            // pg_database.datminmxid is catalog-typed `xid` even though it
+            // holds a MultiXactId -- there is no `mxid` type to cast to, and
+            // mxid_age('0'::xid) would report a ~4.2-billion age for a
+            // database that has simply never recorded a multixact. It yields
+            // NULL rather than dropping the row: a NULL ratio can never
+            // satisfy `>= $1`, so the row is still returned (and correctly
+            // labelled 'xid') when its xid age is what is dangerous.
+            //
+            // ORDER BY is the GREATER of the two ratios, not age(datfrozenxid):
+            // with the filter now an OR, ordering by the xid age alone would
+            // sort a multixact-critical database near the bottom and let LIMIT
+            // cut the only row that mattered. triggered_by is computed from
+            // the same full-precision ratios the WHERE uses (not the rounded
+            // pct_* columns), so the label can never disagree with the reason
+            // the row came back.
+            `SELECT
+               d.datname AS database,
+               age(d.datfrozenxid) AS xid_age,
+               mx.mxid_age AS mxid_age,
+               r.xid_ratio::numeric(10, 4)::float8 AS pct_of_freeze_max_age,
+               r.mxid_ratio::numeric(10, 4)::float8 AS pct_of_multixact_freeze_max_age,
+               CASE
+                 WHEN r.xid_ratio >= $1 AND r.mxid_ratio >= $1 THEN 'both'
+                 WHEN r.mxid_ratio >= $1 THEN 'multixact'
+                 ELSE 'xid'
+               END AS triggered_by
+             FROM pg_catalog.pg_database d
+             CROSS JOIN LATERAL (
+               SELECT CASE WHEN d.datminmxid <> '0'::xid THEN mxid_age(d.datminmxid) END AS mxid_age
+             ) mx
+             CROSS JOIN LATERAL (
+               SELECT
+                 (age(d.datfrozenxid)::numeric
+                    / NULLIF(current_setting('autovacuum_freeze_max_age')::numeric, 0)) AS xid_ratio,
+                 (mx.mxid_age::numeric
+                    / NULLIF(current_setting('autovacuum_multixact_freeze_max_age')::numeric, 0)) AS mxid_ratio
+             ) r
+             WHERE r.xid_ratio >= $1 OR r.mxid_ratio >= $1
+             ORDER BY GREATEST(r.xid_ratio, r.mxid_ratio) DESC
+             LIMIT $2`,
+            [wraparoundThreshold, limit],
+          ),
+          run<WraparoundTableRow>(
+            // Deliberately unfiltered by schema, unlike every other category
+            // in this tool: an anti-wraparound emergency is usually driven by
+            // a TOAST table (pg_toast.*) or a system catalog, and a check that
+            // only looked at user tables would report "nothing wrong" while
+            // the cluster approached a forced shutdown.
+            //
+            // relkind is restricted to relations that actually carry a
+            // frozen-xid horizon: heap ('r'), materialized view ('m'), TOAST
+            // ('t'). Everything else -- views, indexes, partitioned parents
+            // ('p'), sequences -- stores InvalidTransactionId (0) in
+            // relfrozenxid, and age('0'::xid) is a meaningless ~2.1-billion
+            // number that would flood this list with false positives. The
+            // explicit `relfrozenxid <> '0'::xid` guard catches the same case
+            // for any relkind that stops carrying a horizon in a future major.
+            //
+            // freeze_max_age resolves the per-table storage parameter
+            // (`ALTER TABLE ... SET (autovacuum_freeze_max_age = ...)`) and
+            // falls back to the cluster GUC. Without this, a table with a
+            // deliberately raised override reads as critical against the
+            // cluster default, and -- worse -- a table with a LOWERED override
+            // reads as safe when autovacuum is already forcing freezes on it.
+            // pg_options_to_table is strict, so a NULL reloptions yields zero
+            // rows and the scalar subquery returns NULL for COALESCE to
+            // absorb. multixact_freeze_max_age resolves the same way from the
+            // separate `autovacuum_multixact_freeze_max_age` storage parameter
+            // -- a table with a lowered multixact override is already being
+            // force-vacuumed while it still reads as safe against the cluster
+            // default.
+            //
+            // relminmxid is the multixact twin of relfrozenxid and moves
+            // independently of it: row-level locks (SELECT ... FOR
+            // SHARE/UPDATE, FK checks) burn multixact IDs without consuming
+            // xids, so a lock-heavy table can be at 90% of
+            // autovacuum_multixact_freeze_max_age with an age(relfrozenxid) of
+            // nearly zero. Filtering on the xid ratio alone reports that table
+            // as clean.
+            //
+            // The InvalidMultiXactId guard mirrors the relfrozenxid one as
+            // `<> '0'::xid` -- relminmxid is catalog-typed `xid` even though
+            // it holds a MultiXactId, so there is no separate type to cast to,
+            // and mxid_age('0'::xid) would return a meaningless ~4.2-billion
+            // age for any relation that has never recorded a multixact. It is
+            // expressed as a CASE yielding NULL, NOT as another AND in the
+            // WHERE: dropping those rows outright would also drop rows whose
+            // relfrozenxid IS dangerous. A NULL ratio cannot satisfy `>= $1`,
+            // so such a row can only ever be xid-triggered.
+            //
+            // ORDER BY is the GREATER of the two ratios rather than
+            // age(relfrozenxid): now that the filter is an OR, ordering on the
+            // xid age would push a multixact-critical TOAST table below the
+            // LIMIT cut and hide the exact row the operator was paged for.
+            // triggered_by is computed from the same full-precision ratios as
+            // the WHERE (not the rounded pct_* columns), so it can never
+            // disagree with why the row was returned.
+            `SELECT
+               n.nspname AS schema,
+               c.relname AS "table",
+               c.relkind AS relkind,
+               age(c.relfrozenxid) AS xid_age,
+               fma.freeze_max_age AS freeze_max_age,
+               r.xid_ratio::numeric(10, 4)::float8 AS pct_of_freeze_max_age,
+               fma.mxid_age AS mxid_age,
+               fma.multixact_freeze_max_age AS multixact_freeze_max_age,
+               r.mxid_ratio::numeric(10, 4)::float8 AS pct_of_multixact_freeze_max_age,
+               CASE
+                 WHEN r.xid_ratio >= $1 AND r.mxid_ratio >= $1 THEN 'both'
+                 WHEN r.mxid_ratio >= $1 THEN 'multixact'
+                 ELSE 'xid'
+               END AS triggered_by${frozenCoverageCols}
+             FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             CROSS JOIN LATERAL (
+               SELECT
+                 COALESCE(
+                   (SELECT o.option_value::int
+                    FROM pg_catalog.pg_options_to_table(c.reloptions) o
+                    WHERE o.option_name = 'autovacuum_freeze_max_age'),
+                   current_setting('autovacuum_freeze_max_age')::int
+                 ) AS freeze_max_age,
+                 COALESCE(
+                   (SELECT o.option_value::int
+                    FROM pg_catalog.pg_options_to_table(c.reloptions) o
+                    WHERE o.option_name = 'autovacuum_multixact_freeze_max_age'),
+                   current_setting('autovacuum_multixact_freeze_max_age')::int
+                 ) AS multixact_freeze_max_age,
+                 CASE WHEN c.relminmxid <> '0'::xid THEN mxid_age(c.relminmxid) END AS mxid_age
+             ) fma
+             CROSS JOIN LATERAL (
+               SELECT
+                 (age(c.relfrozenxid)::numeric / NULLIF(fma.freeze_max_age, 0)::numeric) AS xid_ratio,
+                 (fma.mxid_age::numeric / NULLIF(fma.multixact_freeze_max_age, 0)::numeric) AS mxid_ratio
+             ) r
+             WHERE c.relkind IN ('r', 'm', 't')
+               AND c.relfrozenxid <> '0'::xid
+               AND (r.xid_ratio >= $1 OR r.mxid_ratio >= $1)
+             ORDER BY GREATEST(r.xid_ratio, r.mxid_ratio) DESC
+             LIMIT $2`,
+            [wraparoundThreshold, limit],
           ),
           run<{ schema: string; table: string }>(
             // Includes partitioned parents (relkind='p') alongside plain heap
@@ -515,8 +817,19 @@ export const adminTools = [
           ),
         ]);
 
+        // One independent `if` per sub-query, never an early return: the
+        // wraparound catalogs (pg_database.datfrozenxid, pg_class.relfrozenxid)
+        // are permission-gated on several managed providers, so a partial
+        // answer is the expected path here rather than an edge case. Losing
+        // wraparound_risk must not also cost the caller the sequence and RLS
+        // findings that came back fine.
         const warnings: string[] = [];
         if (!seqRes.ok) warnings.push(`sequence_exhaustion fetch failed: ${seqRes.error}`);
+        if (!wrapGucRes.ok) {
+          warnings.push(`wraparound_risk.autovacuum_freeze_max_age fetch failed: ${wrapGucRes.error}`);
+        }
+        if (!wrapDbRes.ok) warnings.push(`wraparound_risk.databases fetch failed: ${wrapDbRes.error}`);
+        if (!wrapTblRes.ok) warnings.push(`wraparound_risk.tables fetch failed: ${wrapTblRes.error}`);
         if (!noPkRes.ok) warnings.push(`tables_without_primary_key fetch failed: ${noPkRes.error}`);
         if (!rlsRes.ok) warnings.push(`public_tables_without_rls fetch failed: ${rlsRes.error}`);
 
@@ -524,6 +837,25 @@ export const adminTools = [
           ok: true,
           data: {
             sequence_exhaustion: seqRes.ok ? seqRes.data : [],
+            wraparound_risk: {
+              // `?? null` rather than leaving it undefined: an absent key
+              // serializes away entirely, so a caller reading an empty
+              // `databases` list would have no way to tell "nothing above the
+              // threshold" from "the divisor was never readable".
+              autovacuum_freeze_max_age: wrapGucRes.ok
+                ? (wrapGucRes.data?.[0]?.autovacuum_freeze_max_age ?? null)
+                : null,
+              // Same `?? null` reasoning, and it is exposed even though the
+              // two GUCs share a sub-query: a caller that only saw the xid
+              // divisor would have no scale for pct_of_multixact_freeze_max_age
+              // and no way to judge an empty `databases` list on the multixact
+              // axis.
+              autovacuum_multixact_freeze_max_age: wrapGucRes.ok
+                ? (wrapGucRes.data?.[0]?.autovacuum_multixact_freeze_max_age ?? null)
+                : null,
+              databases: wrapDbRes.ok ? wrapDbRes.data : [],
+              tables: wrapTblRes.ok ? wrapTblRes.data : [],
+            },
             tables_without_primary_key: noPkRes.ok ? noPkRes.data : [],
             public_tables_without_rls: rlsRes.ok ? rlsRes.data : [],
             ...(warnings.length > 0 ? { _warnings: warnings } : {}),
