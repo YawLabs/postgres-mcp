@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { getServerVersionNum, PG16, PG18, withSharedClient } from "../api.js";
+import { warningsField } from "./output.js";
 
 /**
  * Row shape of the `pg_stat_io` query below. A type alias, not an interface:
@@ -57,6 +58,50 @@ type AioRow = {
   length: string | null;
   target_desc: string | null;
 };
+
+/**
+ * Schema counterpart of {@link IoRow}. Every counter is `.nullable()` for the
+ * reason IoRow spells out: pg_stat_io reports NULL, not 0, where an operation
+ * is impossible for a (backend_type, object, context) combination. Declaring
+ * any of them non-null would reject the response on essentially every server,
+ * since a real pg_stat_io result always contains such rows.
+ */
+const ioRowOutput = z.object({
+  backend_type: z.string(),
+  io_object: z.string().describe("The view's `object` column, renamed -- it is a postgres keyword."),
+  io_context: z.string().describe("The view's `context` column, renamed for symmetry with io_object."),
+  reads: z.string().nullable(),
+  read_bytes: z.string().nullable().describe("Source named by the top-level `byte_accounting`."),
+  read_time_ms: z
+    .number()
+    .nullable()
+    .describe("0 next to a non-zero op count means track_io_timing is OFF, not that the I/O was free."),
+  writes: z.string().nullable(),
+  write_bytes: z.string().nullable(),
+  write_time_ms: z.number().nullable(),
+  writebacks: z.string().nullable(),
+  writeback_time_ms: z.number().nullable(),
+  extends: z.string().nullable(),
+  extend_bytes: z.string().nullable(),
+  extend_time_ms: z.number().nullable(),
+  hits: z.string().nullable(),
+  evictions: z.string().nullable(),
+  reuses: z.string().nullable(),
+  fsyncs: z.string().nullable(),
+  fsync_time_ms: z.number().nullable(),
+  stats_reset: z.string().nullable().describe("These counters are cumulative SINCE this point. Null = never reset."),
+});
+
+/** Schema counterpart of {@link AioRow}. */
+const aioRowOutput = z.object({
+  pid: z.number().describe("Line this up against pg_health / pg_inspect_locks output for the same backend."),
+  io_id: z.number(),
+  op: z.string().nullable(),
+  state: z.string().nullable(),
+  off: z.string().nullable().describe("File offset, cast to text so a widened column stays lossless."),
+  length: z.string().nullable(),
+  target_desc: z.string().nullable(),
+});
 
 export const ioTools = [
   {
@@ -122,6 +167,44 @@ export const ioTools = [
           "Max rows per section (default 200). pg_stat_io has well under 200 combinations, so " +
             "this effectively bounds the in-flight list on a busy PG18 server.",
         ),
+    }),
+    // `io_method` and `in_flight` are `.optional()`, never nullable-and-required:
+    // the handler spreads them in only on PG18+, and the whole point of that
+    // gate is that an absent key forces the caller to notice the server cannot
+    // look, where `in_flight: []` would read as a confident "nothing is
+    // stalled". Both are ALSO nullable, for the separate case where the server
+    // can look and the sub-query was refused.
+    outputSchema: z.object({
+      server_version_num: z
+        .number()
+        .describe("Echoed so a caller can tell WHY the PG18-only keys are absent without a second round-trip."),
+      byte_accounting: z
+        .string()
+        .describe("Which source produced read_bytes / write_bytes / extend_bytes: native columns, or op_bytes * ops."),
+      include_zero_rows: z
+        .boolean()
+        .describe("Echoed because it changes what an empty `io` means: no recorded I/O, vs the view returned nothing."),
+      io: z
+        .array(ioRowOutput)
+        .nullable()
+        .describe("Null (not []) when the fetch was refused -- [] is a real answer on a freshly reset cluster."),
+      io_method: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          "PostgreSQL 18+ only. worker | io_uring | sync. With `sync` there is no async submission, " +
+            "so `in_flight` is legitimately empty however much I/O is running.",
+        ),
+      in_flight: z
+        .array(aioRowOutput)
+        .nullable()
+        .optional()
+        .describe(
+          "PostgreSQL 18+ only. Currently-outstanding async I/O. Null (not []) when the fetch was " +
+            "refused -- reading a denial as 'nothing outstanding' would point the investigation the wrong way.",
+        ),
+      _warnings: warningsField,
     }),
     handler: async (input: unknown) => {
       // Zod defaults re-applied for direct (non-MCP) callers, which bypass the

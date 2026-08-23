@@ -786,7 +786,12 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.equal(analyzeUsers.ok, true, `ANALYZE users failed: ${analyzeUsers.error}`);
       assert.equal(analyzePosts.ok, true, `ANALYZE posts failed: ${analyzePosts.error}`);
 
-      const baseline = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: 0, limit: 500 })) as {
+      // 200 is this tool's inputSchema max, and both calls below stay inside
+      // it. Direct handler calls bypass Zod, so a larger number still "works"
+      // here while exercising a shape no MCP client could ever send -- which
+      // is exactly how a regression that lowered the cap would leave this test
+      // green while every real caller started getting a validation error.
+      const baseline = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: 0, limit: 200 })) as {
         ok: boolean;
         data?: { table: string; dead_ratio: number }[];
       };
@@ -794,7 +799,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.ok((baseline.data ?? []).length > 0, "expected at least one baseline row after ANALYZE");
 
       const threshold = 0.5;
-      const filtered = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: threshold, limit: 500 })) as {
+      const filtered = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: threshold, limit: 200 })) as {
         ok: boolean;
         data?: { table: string; dead_ratio: number }[];
       };
@@ -816,7 +821,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // schema; this one proves the `AND schemaname = $3` predicate fires.
     // A regression that swaps the branches would leak cross-schema rows.
     it("filters by schema when provided (no cross-schema leakage)", async () => {
-      const res = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: 0, limit: 500 })) as {
+      const res = (await tableBloat.handler({ schema: FIXTURE_SCHEMA, minDeadRatio: 0, limit: 200 })) as {
         ok: boolean;
         data?: { schema: string }[];
       };
@@ -1430,7 +1435,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // data-integrity hazard: the user follows the advice, drops the unique
     // index, the constraint goes with it, duplicates start landing.
     it("never lists primary-key or unique-constraint indexes", async () => {
-      const res = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 1_000_000, limit: 500 })) as {
+      const res = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 1_000_000, limit: 200 })) as {
         ok: boolean;
         data?: {
           rows: { table: string; index: string }[];
@@ -1487,7 +1492,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // unscanned, so there is no surviving-at-a-nonzero-maxScans row to check;
     // the inclusion side is not pinned here.
     it("respects the maxScans predicate (maxScans=0 excludes any non-zero-scan index)", async () => {
-      const zero = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 500 })) as {
+      const zero = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 200 })) as {
         ok: boolean;
         data?: {
           rows: { index: string; scans: string }[];
@@ -1718,5 +1723,33 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         else process.env.ALLOW_WRITES = original;
       }
     });
+  });
+});
+
+// Deliberately OUTSIDE the integrationEnabled() gate above: this asserts a
+// declared schema bound, needs no server, and putting it behind one would make
+// it vacuous on every run that has no Postgres -- the same trap it exists to
+// catch. `limit` is capped at 200 by pg_unused_indexes' inputSchema, but every
+// handler call in this file hands its arguments straight to the handler and so
+// never runs Zod at all; nothing above can tell a working cap from a missing
+// one. The schema is the only place the boundary is enforceable, so pin both
+// ends of it -- a value one over the max must be REJECTED (the assertion a cap
+// regression actually trips on), and the max itself must stay accepted, since
+// that is the value the calls above were moved onto.
+describe("pg_unused_indexes inputSchema bounds", () => {
+  it("rejects a limit above the declared max and accepts the max itself", () => {
+    const over = unusedIndexes.inputSchema.safeParse({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 201 });
+    assert.equal(
+      over.success,
+      false,
+      "limit=201 is above the declared max of 200 and must be rejected, but safeParse accepted it",
+    );
+
+    const atMax = unusedIndexes.inputSchema.safeParse({ schema: FIXTURE_SCHEMA, maxScans: 0, limit: 200 });
+    assert.equal(
+      atMax.success,
+      true,
+      `limit=200 is the declared max and must stay acceptable: ${atMax.success ? "" : atMax.error.message}`,
+    );
   });
 });

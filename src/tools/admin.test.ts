@@ -504,3 +504,152 @@ describe("pg_advisor wraparound_risk (stubbed connect, no live DB)", () => {
     }
   });
 });
+// ─────────────────────────────────────────────────────────────────────────
+// pg_table_bloat PG19 stats_reset gate WITHOUT a live DB.
+//
+// Unlike the two suites above, this tool runs through runInternal
+// (pool.query) rather than withSharedClient, so the POOL query stub is the
+// only seam -- there is no connect() to intercept. getServerVersionNum()
+// probes through that same seam, so one dispatcher serves both.
+// ─────────────────────────────────────────────────────────────────────────
+
+const pgTableBloat = adminTools.find((t) => t.name === "pg_table_bloat")!;
+
+type BloatCategory = "version" | "extension" | "pgstattuple" | "estimate" | "unknown";
+
+function categorizeBloat(sql: string): BloatCategory {
+  if (sql.includes("server_version_num")) return "version";
+  // Ordered before the pgstattuple query: the extension probe also mentions
+  // pgstattuple, as a value rather than as a function call.
+  if (sql.includes("pg_catalog.pg_extension")) return "extension";
+  if (sql.includes("CROSS JOIN LATERAL")) return "pgstattuple";
+  if (sql.includes("pg_catalog.pg_stat_user_tables")) return "estimate";
+  return "unknown";
+}
+
+const STUB_STATS_RESET = "2026-08-01 00:00:00+00";
+
+function bloatRowsFor(sql: string): Record<string, unknown>[] {
+  switch (categorizeBloat(sql)) {
+    case "extension":
+      return [{ installed: true }];
+    case "pgstattuple":
+    case "estimate":
+      return [
+        {
+          schema: "public",
+          table: "events",
+          live_tuples: "1000",
+          dead_tuples: "500",
+          dead_ratio: 0.333,
+          size_pretty: "8192 bytes",
+          size_bytes: "8192",
+          last_vacuum: null,
+          last_autovacuum: null,
+          last_analyze: null,
+          // Mirror the server: the column comes back only when the handler
+          // actually named it, which is the whole point of the version gate.
+          ...(sql.includes("stats_reset") ? { stats_reset: STUB_STATS_RESET } : {}),
+        },
+      ];
+    default:
+      return [];
+  }
+}
+
+describe("pg_table_bloat stats_reset gate (stubbed pool, no live DB)", () => {
+  const originalQuery = pg.Pool.prototype.query;
+  const originalDbUrl = process.env.DATABASE_URL;
+  let seen: string[] = [];
+
+  /**
+   * @param versionNum server_version_num the probe reports; `null` makes the
+   *   probe reject, exercising getServerVersionNum's "assume oldest" 0.
+   */
+  function installStub(versionNum: number | null) {
+    seen = [];
+    pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
+      const text = typeof sql === "string" ? sql : "";
+      seen.push(text);
+      if (categorizeBloat(text) === "version") {
+        return versionNum === null
+          ? Promise.reject(new Error("version probe unavailable"))
+          : Promise.resolve({ rows: [{ v: String(versionNum) }] });
+      }
+      return Promise.resolve({ rows: bloatRowsFor(text) });
+    } as unknown as typeof pg.Pool.prototype.query;
+  }
+
+  function sqlFor(category: BloatCategory): string {
+    return seen.find((sql) => categorizeBloat(sql) === category) ?? "";
+  }
+
+  beforeEach(async () => {
+    // shutdown() clears the cached server_version_num, so each case's stubbed
+    // version is actually probed instead of reusing the previous case's.
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.query = originalQuery;
+    await shutdown();
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("PG19: names stats_reset and returns it on the row", async () => {
+    installStub(190_000);
+    const res = (await pgTableBloat.handler({})) as { ok: boolean; data?: Record<string, unknown>[] };
+    assert.equal(res.ok, true);
+    assert.ok(sqlFor("estimate").includes("stats_reset::text AS stats_reset"), "PG19 should name stats_reset");
+    assert.equal(res.data?.[0]?.stats_reset, STUB_STATS_RESET);
+  });
+
+  it("PG18: stats_reset is never named, and the key is absent (not null)", async () => {
+    installStub(180_000);
+    const res = (await pgTableBloat.handler({})) as { ok: boolean; data?: Record<string, unknown>[] };
+    const sql = sqlFor("estimate");
+    assert.ok(sql.length > 0, "the bloat query should still run on PG18");
+    // Naming a column the server lacks is a 42703 that fails the whole tool,
+    // so the gate has to keep the identifier out of the statement entirely --
+    // not merely ignore the value that comes back.
+    assert.equal(sql.includes("stats_reset"), false);
+    const rows = res.data ?? [];
+    assert.equal(rows.length, 1);
+    // Absent, not null. On a PG18 server `stats_reset: null` would read as
+    // "these counters have never been reset" -- a real and reassuring fact --
+    // rather than "this server cannot report it".
+    assert.equal("stats_reset" in rows[0], false);
+    // The columns that DO exist on PG18 still come back.
+    assert.equal(rows[0].dead_tuples, "500");
+  });
+
+  it("version probe failure falls through to the pre-PG19 shape", async () => {
+    installStub(null);
+    const res = (await pgTableBloat.handler({})) as { ok: boolean; data?: Record<string, unknown>[] };
+    // The "assume oldest" 0 must degrade the answer, never break it: a failed
+    // probe that guessed PG19 would lose the entire bloat report to a 42703.
+    assert.equal(res.ok, true);
+    assert.equal(sqlFor("estimate").includes("stats_reset"), false);
+    assert.equal(res.data?.length, 1);
+  });
+
+  it("the pgstattuple methods return the same row shape as estimate on the same server", async () => {
+    for (const method of ["approx", "exact"] as const) {
+      installStub(190_000);
+      const res = (await pgTableBloat.handler({ method })) as { ok: boolean; data?: Record<string, unknown>[] };
+      assert.equal(res.ok, true, `method=${method} should succeed`);
+      // Alias-qualified because this query joins pg_stat_user_tables as `s`.
+      // Getting the qualifier wrong is a 42P01/42703 rather than a silent
+      // miss, but an un-gated method would be worse: a caller comparing an
+      // estimate run against an exact one would watch the key appear and
+      // disappear with the method rather than with the server version.
+      assert.ok(
+        sqlFor("pgstattuple").includes("s.stats_reset::text AS stats_reset"),
+        `method=${method} should name the aliased stats_reset`,
+      );
+      assert.equal(res.data?.[0]?.stats_reset, STUB_STATS_RESET);
+    }
+  });
+});

@@ -8,7 +8,145 @@ import {
   runInternal,
   withSharedClient,
 } from "../api.js";
+import { rowsOutput, warningsField } from "./output.js";
 import { identSchema } from "./params.js";
+
+/**
+ * `server_version_num` cut point for PostgreSQL 19, which added the
+ * per-relation `stats_reset` that pg_table_bloat reads below. Declared here
+ * rather than beside the PG16 / PG17 / PG18 constants in api.ts only because
+ * api.ts is being edited concurrently with this change; hoist it next to its
+ * siblings once both land, so a version cut point keeps exactly one home.
+ */
+const PG19 = 190_000;
+
+/**
+ * Which of the two independent counters put a pg_advisor wraparound row over
+ * the threshold. Non-optional on every wraparound row: a table listed purely
+ * for multixact pressure needs a completely different remediation (find the
+ * row-locking workload) than one listed for xid age (get a freeze VACUUM
+ * through), and without this the operator cannot tell them apart from the
+ * numbers alone.
+ */
+type WraparoundTrigger = "xid" | "multixact" | "both";
+const wraparoundTriggerOutput = z
+  .enum(["xid", "multixact", "both"])
+  .describe("'xid' -> chase freezing/autovacuum; 'multixact' -> chase the lock-heavy workload burning members.");
+
+/**
+ * mxid_age / pct_of_multixact_freeze_max_age are nullable, unlike their xid
+ * twins: rows whose minmxid is InvalidMultiXactId are excluded from the
+ * multixact evaluation (see the guard in the query below) but still returned
+ * when the xid side is dangerous. Null here means "no multixact horizon
+ * recorded", and triggered_by will never be 'multixact'/'both' on such a row.
+ *
+ * pages / all_frozen_pages / frozen_page_fraction are PG18+ only, and OPTIONAL
+ * rather than `number | null`: the columns are ABSENT from the row on older
+ * servers, not null -- a caller seeing `frozen_page_fraction: null` would read
+ * it as "no pages frozen" (an alarming, actionable value) rather than "this
+ * server cannot report freeze coverage".
+ */
+type WraparoundTableRow = {
+  schema: string;
+  table: string;
+  relkind: string;
+  xid_age: number;
+  freeze_max_age: number;
+  pct_of_freeze_max_age: number | null;
+  mxid_age: number | null;
+  multixact_freeze_max_age: number;
+  pct_of_multixact_freeze_max_age: number | null;
+  triggered_by: WraparoundTrigger;
+  pages?: number;
+  all_frozen_pages?: number;
+  frozen_page_fraction?: number | null;
+};
+
+/** Schema counterpart of {@link WraparoundTableRow}. */
+const wraparoundTableRowOutput = z.object({
+  schema: z.string(),
+  table: z.string(),
+  relkind: z.string().describe("Raw relkind: 'r' heap, 'm' materialized view, 't' TOAST -- the only three checked."),
+  xid_age: z.number().describe("age(relfrozenxid)."),
+  freeze_max_age: z
+    .number()
+    .describe("EFFECTIVE limit: a per-table storage parameter wins over the cluster GUC."),
+  pct_of_freeze_max_age: z.number().nullable().describe("At 1.0 autovacuum forces an anti-wraparound VACUUM."),
+  mxid_age: z.number().nullable().describe("mxid_age(relminmxid). Null when no multixact was ever recorded."),
+  multixact_freeze_max_age: z.number().describe("EFFECTIVE limit, resolved the same way as freeze_max_age."),
+  pct_of_multixact_freeze_max_age: z.number().nullable(),
+  triggered_by: wraparoundTriggerOutput,
+  pages: z.number().optional().describe("PostgreSQL 18+ only, absent below that. relpages."),
+  all_frozen_pages: z.number().optional().describe("PostgreSQL 18+ only, absent below that. relallfrozen."),
+  frozen_page_fraction: z
+    .number()
+    .nullable()
+    .optional()
+    .describe("PostgreSQL 18+ only, absent below that. Null when relpages is 0, not when coverage is 0."),
+});
+
+type WraparoundDatabaseRow = {
+  database: string;
+  xid_age: number;
+  mxid_age: number | null;
+  pct_of_freeze_max_age: number | null;
+  pct_of_multixact_freeze_max_age: number | null;
+  triggered_by: WraparoundTrigger;
+};
+
+/** Schema counterpart of {@link WraparoundDatabaseRow}. */
+const wraparoundDatabaseRowOutput = z.object({
+  database: z.string().describe("Template databases included -- template0 ages like any other."),
+  xid_age: z.number().describe("age(datfrozenxid)."),
+  mxid_age: z.number().nullable().describe("mxid_age(datminmxid). Null when no multixact was ever recorded."),
+  pct_of_freeze_max_age: z.number().nullable(),
+  pct_of_multixact_freeze_max_age: z.number().nullable(),
+  triggered_by: wraparoundTriggerOutput,
+});
+
+/**
+ * Row shape shared by all three pg_table_bloat methods. `stats_reset` is PG19+
+ * only and ABSENT rather than null below that: a caller seeing
+ * `stats_reset: null` on a PG17 server would read it as "these counters have
+ * never been reset" (a real and reassuring fact) when the truth is that the
+ * server cannot say.
+ */
+type BloatRow = {
+  schema: string;
+  table: string;
+  live_tuples: string;
+  dead_tuples: string;
+  dead_ratio: number;
+  size_pretty: string;
+  size_bytes: string;
+  last_vacuum: string | null;
+  last_autovacuum: string | null;
+  last_analyze: string | null;
+  stats_reset?: string | null;
+};
+
+/** Schema counterpart of {@link BloatRow}. */
+const bloatRowOutput = z.object({
+  schema: z.string(),
+  table: z.string(),
+  live_tuples: z.string().describe("Bigint as a decimal string."),
+  dead_tuples: z.string().describe("Bigint as a decimal string."),
+  dead_ratio: z.number().describe("dead / (live + dead), bounded [0, 1]. Rows with both counters at 0 are filtered."),
+  size_pretty: z.string(),
+  size_bytes: z.string(),
+  last_vacuum: z.string().nullable(),
+  last_autovacuum: z.string().nullable(),
+  last_analyze: z.string().nullable(),
+  stats_reset: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "PostgreSQL 19+ only, absent below that. When THIS relation's counters were last reset by " +
+        "pg_stat_reset_single_table_counters() -- which zeroes the tuple counts AND clears every " +
+        "last_* timestamp together. Null on PG19+ means never reset.",
+    ),
+});
 
 export const adminTools = [
   {
@@ -35,19 +173,53 @@ export const adminTools = [
     inputSchema: z.object({
       limit: z.number().int().min(1).max(100).default(50).describe("Max blocked/blocker pairs (default 50)."),
     }),
+    // The user / query / state columns are NULLABLE, unlike the equivalents in
+    // pg_health.active_queries. Both read pg_stat_activity, but pg_health
+    // filters on `state IS NOT NULL`, which drops exactly the rows postgres
+    // withholds; this query has no such filter -- it must show every blocker,
+    // including ones the calling role can neither own nor read. postgres
+    // withholds those columns from a role lacking pg_read_all_stats / pg_monitor
+    // membership, and leaves usename NULL for a background process such as an
+    // autovacuum worker (a classic blocker). The recommended posture for this
+    // server is a least-privileged role, so declaring these non-null would fail
+    // the tool at the exact moment of contention it exists to diagnose.
+    outputSchema: rowsOutput(
+      z.object({
+        blocked_pid: z.number(),
+        blocked_user: z.string().nullable(),
+        blocked_query: z.string().nullable(),
+        blocked_duration_seconds: z.number().nullable().describe("Since query_start."),
+        blocking_pid: z.number(),
+        blocking_user: z.string().nullable(),
+        blocking_query: z.string().nullable(),
+        blocking_state: z.string().nullable(),
+        blocking_duration_seconds: z.number().nullable(),
+        relation: z
+          .string()
+          .nullable()
+          .describe(
+            "schema.table. For transactionid / virtualxid waits this is a best-effort GUESS among " +
+              "the blocker's held write-intent locks, not authoritative -- disambiguate with the query text.",
+          ),
+        lock_type: z.string().describe("pg_locks.locktype: relation, transactionid, virtualxid, tuple, ..."),
+      }),
+    ),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct (non-MCP) callers, which bypass the
       // schema -- matches the precedent in pg_explain / pg_table_bloat.
       const { limit = 50 } = input as { limit?: number };
+      // The user / query / state columns are `string | null`: see the note on
+      // outputSchema above for why this query, unlike pg_health, can surface a
+      // pg_stat_activity row whose restricted columns postgres withheld.
       return runInternal<{
         blocked_pid: number;
-        blocked_user: string;
-        blocked_query: string;
+        blocked_user: string | null;
+        blocked_query: string | null;
         blocked_duration_seconds: number | null;
         blocking_pid: number;
-        blocking_user: string;
-        blocking_query: string;
-        blocking_state: string;
+        blocking_user: string | null;
+        blocking_query: string | null;
+        blocking_state: string | null;
         blocking_duration_seconds: number | null;
         relation: string | null;
         lock_type: string;
@@ -130,6 +302,19 @@ export const adminTools = [
         .default(false)
         .describe("If true, include built-in `pg_*` roles (pg_read_all_data, pg_monitor, etc.)."),
     }),
+    outputSchema: rowsOutput(
+      z.object({
+        name: z.string(),
+        can_login: z.boolean().describe("False for a group role."),
+        superuser: z.boolean(),
+        createdb: z.boolean(),
+        createrole: z.boolean(),
+        replication: z.boolean(),
+        bypass_rls: z.boolean(),
+        // COALESCEd to an empty array in SQL, so never null.
+        member_of: z.array(z.string()).describe("Roles this one is a direct member of; empty when none."),
+      }),
+    ),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_inspect_locks above.
       const { includeSystem = false } = input as { includeSystem?: boolean };
@@ -193,6 +378,14 @@ export const adminTools = [
       schema: identSchema.default("public").describe("Schema name (defaults to 'public')."),
       table: identSchema.optional().describe("Table name. Omit to list privileges for all tables in the schema."),
     }),
+    outputSchema: rowsOutput(
+      z.object({
+        table: z.string(),
+        grantee: z.string().describe("Role name, or PUBLIC."),
+        privilege_type: z.string().describe("SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER."),
+        is_grantable: z.boolean().describe("True when the grantee may pass this privilege on (WITH GRANT OPTION)."),
+      }),
+    ),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_inspect_locks above.
       const { schema = "public", table } = input as { schema?: string; table?: string };
@@ -245,6 +438,18 @@ export const adminTools = [
         .enum(["cancel", "terminate"])
         .default("cancel")
         .describe("`cancel` aborts the current query; `terminate` closes the connection entirely."),
+    }),
+    // `signaled: false` is a SUCCESS response, not an error -- postgres returned
+    // false rather than raising -- so this schema has to cover it. `note` is the
+    // field that makes it actionable, carrying the NOTICE postgres emitted
+    // ("not a PostgreSQL backend process" vs "must be a member of...").
+    outputSchema: z.object({
+      pid: z.number().describe("Echoed back from the request."),
+      mode: z.enum(["cancel", "terminate"]).describe("Echoed back, after the safer 'cancel' default is applied."),
+      signaled: z.boolean().describe("What pg_cancel_backend / pg_terminate_backend returned."),
+      note: z
+        .string()
+        .describe("On `signaled: false`, postgres's own NOTICE explaining why -- act on this, not on the boolean."),
     }),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_inspect_locks above.
@@ -315,6 +520,43 @@ export const adminTools = [
       openWorldHint: true,
     },
     inputSchema: z.object({}),
+    // `slots` and `replicas` stay non-nullable arrays because a failed
+    // sub-query degrades to [] plus a `_warnings` entry, but `is_replica` goes
+    // NULL rather than false when its probe fails -- `false` would claim "this
+    // is a primary" on a question that was never answered.
+    outputSchema: z.object({
+      is_replica: z.boolean().nullable().describe("pg_is_in_recovery(). Null means the probe failed, NOT 'primary'."),
+      wal_position: z
+        .string()
+        .nullable()
+        .describe("Last received LSN on a replica, current LSN on a primary. Null when the probe failed."),
+      slots: z
+        .array(
+          z.object({
+            slot_name: z.string(),
+            slot_type: z.string().describe("physical | logical."),
+            active: z.boolean().describe("False means nothing is consuming the slot -- WAL piles up behind it."),
+            restart_lsn: z.string().nullable(),
+            confirmed_flush_lsn: z.string().nullable().describe("Logical slots only; null on a physical slot."),
+            wal_status: z.string().nullable().describe("reserved | extended | unreserved | lost."),
+            database: z.string().nullable().describe("Logical slots only; null on a physical slot."),
+            plugin: z.string().nullable().describe("Logical slots only; null on a physical slot."),
+          }),
+        )
+        .describe("Empty both on a standalone database and when the fetch failed -- check `_warnings`."),
+      replicas: z.array(
+        z.object({
+          application_name: z.string(),
+          client_addr: z.string().nullable().describe("Null for a replica connected over a unix socket."),
+          state: z.string().describe("startup | catchup | streaming | backup | stopping."),
+          sync_state: z.string().describe("async | potential | sync | quorum."),
+          write_lag_seconds: z.number().nullable().describe("Null until the primary has measured a round trip."),
+          flush_lag_seconds: z.number().nullable(),
+          replay_lag_seconds: z.number().nullable(),
+        }),
+      ),
+      _warnings: warningsField,
+    }),
     handler: async () => {
       // 3-way fanout sharing one connection -- see api.ts:withSharedClient.
       return withSharedClient(async (run) => {
@@ -468,6 +710,43 @@ export const adminTools = [
         .describe("Schemas where RLS-missing should be flagged. Defaults to ['public']."),
       limit: z.number().int().min(1).max(500).default(50).describe("Max rows per category (default 50)."),
     }),
+    // Every category stays a required array: a failed sub-query degrades to []
+    // plus a `_warnings` entry rather than dropping the key. The two GUC
+    // divisors are the exception -- they are `?? null` on purpose, because a
+    // caller reading an empty `databases` list has no way to tell "nothing above
+    // the threshold" from "the divisor was never readable" without them.
+    outputSchema: z.object({
+      sequence_exhaustion: z.array(
+        z.object({
+          schema: z.string(),
+          sequence: z.string(),
+          last_value: z.string().describe("Bigint as a decimal string."),
+          max_value: z.string().describe("Bigint as a decimal string."),
+          pct_used: z
+            .number()
+            .describe(
+              "last_value / max_value, rounded for display. The FILTER runs at full precision, so a " +
+                "displayed 0.5000 can sit just above the threshold.",
+            ),
+        }),
+      ),
+      wraparound_risk: z.object({
+        autovacuum_freeze_max_age: z.number().nullable().describe("Cluster GUC; the divisor for the xid ratios."),
+        autovacuum_multixact_freeze_max_age: z
+          .number()
+          .nullable()
+          .describe("Cluster GUC; the divisor for the multixact ratios."),
+        databases: z.array(wraparoundDatabaseRowOutput),
+        tables: z
+          .array(wraparoundTableRowOutput)
+          .describe("Deliberately includes pg_catalog and pg_toast -- the culprit is usually one of those."),
+      }),
+      tables_without_primary_key: z
+        .array(z.object({ schema: z.string(), table: z.string() }))
+        .describe("Plain and partitioned tables only; foreign tables cannot have a PK and are excluded."),
+      public_tables_without_rls: z.array(z.object({ schema: z.string(), table: z.string() })),
+      _warnings: warningsField,
+    }),
     handler: async (input: unknown) => {
       // Zod defaults re-applied for direct callers -- see pg_inspect_locks
       // above. `rlsSchemas` is the load-bearing one: undefined bound into
@@ -506,49 +785,10 @@ export const adminTools = [
                (c.relallfrozen::numeric / NULLIF(c.relpages, 0))::numeric(6, 4)::float8 AS frozen_page_fraction`
           : "";
 
-      // PG18+ only. Optional rather than `number | null` because the columns
-      // are ABSENT from the row on older servers, not null -- a caller that
-      // sees `frozen_page_fraction: null` would read it as "no pages frozen"
-      // (an alarming, actionable value) rather than "this server cannot
-      // report freeze coverage".
-      // Which of the two independent counters put the row over the threshold.
-      // Non-optional on every wraparound row: a table listed purely for
-      // multixact pressure needs a completely different remediation (find the
-      // row-locking workload) than one listed for xid age (get a freeze VACUUM
-      // through), and without this the operator cannot tell them apart from
-      // the numbers alone.
-      type WraparoundTrigger = "xid" | "multixact" | "both";
-
-      // mxid_age / pct_of_multixact_freeze_max_age are nullable, unlike their
-      // xid twins: rows whose minmxid is InvalidMultiXactId are excluded from
-      // the multixact evaluation (see the guard in the query below) but still
-      // returned when the xid side is dangerous. Null here means "no multixact
-      // horizon recorded", and triggered_by will never be 'multixact'/'both'
-      // on such a row.
-      type WraparoundTableRow = {
-        schema: string;
-        table: string;
-        relkind: string;
-        xid_age: number;
-        freeze_max_age: number;
-        pct_of_freeze_max_age: number | null;
-        mxid_age: number | null;
-        multixact_freeze_max_age: number;
-        pct_of_multixact_freeze_max_age: number | null;
-        triggered_by: WraparoundTrigger;
-        pages?: number;
-        all_frozen_pages?: number;
-        frozen_page_fraction?: number | null;
-      };
-
-      type WraparoundDatabaseRow = {
-        database: string;
-        xid_age: number;
-        mxid_age: number | null;
-        pct_of_freeze_max_age: number | null;
-        pct_of_multixact_freeze_max_age: number | null;
-        triggered_by: WraparoundTrigger;
-      };
+      // WraparoundTrigger / WraparoundTableRow / WraparoundDatabaseRow live at
+      // module scope beside the Zod schemas that mirror them -- keeping the two
+      // adjacent is what stops the row type and the declared outputSchema from
+      // drifting apart.
 
       // 6-way fanout sharing one connection -- see api.ts:withSharedClient.
       return withSharedClient(async (run) => {
@@ -871,7 +1111,13 @@ export const adminTools = [
       "Estimate table bloat (dead tuples + free space) for tables in a schema. Returns live " +
       "tuples, dead tuples, dead-tuple ratio, last_vacuum / last_autovacuum timestamps, and " +
       "total relation size. A high dead_ratio with a stale last_autovacuum is a sign a table " +
-      "needs VACUUM.\n\n" +
+      "needs VACUUM.\n" +
+      "On PostgreSQL 19+ every row also carries `stats_reset`: the last time THAT relation's " +
+      "counters were reset via `pg_stat_reset_single_table_counters()`. Read it before trusting " +
+      "anything else in the row -- a reset zeroes live_tuples and dead_tuples AND clears " +
+      "last_vacuum / last_autovacuum / last_analyze together, so a table reset a minute ago is " +
+      "indistinguishable from a pristine one without it. The key is ABSENT on older servers " +
+      "rather than null; null on PG19+ means this relation's counters have never been reset.\n\n" +
       "Three methods are available via the `method` parameter:\n" +
       "- `estimate` (default): reads pg_stat_user_tables -- fast, no extensions, ANALYZE-driven " +
       "approximations. Use this first.\n" +
@@ -928,18 +1174,41 @@ export const adminTools = [
       const params: unknown[] = [minDeadRatio, limit];
       if (schema) params.push(schema);
 
-      type BloatRow = {
-        schema: string;
-        table: string;
-        live_tuples: string;
-        dead_tuples: string;
-        dead_ratio: number;
-        size_pretty: string;
-        size_bytes: string;
-        last_vacuum: string | null;
-        last_autovacuum: string | null;
-        last_analyze: string | null;
-      };
+      // `stats_reset` on pg_stat_user_tables was added in PG19. Naming it on an
+      // older server is a 42703 undefined_column that fails the whole tool
+      // instead of degrading it, so the column list is built from the server
+      // version. getServerVersionNum returns 0 when the probe itself fails,
+      // which falls through to the pre-PG19 shape -- a slightly poorer answer
+      // instead of a broken one -- and api.ts caches the result process-wide.
+      //
+      // Worth a round trip because every freshness signal this tool reports is
+      // per-relation state that `pg_stat_reset_single_table_counters()` zeroes
+      // in one go: n_live_tup, n_dead_tup AND last_vacuum / last_autovacuum /
+      // last_analyze all drop to 0 / NULL together. Without the reset
+      // timestamp a table whose counters were just discarded is
+      // indistinguishable from a pristine one: it reads as "no dead tuples,
+      // and autovacuum has never had to touch this", which is the most
+      // reassuring possible rendering of "the evidence was thrown away".
+      // pg_stat_database.stats_reset cannot stand in for it -- that clock only
+      // moves on a database-wide reset.
+      const versionNum = await getServerVersionNum();
+      // Two spellings of one fragment because the two query shapes below scan
+      // the same view under different aliases. Both methods must return the
+      // same row shape on the same server, or a caller comparing an `estimate`
+      // run against an `exact` one watches the key appear and disappear.
+      const statsResetCol =
+        versionNum >= PG19
+          ? `,
+           stats_reset::text AS stats_reset`
+          : "";
+      const statsResetColAliased =
+        versionNum >= PG19
+          ? `,
+             s.stats_reset::text AS stats_reset`
+          : "";
+
+      // BloatRow lives at module scope beside the Zod schema that mirrors it --
+      // see the note on the wraparound row types above.
 
       if (method !== "estimate") {
         // Check extension presence before opening a second connection.
@@ -977,7 +1246,7 @@ export const adminTools = [
              pg_total_relation_size(s.relid)::text AS size_bytes,
              s.last_vacuum::text AS last_vacuum,
              s.last_autovacuum::text AS last_autovacuum,
-             s.last_analyze::text AS last_analyze
+             s.last_analyze::text AS last_analyze${statsResetColAliased}
            FROM pg_catalog.pg_stat_user_tables s
            JOIN pg_catalog.pg_class c ON c.oid = s.relid AND c.relkind IN ('r', 'm')
            CROSS JOIN LATERAL ${fn}(s.relid::regclass) p
@@ -1004,7 +1273,7 @@ export const adminTools = [
            pg_total_relation_size(relid)::text AS size_bytes,
            last_vacuum::text AS last_vacuum,
            last_autovacuum::text AS last_autovacuum,
-           last_analyze::text AS last_analyze
+           last_analyze::text AS last_analyze${statsResetCol}
          FROM pg_catalog.pg_stat_user_tables
          WHERE (n_live_tup + n_dead_tup) > 0
            AND (n_dead_tup::float8 / (n_live_tup + n_dead_tup)) >= $1

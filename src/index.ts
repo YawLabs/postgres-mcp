@@ -105,9 +105,8 @@ const server = new McpServer({
 // `server.tool()` is deprecated as of SDK 1.30 -- every one of its six
 // overloads carries `@deprecated Use registerTool instead`, and it is gone in
 // the v2 packages. registerTool takes the same information as a config object
-// and is the only form that can carry `outputSchema`, so moving now is what
-// makes structured tool output reachable later without touching this loop
-// again.
+// and is the only form that can carry `outputSchema`, which is what makes the
+// structured tool output wired below reachable at all.
 for (const tool of allTools) {
   server.registerTool(
     tool.name,
@@ -120,6 +119,13 @@ for (const tool of allTools) {
       title: tool.annotations.title,
       description: tool.description,
       inputSchema: tool.inputSchema.shape,
+      // Declaring outputSchema is not free: from here on the SDK REJECTS any
+      // successful result whose `structuredContent` fails to parse against it,
+      // so a schema that overstates the response turns a working tool into a
+      // hard failure. mcp-wrapper.ts is what supplies the structuredContent;
+      // tools/output.ts documents the optional-vs-nullable rule the per-tool
+      // schemas follow to stay inside that contract.
+      outputSchema: tool.outputSchema.shape,
       annotations: tool.annotations,
     },
     wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>),

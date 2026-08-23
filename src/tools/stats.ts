@@ -1,6 +1,26 @@
 import { z } from "zod";
 import { type ApiResponse, getServerVersionNum, PG16, runInternal, withSharedClient } from "../api.js";
+import { warningsField } from "./output.js";
 import { identSchema } from "./params.js";
+
+/**
+ * The reset pair as `withStatsReset` actually emits it: ALWAYS present, and
+ * null both when the counters were never reset and when the probe failed --
+ * `_warnings` is the only thing that separates those two readings.
+ *
+ * Required here, unlike the `StatsWindow` interface that declares them
+ * optional. That interface is optional for pg_top_queries' sake alone (its
+ * pre-1.9 path omits both keys); pg_seq_scan_tables and pg_unused_indexes have
+ * no such path, so declaring the keys optional for them would tell a caller a
+ * field might go missing when it never does.
+ */
+const statsResetFields = {
+  stats_reset: z
+    .string()
+    .nullable()
+    .describe("Every counter in `rows` is cumulative SINCE this point. Null = start of the window unknown."),
+  stats_reset_age_seconds: z.number().nullable().describe("Seconds since `stats_reset`; null whenever that is null."),
+};
 
 /**
  * Row shape of {@link STATS_RESET_SQL} and {@link STATEMENTS_STATS_RESET_SQL}.
@@ -139,6 +159,53 @@ export const statsTools = [
         .default("total_time")
         .describe("Ranking: total_time (cumulative impact), mean_time (worst per-call), or calls (hottest)."),
       limit: z.number().int().min(1).max(100).default(20).describe("Number of rows to return (default 20)."),
+    }),
+    // The one tool here whose reset fields are `.optional()`: on
+    // pg_stat_statements < 1.9 the handler returns `{rows, _warnings}` and omits
+    // all three, because `stats_reset: null` would read as "never reset" and
+    // `dealloc: null` as "nothing was ever evicted" -- reassuring claims that
+    // extension version cannot support. Absent is the honest answer, so the
+    // schema has to permit it.
+    outputSchema: z.object({
+      rows: z.array(
+        z.object({
+          query: z.string().describe("Normalized text: constants replaced with `?`."),
+          calls: z.string().describe("Bigint as a decimal string."),
+          total_time_ms: z.number(),
+          mean_time_ms: z.number(),
+          min_time_ms: z.number(),
+          max_time_ms: z.number(),
+          rows: z.string().describe("Rows returned or affected, bigint as a decimal string."),
+          hit_percent: z.number().nullable().describe("Null when the statement touched no shared blocks at all."),
+          io_read_time_ms: z
+            .number()
+            .nullable()
+            .optional()
+            .describe(
+              "pg_stat_statements >= 1.10 only, absent below that. Null means track_io_timing is off " +
+                "OR the query did no measurable IO.",
+            ),
+          io_write_time_ms: z.number().nullable().optional().describe("See io_read_time_ms."),
+        }),
+      ),
+      stats_reset: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          "pg_stat_statements' OWN reset clock, independent of the pg_stat_database one the " +
+            "table/index tools report -- never compare the two. Absent below extension 1.9.",
+        ),
+      stats_reset_age_seconds: z.number().nullable().optional(),
+      dealloc: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          "Times least-executed entries were evicted for exceeding pg_stat_statements.max. Non-zero " +
+            "means this ranking is drawn from an INCOMPLETE population. Absent below extension 1.9.",
+        ),
+      _warnings: warningsField,
     }),
     handler: async (input: unknown) => {
       // Direct (non-MCP) callers bypass Zod, so the schema defaults never ran.
@@ -308,6 +375,33 @@ export const statsTools = [
         .describe("Minimum live tuple count to include (default 1000, filters out tiny/empty tables)."),
       limit: z.number().int().min(1).max(100).default(20).describe("Max rows to return (default 20)."),
     }),
+    outputSchema: z.object({
+      rows: z.array(
+        z.object({
+          schema: z.string(),
+          table: z.string(),
+          seq_scans: z.string().describe("Bigint as a decimal string."),
+          idx_scans: z.string().describe("COALESCEd to '0', so a never-index-scanned table reads as 0, not null."),
+          live_tuples: z.string(),
+          seq_tup_read: z.string(),
+          ratio: z.number().nullable().describe("seq_scans / idx_scans; null when idx_scans is 0 (division guard)."),
+          // Gated out below PG16 rather than defaulted -- naming the column on
+          // an older server is a 42703 that fails the whole tool.
+          last_seq_scan: z
+            .string()
+            .nullable()
+            .optional()
+            .describe("PostgreSQL 16+ only, absent below that. Null = no sequential scan since the reset."),
+          last_idx_scan: z
+            .string()
+            .nullable()
+            .optional()
+            .describe("PostgreSQL 16+ only, absent below that. Null = no index scan since the reset."),
+        }),
+      ),
+      ...statsResetFields,
+      _warnings: warningsField,
+    }),
     handler: async (input: unknown) => {
       // Zod defaults re-applied for direct callers -- see pg_top_queries above.
       const {
@@ -414,6 +508,29 @@ export const statsTools = [
         .default(10)
         .describe("Include indexes with scan count <= this (default 10). Use 0 for 'never scanned'."),
       limit: z.number().int().min(1).max(200).default(50).describe("Max rows to return (default 50)."),
+    }),
+    outputSchema: z.object({
+      rows: z.array(
+        z.object({
+          schema: z.string(),
+          table: z.string(),
+          index: z.string(),
+          scans: z.string().describe("Bigint as a decimal string. A COUNTER, not a verdict -- read stats_reset first."),
+          size_pretty: z.string(),
+          size_bytes: z.string(),
+          definition: z.string(),
+          last_idx_scan: z
+            .string()
+            .nullable()
+            .optional()
+            .describe(
+              "PostgreSQL 16+ only, absent below that. Null = never scanned since the reset. Far " +
+                "better grounds for a drop decision than the bare count.",
+            ),
+        }),
+      ),
+      ...statsResetFields,
+      _warnings: warningsField,
     }),
     handler: async (input: unknown) => {
       // Zod defaults re-applied for direct callers -- see pg_top_queries above.

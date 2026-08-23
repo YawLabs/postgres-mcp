@@ -15,10 +15,30 @@
 #     `npm login --auth-type=web` -- it OVERWRITES the automation token with a
 #     2FA-bound web session and the next publish EOTPs on a WebAuthn challenge.
 #   - gh CLI authenticated (or GITHUB_TOKEN set)
+#
+# Reading the result:
+#   Every terminal path prints exactly one sentinel as its FINAL line --
+#   RELEASE_RESULT=SUCCESS / FAILED / ABORTED -- and the FAILED one is written
+#   to stdout AND stderr. Grep for that line. Do NOT judge a run by a trailing
+#   `echo "RELEASE_EXIT=$?"` (that reports echo's status) or by the exit code
+#   of a pipeline like `./release.sh 1.2.3 | tail` (that reports tail's).
 # =============================================================================
 
 set -euo pipefail
-trap 'echo -e "\n\033[0;31m  [X] Release failed at line $LINENO (exit code $?)\033[0m"' ERR
+
+# State the failure banner reads back. The ERR and EXIT traps fire from
+# arbitrary depth with no way to know where they came from, so the position is
+# tracked as it moves rather than reconstructed after the fact.
+CURRENT_STEP="pre-flight"
+FAIL_MSG=""
+ERR_LINE=""
+ERR_STATUS=""
+
+# The ERR trap only RECORDS (plus the line it always printed). The banner is
+# printed from the EXIT trap instead, so it lands last on every failing path --
+# a bare command failing under `set -e`, a fail(), or an `exit 1` that ERR
+# never sees at all.
+trap 'ERR_STATUS=$?; ERR_LINE=$LINENO; echo -e "\n\033[0;31m  [X] Release failed at line $ERR_LINE (exit code $ERR_STATUS)\033[0m"' ERR
 
 # ---- Helpers ----
 RED='\033[0;31m'
@@ -31,13 +51,59 @@ NC='\033[0m'
 # check/cross/bang glyphs. The Unicode variants render as mojibake under
 # Windows ConPTY when the active codepage races with UTF-8 output, and the
 # corrupted bytes then get copy-pasted into bug reports.
-step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
+step() { CURRENT_STEP="step $1/$TOTAL_STEPS ($2)"; echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
 info() { echo -e "${GREEN}  [OK] $1${NC}"; }
 # warn() writes to stderr so warnings survive stdout redirects -- e.g. the
 # pre-commit path runs `npm run lint:fix >/dev/null`, which would otherwise
 # swallow the SKIP_LINT noop notice and silently skip the formatting gate.
 warn() { echo -e "${YELLOW}  [!] $1${NC}" >&2; }
-fail() { echo -e "${RED}  [X] $1${NC}"; exit 1; }
+# fail() stashes the message so the exit banner can repeat the specific
+# remedy; without it the banner could only say "something exited non-zero".
+fail() { FAIL_MSG="$1"; echo -e "${RED}  [X] $1${NC}"; exit 1; }
+
+# The failure banner. Two releases read as successes today: a harness reported
+# "exit code 0" that was really the status of a trailing
+# `echo "RELEASE_EXIT=$?"`, and piping into `tail` reported success for a run
+# that had executed ZERO tests, because a pipeline's status is the LAST
+# command's. So the banner (a) goes to stdout AND stderr, so redirecting either
+# one still captures it, (b) is the final output on every failing path, and
+# (c) ends in a RELEASE_RESULT= line to grep for when `$?` cannot be trusted.
+# Deliberately uncolored -- this text exists to be read out of a captured log,
+# where ANSI escapes are noise.
+release_exit_banner() {
+  local status="$1"
+  local bar="=========================================================================="
+  local detail="${FAIL_MSG:-}"
+  if [ -z "$detail" ]; then
+    detail="  The command at line ${ERR_LINE:-?} exited ${ERR_STATUS:-$status}. See the output above."
+  fi
+  # The version can legitimately be unresolved here -- a missing or malformed
+  # argument fails before VERSION is set -- and a bare "v" in the headline
+  # reads as a corrupted banner rather than a missing input.
+  local vlabel="v${VERSION:-}"
+  [ "$vlabel" = "v" ] && vlabel="(version not resolved)"
+  local body
+  body=$(printf '%s\n' \
+    "" \
+    "$bar" \
+    "  RELEASE FAILED -- ${vlabel} -- ${CURRENT_STEP}" \
+    "$bar" \
+    "$detail" \
+    "" \
+    "  Nothing after ${CURRENT_STEP} ran. Fix the cause above, then re-run" \
+    "  './release.sh ${VERSION:-<version>}' -- every step is idempotent." \
+    "$bar" \
+    "RELEASE_RESULT=FAILED version=${VERSION:-unknown} exit=${status} step=[${CURRENT_STEP}]")
+  printf '%s\n' "$body"
+  printf '%s\n' "$body" >&2
+}
+
+# Installed only after release_exit_banner exists, so an early failure cannot
+# call a function that is not defined yet. The trailing `exit $RELEASE_STATUS`
+# is load-bearing: a trap that just returns lets the status of the last command
+# INSIDE the trap become the script's status, which is exactly the class of
+# accident this banner exists to stop.
+trap 'RELEASE_STATUS=$?; if [ "$RELEASE_STATUS" -ne 0 ]; then release_exit_banner "$RELEASE_STATUS"; fi; exit $RELEASE_STATUS' EXIT
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
 # no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
@@ -78,6 +144,7 @@ if [ -z "$VERSION" ]; then
     echo "Usage: ./release.sh <version> [\"commit message\"]"
     echo "  e.g. ./release.sh 0.1.0"
     echo "       ./release.sh 0.1.0 \"feat: add foo\"   # commits tracked changes first"
+    FAIL_MSG="No version argument given. Pass the version to release, e.g. ./release.sh 0.1.0"
     exit 1
   fi
 fi
@@ -88,6 +155,21 @@ fi
 
 # ---- Pre-flight checks ----
 echo -e "${CYAN}Pre-flight checks...${NC}"
+
+# Pipeline / redirect guard. `./release.sh 1.2.3 | tail -20` reports the exit
+# status of `tail`, never of the release -- the same shape that let a
+# wsl-test-matrix.sh run which executed ZERO tests read as a pass. The caller's
+# command line is not visible from inside the script, but a non-tty stdout is
+# the necessary condition for that misread, so flag it up front. The banner is
+# written to stdout AND stderr and ends in RELEASE_RESULT= precisely so a run
+# captured despite this warning is still unambiguous.
+if [ ! -t 1 ]; then
+  if [ -p /dev/stdout ]; then
+    warn "stdout is a PIPE -- a pipeline's exit status is the LAST command's, not this script's. Run the caller with 'set -o pipefail', read \${PIPESTATUS[0]}, or grep the output for the final 'RELEASE_RESULT=' line."
+  else
+    warn "stdout is redirected, not a tty -- do not judge this release by a trailing 'echo \$?' (that reports echo's own status). Grep the captured output for the final 'RELEASE_RESULT=' line."
+  fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -125,6 +207,7 @@ fi
 # below. The integration matrix runs again in step 2; we skip it here to
 # keep the pre-commit fast (matrix gates the tag, not the feature commit).
 if [ "$IS_CI" != "true" ] && [ -n "$PRE_COMMIT_MSG" ] && [ -n "$(git status --porcelain)" ]; then
+  CURRENT_STEP="pre-release commit (before step 1)"
   echo -e "${CYAN}Committing tracked changes before release...${NC}"
   npm run lint:fix >/dev/null || fail "lint:fix failed -- fix and re-run"
   npx tsc --noEmit         || fail "tsc failed -- fix type errors and re-run"
@@ -135,7 +218,17 @@ if [ "$IS_CI" != "true" ] && [ -n "$PRE_COMMIT_MSG" ] && [ -n "$(git status --po
   else
     git commit -m "$PRE_COMMIT_MSG" || fail "git commit failed"
     git push origin "$RELEASE_BRANCH" \
-      || fail "git push of '$RELEASE_BRANCH' failed -- resolve (fetch/rebase if the branch moved) and re-run"
+      || fail "git push of the pre-release commit to '$RELEASE_BRANCH' was REJECTED (usually non-fast-forward: another session pushed while this ran).
+
+  No tag exists yet, so the recovery is only the branch:
+
+      git fetch origin
+      git log --oneline HEAD..origin/${RELEASE_BRANCH}    # what landed meanwhile
+      git rebase origin/${RELEASE_BRANCH}
+      ./release.sh ${VERSION} \"${PRE_COMMIT_MSG}\"
+
+  The commit itself already exists locally -- the re-run sees a clean tree and
+  will not duplicate it."
     info "Pre-release commit pushed to $RELEASE_BRANCH: $PRE_COMMIT_MSG"
   fi
 fi
@@ -170,6 +263,10 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
       echo "Aborted."
+      # A decline exits 0, which is indistinguishable from a completed release
+      # by exit code alone. The sentinel is what tells the two apart in a
+      # captured log, so every terminal path emits exactly one.
+      echo "RELEASE_RESULT=ABORTED version=${VERSION}"
       exit 0
     fi
   elif [ "${RELEASE_YES:-}" = "1" ]; then
@@ -325,8 +422,56 @@ else
     info "Nothing to commit"
   fi
 
+  RELEASE_SHA=$(git rev-parse HEAD)
   if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-    info "Tag v${VERSION} already exists"
+    # Re-entrancy guard. A run that dies between `git tag` and `git push`
+    # leaves the tag behind; the operator then fetches and rebases or resets --
+    # exactly what the push-rejected remedy below tells them to do -- which
+    # rewrites or discards the commit that tag points at. On the re-run the tag
+    # is an ORPHAN, and "tag already exists" used to be treated as success:
+    # npm would publish THIS working tree while step 6 cut the GitHub release
+    # from a commit that is on no branch. Two artifacts, two different trees,
+    # one version number.
+    TAG_COMMIT=$(git rev-parse "v${VERSION}^{}")
+    if [ "$TAG_COMMIT" != "$RELEASE_SHA" ]; then
+      if git merge-base --is-ancestor "$TAG_COMMIT" "$RELEASE_SHA"; then
+        DRIFT="behind HEAD (still an ancestor -- commits were added after the tag was created)"
+      else
+        DRIFT="NOT an ancestor of HEAD -- its commit was rewritten or discarded (rebase / reset / amend) and is now orphaned"
+      fi
+      # Whether the tag also reached origin decides which recovery is safe, so
+      # look it up instead of making the operator guess. Best-effort: a network
+      # failure here must not replace the real error with a git one.
+      TAG_ON_ORIGIN=$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | awk '{print $1}' || true)
+      if [ -n "$TAG_ON_ORIGIN" ]; then
+        REMOTE_STATE="  origin ALSO has tag v${VERSION}, at ${TAG_ON_ORIGIN}. Anything built from it
+  downstream (GitHub release, MCP Registry entry, anyone who fetched) already
+  points at the wrong commit -- prefer cutting the next patch version over
+  moving a tag that is already public."
+      else
+        REMOTE_STATE="  origin does NOT have tag v${VERSION} yet, so nothing downstream has seen it
+  -- deleting and recreating it locally is safe."
+      fi
+      fail "Local tag v${VERSION} points at ${TAG_COMMIT}, but the commit about to be
+  released is ${RELEASE_SHA}. The tag is ${DRIFT}.
+
+${REMOTE_STATE}
+
+  Recover, EITHER move the tag onto the commit being released:
+
+      git tag -d v${VERSION}
+      git push origin :refs/tags/v${VERSION}   # ONLY if origin has it, per above
+      ./release.sh ${VERSION}
+
+  OR -- the safe option once the tag is public -- leave the bad tag alone and
+  cut the next patch version instead:
+
+      ./release.sh <next-patch>
+
+  Refusing to publish npm from ${RELEASE_SHA} while the GitHub release would be
+  cut from ${TAG_COMMIT}."
+    fi
+    info "Tag v${VERSION} already exists and points at the commit being released"
   else
     # Annotated (-a) so --follow-tags below picks it up; lightweight tags are
     # ignored by --follow-tags and would silently fail to publish.
@@ -358,7 +503,37 @@ else
   fi
 
   git push origin "$RELEASE_BRANCH" --follow-tags \
-    || fail "git push of '$RELEASE_BRANCH' failed. If the branch moved on origin, fetch and rebase, then re-run -- the tag is already created locally and this step is idempotent."
+    || fail "git push of '$RELEASE_BRANCH' was REJECTED. The recurring cause is non-fast-forward:
+  another session pushed to '$RELEASE_BRANCH' while this release was running.
+
+  Nothing after this ran -- npm publish, the GitHub release and the MCP Registry
+  publish have NOT happened. The bump commit and the annotated tag v${VERSION}
+  DO exist locally, and the tag MAY ALSO have reached origin: this push is not
+  atomic, so a rejected branch ref does not roll back an accepted tag ref.
+  Check both before rewriting anything:
+
+      git fetch origin
+      git log --oneline HEAD..origin/${RELEASE_BRANCH}     # what landed meanwhile
+      git ls-remote --tags origin refs/tags/v${VERSION}    # empty => tag is local-only
+
+  Then EITHER replay the bump commit on top of what landed:
+
+      git tag -d v${VERSION}
+      git push origin :refs/tags/v${VERSION}   # ONLY if ls-remote found it
+      git rebase origin/${RELEASE_BRANCH}
+      ./release.sh ${VERSION}
+
+  OR, if the bump commit is the only local work and rebasing is messier than
+  letting the script rebuild it, discard it:
+
+      git tag -d v${VERSION}
+      git push origin :refs/tags/v${VERSION}   # ONLY if ls-remote found it
+      git reset --hard origin/${RELEASE_BRANCH}
+      ./release.sh ${VERSION}
+
+  Delete the tag in EITHER path: rebase and reset both move the commit out from
+  under it, and the re-run refuses to proceed on a tag that no longer matches
+  the commit being released."
   info "Pushed $RELEASE_BRANCH + tag v${VERSION} to origin"
 fi
 
@@ -649,3 +824,7 @@ echo ""
 echo -e "  npm: https://www.npmjs.com/package/@yawlabs/postgres-mcp"
 echo -e "  git: https://github.com/YawLabs/postgres-mcp/releases/tag/v${VERSION}"
 echo ""
+# Counterpart to the FAILED banner and the last line of a successful run. Only
+# reachable when every step above ran, so a caller that cannot trust `$?`
+# (pipeline, trailing echo) can grep for this and get a true answer.
+echo "RELEASE_RESULT=SUCCESS version=${VERSION}"

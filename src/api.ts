@@ -22,6 +22,17 @@
  *                                            so parsed DSN keys override explicit config. A DSN with
  *                                            no application_name emits no such key, so it cannot
  *                                            clobber this default with undefined.
+ *   - POSTGRES_AUDIT_LOG                   - "1", "true", or "stderr" to write one JSON line per
+ *                                            statement to stderr (default: off). Bound parameter
+ *                                            VALUES are never logged in any mode -- only their
+ *                                            count. See audit.ts.
+ *   - POSTGRES_AUDIT_LOG_FILE              - append the audit lines to this path instead of stderr.
+ *                                            Setting it alone turns auditing on. The server refuses
+ *                                            to start when the file cannot be opened, rather than
+ *                                            run with the trail silently disabled.
+ *   - POSTGRES_AUDIT_REDACT                - "1" or "true" to log each statement's first keyword
+ *                                            plus a sha256 of its text instead of the SQL, for
+ *                                            operators who want the trail without the literals.
  *
  * Safety model:
  *   User-provided SQL runs in a `BEGIN READ ONLY` transaction by default, so
@@ -31,6 +42,16 @@
  */
 
 import pg from "pg";
+import { auditQuery, initAudit } from "./audit.js";
+
+// Open the audit sink at module load rather than lazily on the first query: a
+// POSTGRES_AUDIT_LOG_FILE that cannot be opened has to kill the process at
+// startup, while the operator is still watching, instead of surfacing as one
+// failed tool call much later -- or never, if no query is ever run. index.ts
+// imports this module before the transport connects, so module load is
+// startup. The call is idempotent, so tool modules importing api.ts do not
+// re-open the sink.
+initAudit();
 
 // pg 8.14+ supports `queryMode: 'extended'` on QueryConfig to force the
 // extended query protocol even when `values` is empty. @types/pg has not yet
@@ -403,6 +424,33 @@ async function runUserQueryBounded(
   }
 }
 
+/**
+ * `runUserQueryBounded` plus one audit line (no-op unless POSTGRES_AUDIT_LOG /
+ * POSTGRES_AUDIT_LOG_FILE is set). It exists as its own wrapper so all three
+ * user-SQL paths record the statement identically -- one path quietly missing
+ * the audit is the failure an inline call at each site invites, and a partial
+ * trail is the kind an operator only discovers during an incident.
+ *
+ * `source: "user"` separates agent-supplied SQL from the internal catalog
+ * queries runInternal / withSharedClient record.
+ */
+async function runUserQueryAudited(
+  client: pg.PoolClient,
+  sql: string,
+  params: unknown[],
+  maxRows: number,
+): Promise<{ result: pg.QueryResult; viaCursor: boolean }> {
+  return auditQuery(
+    { source: "user", sql, paramCount: params.length },
+    () => runUserQueryBounded(client, sql, params, maxRows),
+    // Rows as postgres reported them: the affected-row count on the
+    // direct-exec path, and on the cursor path the bounded FETCH count
+    // (maxRows + 1 at most) -- the true total is unknowable there by design,
+    // exactly as QueryResult.rowCount documents.
+    ({ result }) => result.rowCount ?? result.rows.length,
+  );
+}
+
 // Type-name resolution is decorative: a failure here must not lose the user's
 // successful query result. Fall back to an empty map so fields still carry
 // dataTypeID, just without the human-readable dataTypeName.
@@ -507,7 +555,7 @@ export async function runReadOnly(
   try {
     await client.query("BEGIN READ ONLY");
     if (hooks.setup) await hooks.setup(client);
-    const { result, viaCursor } = await runUserQueryBounded(client, sql, params, maxRows);
+    const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
@@ -542,7 +590,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
-    const { result, viaCursor } = await runUserQueryBounded(client, sql, params, maxRows);
+    const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
     await client.query("COMMIT");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
@@ -581,7 +629,7 @@ export async function runReadWriteRollback(
   try {
     await client.query("BEGIN");
     if (hooks.setup) await hooks.setup(client);
-    const { result, viaCursor } = await runUserQueryBounded(client, sql, params, maxRows);
+    const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
     await client.query("ROLLBACK");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
@@ -614,7 +662,14 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
   params: unknown[] = [],
 ): Promise<ApiResponse<T[]>> {
   try {
-    const result = await getPool().query<T>(sql, params);
+    // source: "internal" -- catalog SQL this server composes, not agent SQL.
+    // Without the distinction one pg_schemas call reads in the audit log like
+    // a dozen statements the agent issued.
+    const result = await auditQuery(
+      { source: "internal", sql, paramCount: params.length },
+      () => getPool().query<T>(sql, params),
+      (r) => r.rowCount ?? r.rows.length,
+    );
     return { ok: true, data: result.rows };
   } catch (err) {
     return { ok: false, error: formatPgError(err) };
@@ -649,7 +704,13 @@ export async function withSharedClient<T>(
       params: unknown[] = [],
     ): Promise<ApiResponse<R[]>> => {
       try {
-        const result = await client.query<R>(sql, params);
+        // Same "internal" tagging as runInternal -- these run on a shared
+        // client but are the same class of server-composed catalog SQL.
+        const result = await auditQuery(
+          { source: "internal", sql, paramCount: params.length },
+          () => client.query<R>(sql, params),
+          (r) => r.rowCount ?? r.rows.length,
+        );
         return { ok: true, data: result.rows };
       } catch (err) {
         return { ok: false, error: formatPgError(err) };

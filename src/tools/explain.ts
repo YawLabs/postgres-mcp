@@ -273,6 +273,20 @@ export const explainTools = [
             "extension. Indexes are session-scoped and reset at the end of the call.",
         ),
     }),
+    // One key, two shapes, decided by `format`. Modelling it as a union rather
+    // than `z.unknown()` is what lets a caller branch on the response without
+    // re-reading the request: `format: "text"` flattens the plan rows into one
+    // newline-joined string, while `format: "json"` hands back the parsed
+    // `QUERY PLAN` value -- an ARRAY of plan nodes, which is what postgres
+    // returns and node-pg parses for a json column, not an object.
+    outputSchema: z.object({
+      plan: z
+        .union([z.string(), z.array(z.unknown())])
+        .describe(
+          "Newline-joined plan text for `format: \"text\"` (with a trailing truncation marker when " +
+            'POSTGRES_MAX_ROWS chopped it), or the parsed plan array for `format: "json"`.',
+        ),
+    }),
     handler: async (input: unknown) => {
       // Direct (non-MCP) callers bypass Zod, so the analyze/format defaults the
       // schema would have applied never ran -- a caller omitting `format` would

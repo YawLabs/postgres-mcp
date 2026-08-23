@@ -2,6 +2,54 @@ import { z } from "zod";
 import { isWritesAllowed, runReadOnly, runReadWrite } from "../api.js";
 import { paramsArray } from "./params.js";
 
+/**
+ * Mirrors api.ts:QueryResult, the shape `toQueryResult` builds for every
+ * user-SQL path (runReadOnly / runReadWrite / runReadWriteRollback). Both tools
+ * in this file return it unchanged, so they share one schema -- two copies
+ * would drift apart the first time a field is added to one of them.
+ *
+ * `command` and `truncated` are optional because `toQueryResult` SPREADS them
+ * in conditionally: `command` is omitted on the cursor path (there the tag
+ * describes the FETCH, not the user's statement) and `truncated` appears only
+ * when the row cap actually bit. Neither is ever null, so modelling them as
+ * nullable would advertise a value the code cannot produce.
+ */
+const queryResultOutput = z.object({
+  rows: z
+    .array(z.record(z.string(), z.unknown()))
+    .describe("Result rows, capped at POSTGRES_MAX_ROWS. Values are whatever JSON type pg parsed the column into."),
+  rowCount: z
+    .number()
+    .nullable()
+    .describe(
+      "Rows AFFECTED for DML -- not necessarily rows.length -- and rows returned on the cursor " +
+        "path. Null when pg reported no count.",
+    ),
+  fields: z
+    .array(
+      z.object({
+        name: z.string(),
+        dataTypeID: z.number(),
+        // Absent, not null, when the oid did not resolve to a typname:
+        // safeResolveTypeNames drops unresolved oids instead of mapping them to
+        // a placeholder, and toQueryResult then omits the key entirely.
+        dataTypeName: z.string().optional(),
+      }),
+    )
+    .describe("Result column descriptors, in select-list order."),
+  command: z
+    .string()
+    .optional()
+    .describe(
+      "Postgres command tag (`INSERT`, `CREATE TABLE`, ...). Absent on the cursor path -- read " +
+        "absence as 'row-returning statement, command unknown'.",
+    ),
+  truncated: z
+    .boolean()
+    .optional()
+    .describe("Present and true only when the result hit POSTGRES_MAX_ROWS and rows were dropped."),
+});
+
 export const queryTools = [
   {
     name: "pg_readonly",
@@ -42,6 +90,7 @@ export const queryTools = [
       sql: z.string().min(1).max(1_000_000).describe("The SQL statement to execute. Hard cap of 1 MB."),
       params: paramsArray.optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
     }),
+    outputSchema: queryResultOutput,
     handler: async (input: unknown) => {
       const { sql, params } = input as { sql: string; params?: unknown[] };
       return runReadOnly(sql, params ?? []);
@@ -73,6 +122,7 @@ export const queryTools = [
       sql: z.string().min(1).max(1_000_000).describe("The SQL statement to execute. Hard cap of 1 MB."),
       params: paramsArray.optional().describe("Positional parameters referenced as $1, $2, ... in the SQL."),
     }),
+    outputSchema: queryResultOutput,
     handler: async (input: unknown) => {
       const { sql, params } = input as { sql: string; params?: unknown[] };
       if (isWritesAllowed()) {
