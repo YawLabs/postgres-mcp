@@ -590,29 +590,34 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.equal(res.data?._warnings, undefined, "no warnings expected on a healthy standalone instance");
     });
 
-    // Populated-`_warnings` path. The handler's three sub-queries (slots,
-    // replicas, wal_position) only one of which has a privilege gate that
-    // bites on a standalone cluster: on an instance with no slots / no
-    // replicas, pg_replication_slots and pg_stat_replication return empty
-    // rows even for non-pg_monitor roles. To force a real permission-
-    // denied we REVOKE EXECUTE on pg_current_wal_lsn() from PUBLIC for
-    // the duration of the test, then swap to a fixture role that lacks
-    // any direct grant. Cleanup re-grants so other tests / suites running
-    // in the same cluster see the default state.
-    it("populates _warnings when the role lacks EXECUTE on pg_current_wal_lsn()", async () => {
-      // Step 1 (as superuser): yank PUBLIC EXECUTE from the WAL function so
-      // a plain LOGIN role gets 42501. Superuser is unaffected.
-      const revoke = await runInternal("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() FROM PUBLIC");
-      assert.equal(revoke.ok, true, `REVOKE setup failed: ${revoke.error}`);
-
+    // Populated-`_warnings` path. The handler runs three sub-queries
+    // (slots, replicas, wal_position); on a standalone cluster the privilege
+    // gates that matter live on `pg_replication_slots` and `pg_stat_replication`.
+    // Both views call functions (`pg_get_replication_slots`,
+    // `pg_stat_get_wal_senders`) whose EXECUTE is REVOKEd from PUBLIC in
+    // system_views.sql and re-granted only to `pg_read_all_stats` -- so a
+    // plain LOGIN role with no pg_monitor / no REPLICATION attribute hits
+    // 42501 on both. `pg_current_wal_lsn()` keeps its default PUBLIC grant,
+    // so walRes still succeeds and is_replica / wal_position come back
+    // populated (this is the realistic managed-DB shape: read the WAL
+    // position but not the replication catalogs).
+    //
+    // Earlier versions of this test REVOKEd EXECUTE on
+    // pg_catalog.pg_current_wal_lsn() from PUBLIC to force walRes to fail
+    // too. That mutation was cluster-global: a crash between REVOKE and the
+    // cleanup GRANT would have stranded every non-superuser session in the
+    // cluster without WAL function access until a manual re-grant. The
+    // role-swap below exercises the same _warnings-populated code path
+    // without touching pg_catalog grants.
+    it("populates _warnings when the role lacks pg_read_all_stats", async () => {
       const originalUrl = process.env.DATABASE_URL!;
       // Capture the primary test failure (if any) so cleanup below can run
       // unconditionally. Throwing from a `finally` would shadow the
       // assertion error, which is what the lint correctly objects to.
       let testError: unknown = null;
       try {
-        // Step 2: swap to the limited role and rebuild the pool so the
-        // handler's sub-queries actually run as that role.
+        // Swap to the limited role and rebuild the pool so the handler's
+        // sub-queries actually run as that role.
         const limited = new URL(originalUrl);
         limited.username = FIXTURE_LIMITED_ROLE;
         limited.password = FIXTURE_LIMITED_PASSWORD;
@@ -636,34 +641,32 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
           warnings.length > 0,
           `expected at least one warning under restricted role, got ${JSON.stringify(res.data)}`,
         );
-        // walRes failure: is_replica and wal_position MUST go null. `false`
-        // here would falsely tell the caller "this is a primary" when in
-        // fact we couldn't determine the role at all.
-        assert.equal(res.data?.is_replica, null, "is_replica must be null, not false, when walRes fails");
-        assert.equal(res.data?.wal_position, null, "wal_position must be null when walRes fails");
-        // The wal_position warning specifically should reference permission
-        // denied or SQLSTATE 42501.
+        // The slots sub-query is the most reliable signal: pg_replication_slots
+        // is gated on pg_read_all_stats across every supported PG major, so a
+        // role without that membership always 42501s here.
         assert.ok(
-          warnings.some((w) => /wal_position fetch failed/.test(w) && /permission denied|42501/i.test(w)),
-          `expected a wal_position permission-denied warning, got ${JSON.stringify(warnings)}`,
+          warnings.some((w) => /slots fetch failed/.test(w) && /permission denied|42501/i.test(w)),
+          `expected a slots permission-denied warning, got ${JSON.stringify(warnings)}`,
         );
+        // slots / replicas fall back to empty arrays on permission denied --
+        // the partial-failure contract is "readable parts come through, the
+        // rest is surfaced as a warning."
+        assert.ok(Array.isArray(res.data?.slots) && res.data?.slots.length === 0);
+        assert.ok(Array.isArray(res.data?.replicas) && res.data?.replicas.length === 0);
+        // walRes still succeeds because pg_current_wal_lsn() retains its
+        // default PUBLIC EXECUTE grant -- so is_replica and wal_position
+        // are populated (unlike the prior REVOKE-based variant, which
+        // forced both to null).
       } catch (e) {
         testError = e;
       }
 
-      // Cleanup (always runs). Restore the superuser URL + pool first, then
-      // re-grant the default. A failure here means subsequent test files
-      // in the same cluster will fail on walRes, so surface it -- but only
-      // if the test itself didn't already throw, since the primary failure
-      // is the more informative signal.
+      // Cleanup (always runs): restore the superuser URL + rebuild the
+      // pool. No pg_catalog mutation to undo.
       process.env.DATABASE_URL = originalUrl;
       await shutdown();
-      const grant = await runInternal("GRANT EXECUTE ON FUNCTION pg_catalog.pg_current_wal_lsn() TO PUBLIC");
 
       if (testError) throw testError;
-      if (!grant.ok) {
-        throw new Error(`Failed to restore PUBLIC EXECUTE on pg_current_wal_lsn(): ${grant.error}`);
-      }
     });
   });
 
