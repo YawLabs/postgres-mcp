@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-08-31
+
 ### Security
 
 - **`pg_index_advisor` ran caller-supplied SQL on a protocol that accepts
