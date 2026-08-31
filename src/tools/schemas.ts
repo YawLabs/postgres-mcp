@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getServerVersionNum, PG18, runInternal, withSharedClient } from "../api.js";
+import { getServerVersionNum, PG18, runInternal, userSchemaFilter, withSharedClient } from "../api.js";
 import { rowsOutput, warningsField } from "./output.js";
 import { identSchema } from "./params.js";
 
@@ -56,9 +56,7 @@ export const schemaTools = [
            n.nspname AS schema_name,
            pg_catalog.pg_get_userbyid(n.nspowner) AS owner
          FROM pg_catalog.pg_namespace n
-         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-           AND n.nspname NOT LIKE 'pg_toast%'
-           AND n.nspname NOT LIKE 'pg_temp_%'
+         WHERE ${userSchemaFilter("n.nspname")}
          ORDER BY n.nspname`,
       );
     },
@@ -781,9 +779,7 @@ export const schemaTools = [
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_list_tables above.
       const { pattern, schema, limit = 100 } = input as { pattern: string; schema?: string; limit?: number };
-      const schemaFilter = schema
-        ? "AND n.nspname = $3"
-        : "AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_%'";
+      const schemaFilter = schema ? "AND n.nspname = $3" : `AND ${userSchemaFilter("n.nspname")}`;
       const params: unknown[] = [pattern, limit];
       if (schema) params.push(schema);
       return runInternal<{ schema: string; table: string; column: string; type: string; nullable: boolean }>(

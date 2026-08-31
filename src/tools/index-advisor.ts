@@ -9,7 +9,7 @@ import { compareVersions } from "./stats.js";
  * own signature rather than re-declared, so a change to the api.ts contract
  * surfaces here as a type error instead of a silently-diverging local copy.
  */
-type SharedRunner = Parameters<Parameters<typeof withSharedClient>[0]>[0];
+export type SharedRunner = Parameters<Parameters<typeof withSharedClient>[0]>[0];
 
 /**
  * Savepoint wrapped around every statement issued inside the advisor's
@@ -651,8 +651,21 @@ export async function greedySearch(options: {
   minImprovement: number;
   maxRecommendations: number;
   evaluate: (candidate: IndexCandidate, statementIndices: number[]) => Promise<Map<number, number> | null>;
+  /**
+   * Called once a candidate is accepted, before the next round begins.
+   *
+   * This is what makes the search actually greedy rather than a per-candidate
+   * ranking. `evaluate` measures ONE candidate at a time and is expected to undo
+   * whatever it created; without a hook that PERSISTS the winner, round N+1
+   * re-measures every remaining candidate against the bare baseline, so two
+   * candidates that fix the same statement both get full credit for it and the
+   * second pick is chosen knowing nothing about what the first already fixed.
+   * Optional so the accounting stays unit-testable with no database.
+   */
+  onAccept?: (candidate: IndexCandidate) => Promise<void>;
 }): Promise<GreedyResult> {
-  const { candidates, currentCosts, weights, explainBudget, minImprovement, maxRecommendations, evaluate } = options;
+  const { candidates, currentCosts, weights, explainBudget, minImprovement, maxRecommendations, evaluate, onAccept } =
+    options;
 
   const accepted: AcceptedCandidate[] = [];
   const remaining = [...candidates];
@@ -678,11 +691,27 @@ export async function greedySearch(options: {
       }
       explainsUsed += candidate.statements.length;
       const measured = await evaluate(candidate, candidate.statements);
-      if (!measured) continue;
+      if (!measured) {
+        // The candidate could not be costed at all -- HypoPG declines shapes it
+        // cannot model -- so no EXPLAIN was ever issued for it. Refund the
+        // reservation: charging for work that did not run makes `explains_used`
+        // overstate the spend and can report `budget_exhausted` on a search that
+        // never actually reached its cap.
+        explainsUsed -= candidate.statements.length;
+        continue;
+      }
       let after = 0;
       for (let i = 0; i < costs.length; i++) {
         const replaced = measured.get(i);
-        after += (replaced ?? costs[i] ?? 0) * (weights[i] ?? 1);
+        const current = costs[i] ?? 0;
+        // The better of the two, not the raw measurement. An index only ADDS a
+        // path -- it never takes away the plan the planner already had -- so the
+        // achievable cost for a statement is min(with, without). Scoring the raw
+        // number instead lets an estimate that wobbled upward on one statement
+        // veto a candidate that decisively helps another, and it would also
+        // disagree with the clamp applied on acceptance below.
+        const effective = replaced !== undefined ? Math.min(replaced, current) : current;
+        after += effective * (weights[i] ?? 1);
       }
       if (!best || after < best.after) best = { position, costs: measured, after };
     }
@@ -702,11 +731,27 @@ export async function greedySearch(options: {
       // Report only the statements this index actually moved. A statement whose
       // cost is unchanged is not "helped by" the index, and listing it would
       // overstate the recommendation's reach.
-      if (cost < previous) perStatement.set(index, { before: previous, after: cost });
-      costs[index] = cost;
+      //
+      // The write-back is guarded by the SAME condition, so a statement measured
+      // more expensive than the running state keeps its existing cost. An index
+      // cannot make the planner pick a worse plan than it already had -- the
+      // planner takes the cheapest -- so a higher reading is estimate wobble,
+      // and storing it would let `final_workload_cost` climb above an earlier
+      // round's and make the search non-monotonic.
+      if (cost < previous) {
+        perStatement.set(index, { before: previous, after: cost });
+        costs[index] = cost;
+      }
     }
-    accepted.push({ candidate, costBefore: before, costAfter: best.after, perStatement });
+    // Recomputed from the state actually stored rather than reusing best.after,
+    // which was derived from the raw measurements before the clamp above. The
+    // two agree whenever every measurement was an improvement; taking this one
+    // keeps the reported cost and the running totals from ever disagreeing.
+    accepted.push({ candidate, costBefore: before, costAfter: weightedTotal(), perStatement });
     remaining.splice(best.position, 1);
+    // Persist the winner so the next round measures on top of it. Without this
+    // the loop degrades into an independent per-candidate ranking.
+    if (onAccept) await onAccept(candidate);
     if (budgetExhausted) break;
   }
 
@@ -714,11 +759,91 @@ export async function greedySearch(options: {
 }
 
 /** Result of running one EXPLAIN inside the advisor's transaction. */
-interface ExplainOutcome {
+export interface ExplainOutcome {
   ok: boolean;
   cost?: number;
   plan?: unknown;
   error?: string;
+}
+
+/**
+ * SQLSTATE 08P01 (protocol_violation) as `formatPgError` renders it.
+ *
+ * Reached only from the BIND step of the extended protocol -- "bind message
+ * supplies 0 parameters, but prepared statement requires 1". Bind is the LAST
+ * step, so seeing it proves PARSE already succeeded, and parse is where postgres
+ * rejects a multi-statement string. It is therefore positive evidence that the
+ * text is a SINGLE statement carrying `$n` placeholders.
+ */
+const BIND_COUNT_MISMATCH = /\(code: 08P01\)/;
+
+/**
+ * Reject a statement that packs more than one command into one string, before
+ * any of it reaches the server on a protocol that would run them all.
+ *
+ * WHY THIS EXISTS. Everything else in this file is read-only by construction --
+ * EXPLAIN without ANALYZE never executes the statement, and the whole run sits
+ * inside `BEGIN READ ONLY`. Both guarantees are defeated by the same payload:
+ * `SELECT 1; COMMIT; DROP TABLE users;`. The embedded COMMIT ends the read-only
+ * transaction mid-string and the rest runs in autocommit. api.ts closes exactly
+ * this hole for user SQL by pinning `queryMode: 'extended'` (see runReadOnly),
+ * and the extended protocol is what makes it work: postgres refuses to PARSE a
+ * multi-command string, SQLSTATE 42601. This tool feeds the server SQL it did
+ * not write -- caller-supplied `statements`, and pg_stat_statements text -- so
+ * it needs the same guard.
+ *
+ * WHY IT IS A VALIDATOR RATHER THAN THE EXECUTION PATH. The extended protocol
+ * also demands that the bind parameter COUNT match the statement's placeholders,
+ * and this tool's whole reason for using GENERIC_PLAN is to plan a normalized
+ * pg_stat_statements entry whose `$n` placeholders have no values to bind.
+ * Binding NULLs instead is not a workaround: `col = NULL` is provably false, so
+ * the planner collapses to a zero-cost Result node and every parameterized
+ * statement reports a baseline cost of 0 -- which silently makes `min_improvement`
+ * unsatisfiable and the advisor recommend nothing. So the extended protocol is
+ * used ONCE per statement purely to have postgres answer "is this one command?",
+ * and the statement then runs on the protocol GENERIC_PLAN needs.
+ *
+ * Any error that is NOT the bind-count mismatch rejects the statement. That
+ * covers 42601 multi-command without matching on message TEXT (which postgres
+ * localizes via lc_messages), and it costs nothing when the statement is merely
+ * malformed: such a statement could not have been planned either way, and the
+ * caller sees the same postgres error it would have seen from the EXPLAIN.
+ *
+ * EXPORTED FOR UNIT TESTING, and that export is load-bearing rather than
+ * incidental. The only other coverage of this function is an integration test
+ * gated behind `POSTGRES_MCP_INTEGRATION=1`, which the default `npm test` does
+ * not set -- so deleting the `{ extended: true }` below leaves the entire suite
+ * green while fully restoring the stacked-query vulnerability (verified by
+ * mutation). The unit test that pins that argument is what makes the guard
+ * defended by the default suite instead of only by a run someone remembers to
+ * opt into.
+ */
+export async function assertSingleStatement(run: SharedRunner, explainSql: string): Promise<ExplainOutcome> {
+  const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  if (!sp.ok) return { ok: false, error: sp.error };
+
+  const probe = await run<{ "QUERY PLAN": unknown }>(explainSql, [], { extended: true });
+  if (probe.ok) {
+    await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    // No placeholders: the validating call WAS a complete, protocol-guarded
+    // EXPLAIN, so its plan is returned rather than paying a second round trip
+    // to re-run the identical statement.
+    const plan = probe.data?.[0]?.["QUERY PLAN"];
+    const cost = planTotalCost(plan);
+    if (cost === null) return { ok: false, error: "EXPLAIN returned a plan with no readable Total Cost." };
+    return { ok: true, cost, plan };
+  }
+
+  // ROLLBACK TO clears the aborted state but LEAVES the savepoint, so the
+  // RELEASE is still required -- see explainStatement.
+  await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  if (BIND_COUNT_MISMATCH.test(probe.error ?? "")) {
+    // Single statement, placeholders unbound. Safe to plan on the simple
+    // protocol, which is the only one GENERIC_PLAN can use.
+    return { ok: true };
+  }
+  return { ok: false, error: probe.error };
 }
 
 /**
@@ -736,10 +861,14 @@ interface ExplainOutcome {
  * key, and without it every scan node would have to be attributed to a guessed
  * schema. See {@link harvestPlanPredicates}.
  */
-async function explainStatement(run: SharedRunner, sql: string, useGenericPlan: boolean): Promise<ExplainOutcome> {
+function buildExplainSql(sql: string, useGenericPlan: boolean): string {
   const flags = ["FORMAT JSON", "VERBOSE"];
   if (useGenericPlan) flags.push("GENERIC_PLAN");
-  const explainSql = `EXPLAIN (${flags.join(", ")}) ${sql}`;
+  return `EXPLAIN (${flags.join(", ")}) ${sql}`;
+}
+
+async function explainStatement(run: SharedRunner, sql: string, useGenericPlan: boolean): Promise<ExplainOutcome> {
+  const explainSql = buildExplainSql(sql, useGenericPlan);
 
   const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
   if (!sp.ok) return { ok: false, error: sp.error };
@@ -1079,7 +1208,7 @@ export const indexAdvisorTools = [
       // to a warning rather than failing the tool.
       const seqScans = new Map<string, number>();
       const seqRes = await runInternal<{ schema: string; table: string; seq_scan: string }>(
-        `SELECT schemaname AS schema, relname AS table, COALESCE(seq_scan, 0)::text AS seq_scan
+        `SELECT schemaname AS schema, relname AS "table", COALESCE(seq_scan, 0)::text AS seq_scan
            FROM pg_catalog.pg_stat_user_tables`,
       );
       if (seqRes.ok) {
@@ -1137,6 +1266,29 @@ export const indexAdvisorTools = [
               );
               continue;
             }
+
+            // Stacked-query guard, run ONCE per statement rather than per
+            // EXPLAIN: the SQL text is fixed for the life of the search, so a
+            // statement cleared here stays cleared for every re-costing the
+            // greedy loop does. A rejected statement gets a null baseline, and
+            // every later stage is already gated on that -- `evaluate` skips
+            // any index whose baseline is null -- so it is never sent again.
+            const guard = await assertSingleStatement(run, buildExplainSql(statement.sql, parameterized));
+            if (!guard.ok) {
+              baselineCosts.push(null);
+              rawPlans.push(undefined);
+              warnings.push(`could not plan a statement (${guard.error}): ${preview(statement.sql, 120)}`);
+              continue;
+            }
+            // A statement with no placeholders was fully planned by the guard
+            // itself, on the protocol-safe path; reuse that instead of paying a
+            // second round trip for the identical EXPLAIN.
+            if (guard.cost !== undefined) {
+              baselineCosts.push(guard.cost);
+              rawPlans.push(guard.plan);
+              continue;
+            }
+
             const outcome = await explainStatement(run, statement.sql, parameterized);
             if (!outcome.ok) {
               baselineCosts.push(null);
@@ -1178,8 +1330,21 @@ export const indexAdvisorTools = [
             };
           }
 
-          const schemas = [...new Set([...relationNames].map((k) => k.slice(0, k.indexOf("."))))];
-          const tables = [...new Set([...relationNames].map((k) => k.slice(k.indexOf(".") + 1)))];
+          // Split on the FIRST dot, matching how every `${schema}.${relation}`
+          // key in this file is built (collectRelations, harvestPlanPredicates).
+          // A schema name containing a dot would mis-split -- `identSchema`
+          // permits one, since a quoted identifier legally may -- but the split
+          // has to agree with the join, and re-keying on a delimiter that cannot
+          // appear in either half would mean changing both. Recorded here rather
+          // than silently: such a relation is mis-keyed against
+          // `relationNames`, so it drops out of `knownColumns` and simply
+          // produces no candidates, never a candidate on the wrong table.
+          const splitKey = (key: string): { schema: string; table: string } => {
+            const dot = key.indexOf(".");
+            return { schema: key.slice(0, dot), table: key.slice(dot + 1) };
+          };
+          const schemas = [...new Set([...relationNames].map((k) => splitKey(k).schema))];
+          const tables = [...new Set([...relationNames].map((k) => splitKey(k).table))];
 
           const colsRes = await run<{
             schema: string;
@@ -1189,8 +1354,8 @@ export const indexAdvisorTools = [
             reltuples: number | null;
           }>(
             `SELECT n.nspname AS schema,
-                    c.relname  AS table,
-                    a.attname  AS column,
+                    c.relname  AS "table",
+                    a.attname  AS "column",
                     s.n_distinct::float8 AS n_distinct,
                     c.reltuples::float8  AS reltuples
                FROM pg_catalog.pg_class c
@@ -1235,7 +1400,7 @@ export const indexAdvisorTools = [
           const existingIndexPrefixes = new Set<string>();
           const idxRes = await run<{ schema: string; table: string; columns: (string | null)[] }>(
             `SELECT n.nspname AS schema,
-                    c.relname  AS table,
+                    c.relname  AS "table",
                     ARRAY(
                       SELECT a.attname
                         FROM unnest(i.indkey[0:i.indnkeyatts - 1]) WITH ORDINALITY AS k(attnum, ord)
@@ -1329,9 +1494,36 @@ export const indexAdvisorTools = [
               return costs;
             } finally {
               // Drop only THIS candidate. A hypopg_reset() here would also wipe
-              // every previously accepted index and silently turn the greedy
-              // search into an independent per-candidate ranking.
+              // every previously ACCEPTED index (recreated by onAccept below)
+              // and turn the greedy search into an independent per-candidate
+              // ranking -- the exact bug onAccept exists to prevent.
               await run("SELECT hypopg_drop_index($1)", [created]);
+            }
+          };
+
+          // Accepted indexes have to OUTLIVE the evaluate() that measured them:
+          // evaluate drops whatever it created, so without recreating the winner
+          // here nothing from round N is in place for round N+1, and every
+          // remaining candidate would be re-measured against the bare baseline.
+          // Two candidates fixing the same statement would then both be credited
+          // in full for it.
+          //
+          // A failure is recorded rather than thrown: losing one hypothetical
+          // index degrades later rounds to the old independent-ranking behaviour
+          // for that statement, which is worth a warning, not the whole tool.
+          // Indexed in acceptance order, which is the order `search.accepted` is
+          // built in, so the sizing pass below can reuse these oids instead of
+          // creating a second copy of an index that is already in place.
+          const acceptedOids: (number | null)[] = [];
+          const onAccept = async (candidate: IndexCandidate): Promise<void> => {
+            const oid = await createHypotheticalIndex(run, candidate);
+            acceptedOids.push(oid);
+            if (oid === null) {
+              warnings.push(
+                `could not keep the hypothetical index on ${candidate.schema}.${candidate.table} ` +
+                  `(${candidate.columns.join(", ")}) in place for the rest of the search, so later ` +
+                  "recommendations were costed without it and may overlap it",
+              );
             }
           };
 
@@ -1348,6 +1540,7 @@ export const indexAdvisorTools = [
             minImprovement: min_improvement,
             maxRecommendations: max_recommendations,
             evaluate,
+            onAccept,
           });
 
           if (search.budgetExhausted) {
@@ -1360,13 +1553,14 @@ export const indexAdvisorTools = [
 
           // ─── Size the accepted indexes ───
 
-          // Recreated together at the end rather than measured during the
-          // search: hypopg_relation_size needs the index to exist, and creating
-          // the accepted set as a set also confirms the final recommendation
-          // actually co-exists.
+          // Sized at the end, from the indexes `onAccept` already left in place:
+          // hypopg_relation_size needs the index to exist, and the whole accepted
+          // set is still resident, which also confirms the recommendations
+          // actually co-exist. Only a candidate whose persist FAILED is recreated
+          // here, so the common path issues no redundant CREATE at all.
           const sizes: (string | null)[] = [];
-          for (const entry of search.accepted) {
-            const oid = await createHypotheticalIndex(run, entry.candidate);
+          for (const [i, entry] of search.accepted.entries()) {
+            const oid = acceptedOids[i] ?? (await createHypotheticalIndex(run, entry.candidate));
             if (oid === null) {
               sizes.push(null);
               continue;

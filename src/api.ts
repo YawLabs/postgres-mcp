@@ -117,9 +117,48 @@ export function getApplicationName(): string {
  * Used to gate catalog columns that do not exist on older servers. Naming a
  * constant beats an inline 160000 -- the number alone reads as a row count.
  */
+export const PG12 = 120_000;
+export const PG13 = 130_000;
 export const PG16 = 160_000;
 export const PG17 = 170_000;
 export const PG18 = 180_000;
+export const PG19 = 190_000;
+
+/**
+ * SQL predicate excluding PostgreSQL's own schemas from a user-facing listing.
+ *
+ * ONE definition because there used to be two, and they disagreed. Some queries
+ * wrote `NOT LIKE 'pg_%'` while others wrote `NOT LIKE 'pg_toast%' AND NOT LIKE
+ * 'pg_temp_%'`. The gap between them is far wider than the literal reading
+ * suggests: in SQL LIKE, `_` is a single-character WILDCARD, so `pg_%` matches
+ * "pg" followed by ANY character -- it swallows `pgagent`, `pgboss`,
+ * `pgbouncer`, `pglogical`, `pganalyze`, every user schema whose name merely
+ * starts with "pg". The literal reading -- a genuinely `pg_`-prefixed schema
+ * that is neither toast nor temp -- describes a case that cannot occur:
+ * postgres rejects `CREATE SCHEMA pg_anything` with `unacceptable schema name
+ * ... The prefix "pg_" is reserved for system schemas`, so the only real
+ * `pg_`-prefixed schemas are the server's own pg_toast / pg_temp_N. That split
+ * let `pg_list_schemas` (the permissive form) advertise a schema like `pgagent`
+ * that `pg_search_columns` and the stats tools (the broad form) then silently
+ * returned nothing for -- a user sees the schema, asks about it, and gets an
+ * empty result with no reason given.
+ *
+ * The permissive spelling is the one kept: it names exactly what it excludes,
+ * and a discovery tool must never surface a schema the analysis tools refuse to
+ * answer about. `pg_catalog` and `information_schema` are matched by identity;
+ * `pg_toast*` and `pg_temp_*` by prefix because their names carry a numeric
+ * suffix per backend.
+ *
+ * `column` is interpolated into SQL and MUST be a literal from this codebase
+ * (`n.nspname`, `schemaname`, `s.schemaname`) -- never a caller-supplied value.
+ */
+export function userSchemaFilter(column: string): string {
+  return (
+    `${column} NOT IN ('pg_catalog', 'information_schema') ` +
+    `AND ${column} NOT LIKE 'pg_toast%' ` +
+    `AND ${column} NOT LIKE 'pg_temp_%'`
+  );
+}
 
 /**
  * Minimal structural type satisfied by both `pg.Pool` and `pg.PoolClient`, so
@@ -689,11 +728,33 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
  * failures and returns `{ok: false}`. The MCP wrapper in index.ts handles
  * both shapes, but don't assume drop-in equivalence between the two.
  */
+/**
+ * Per-call options for {@link withSharedClient}'s runner.
+ *
+ * `extended` forces the EXTENDED query protocol even when `params` is empty.
+ * pg otherwise picks the protocol from the values array -- `requiresPreparation()`
+ * ends in `values.length > 0` -- so a zero-parameter call goes out on the SIMPLE
+ * protocol, which accepts MULTIPLE statements in one message. That is the
+ * stacked-query hole runReadOnly closes for user SQL (see its doc comment); any
+ * caller on this helper that interpolates non-catalog SQL into its statement
+ * needs the same guard and must pass this flag.
+ *
+ * Note the extended protocol also requires the bind parameter COUNT to match the
+ * statement's placeholders, so it cannot be used to run a statement whose `$n`
+ * placeholders are deliberately left unbound (EXPLAIN GENERIC_PLAN). Callers in
+ * that position use it as a single-statement VALIDATOR and then run the
+ * validated text normally -- see tools/index-advisor.ts:assertSingleStatement.
+ */
+export interface RunOnClientOptions {
+  extended?: boolean;
+}
+
 export async function withSharedClient<T>(
   fn: (
     runOnClient: <R extends pg.QueryResultRow = pg.QueryResultRow>(
       sql: string,
       params?: unknown[],
+      options?: RunOnClientOptions,
     ) => Promise<ApiResponse<R[]>>,
   ) => Promise<T>,
 ): Promise<T> {
@@ -702,13 +763,17 @@ export async function withSharedClient<T>(
     const runOnClient = async <R extends pg.QueryResultRow = pg.QueryResultRow>(
       sql: string,
       params: unknown[] = [],
+      options: RunOnClientOptions = {},
     ): Promise<ApiResponse<R[]>> => {
       try {
         // Same "internal" tagging as runInternal -- these run on a shared
         // client but are the same class of server-composed catalog SQL.
         const result = await auditQuery(
           { source: "internal", sql, paramCount: params.length },
-          () => client.query<R>(sql, params),
+          () =>
+            options.extended
+              ? client.query<R>({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig)
+              : client.query<R>(sql, params),
           (r) => r.rowCount ?? r.rows.length,
         );
         return { ok: true, data: result.rows };
@@ -738,13 +803,23 @@ export async function shutdown(): Promise<void> {
   // signal handler can still call process.exit().
   const ending = pool;
   pool = null;
+  // The loser of this race has to be cleaned up explicitly. An un-cleared
+  // setTimeout holds the event loop open for its full 5s, so a process that
+  // has nothing left to do still waits -- invisible under index.ts (a
+  // process.exit follows immediately) but a 5s hang for any in-process
+  // embedder or test teardown that calls shutdown() and expects to continue.
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
       ending.end(),
-      new Promise<void>((_, reject) => setTimeout(() => reject(new Error("pool shutdown timed out after 5s")), 5_000)),
+      new Promise<void>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("pool shutdown timed out after 5s")), 5_000);
+      }),
     ]);
   } catch {
     // Best-effort -- if pool.end() lost the race, the underlying TCP sockets
     // get reaped when the process exits.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

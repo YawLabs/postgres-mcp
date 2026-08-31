@@ -5,20 +5,13 @@ import {
   getServerVersionNum,
   isWritesAllowed,
   PG18,
+  PG19,
   runInternal,
+  userSchemaFilter,
   withSharedClient,
 } from "../api.js";
 import { rowsOutput, warningsField } from "./output.js";
 import { identSchema } from "./params.js";
-
-/**
- * `server_version_num` cut point for PostgreSQL 19, which added the
- * per-relation `stats_reset` that pg_table_bloat reads below. Declared here
- * rather than beside the PG16 / PG17 / PG18 constants in api.ts only because
- * api.ts is being edited concurrently with this change; hoist it next to its
- * siblings once both land, so a version cut point keeps exactly one home.
- */
-const PG19 = 190_000;
 
 /**
  * Which of the two independent counters put a pg_advisor wraparound row over
@@ -157,9 +150,23 @@ export const adminTools = [
       "Row shape: one row per (blocked_pid, blocking_pid) pair. A session waiting on multiple " +
       "blockers appears on multiple rows -- group/deduplicate by `blocked_pid` if you want a " +
       "per-blocked-session count. " +
-      "Caveat on `relation`: for non-relation waits (transactionid/virtualxid, where the wait " +
-      "is on the blocker's xid rather than a table) `relation` is a best-effort hint -- an " +
-      "alphabetical guess among the blocker's held write-intent locks -- not authoritative. " +
+      "Scope: CLUSTER-WIDE, unlike `pg_health` active_queries, which is filtered to the database " +
+      "in DATABASE_URL. Lock waits cross databases (a shared catalog, a long transaction in a " +
+      "sibling database), so the blocker is not always somewhere this connection could see -- but " +
+      "it does mean a row here may name a pid in another database entirely. `relation` is only " +
+      "resolved for locks in the CURRENT database or on a cluster-shared catalog (pg_authid, " +
+      "pg_database, ...); it is NULL for a lock held in another database, because a pg_class OID " +
+      "is only meaningful within its own database. " +
+      "A NULL `relation` has TWO unrelated causes, and `lock_type` is what tells them apart. " +
+      "When the wait is ON a relation (`lock_type` relation / extend / page / tuple), NULL means " +
+      "the lock is held in another database and cannot be named from here. When the wait is on " +
+      "something else (`transactionid` / `virtualxid` / `advisory`), `relation` was only ever a " +
+      "best-effort hint -- an alphabetical guess among the blocker's held write-intent locks, not " +
+      "authoritative -- so NULL there means the guess found no candidate, and the blocker is very " +
+      "likely LOCAL. Do not read that second case as 'somewhere else': use `blocking_pid` and " +
+      "`blocking_query`, which are populated either way. Note also that pg_cancel_backend / " +
+      "pg_terminate_backend signal by PID across the whole cluster, so even a genuinely " +
+      "cross-database blocker is actionable via `pg_kill`. " +
       "Use the blocked/blocking query text to disambiguate which table is actually contested.",
     annotations: {
       title: "Inspect blocking locks",
@@ -196,8 +203,12 @@ export const adminTools = [
           .string()
           .nullable()
           .describe(
-            "schema.table. For transactionid / virtualxid waits this is a best-effort GUESS among " +
-              "the blocker's held write-intent locks, not authoritative -- disambiguate with the query text.",
+            "schema.table. NULL has two causes, told apart by `lock_type`: on a relation wait " +
+              "(relation / extend / page / tuple) NULL means the lock is held in ANOTHER database and " +
+              "cannot be named from here; on a transactionid / virtualxid / advisory wait this field " +
+              "was only ever a best-effort GUESS among the blocker's held write-intent locks, so NULL " +
+              "means the guess found nothing and the blocker is very likely LOCAL. Never authoritative " +
+              "on the guess path -- disambiguate with the query text.",
           ),
         lock_type: z.string().describe("pg_locks.locktype: relation, transactionid, virtualxid, tuple, ..."),
       }),
@@ -232,12 +243,30 @@ export const adminTools = [
            blocking.query AS blocking_query,
            blocking.state AS blocking_state,
            EXTRACT(EPOCH FROM (now() - blocking.query_start))::numeric(10, 2)::float8 AS blocking_duration_seconds,
+           -- Both branches below resolve a pg_class OID against the CURRENT
+           -- database's catalog, but pg_locks is CLUSTER-WIDE: bl.relation can
+           -- be an OID from a database this connection is not attached to, and
+           -- pg_class OIDs are NOT unique across a cluster. CREATE DATABASE x
+           -- TEMPLATE y is a physical copy that preserves them verbatim, and
+           -- every database shares the initdb-created catalog OIDs -- so an
+           -- unqualified lookup silently renders a lock held on ANOTHER
+           -- database's public.orders as this database's public.orders. That is
+           -- worse than no answer: it is indistinguishable from a real local
+           -- lock, and an agent may then kill a backend or roll back a
+           -- migration against the wrong database.
+           --
+           -- The 0 is required, not defensive. Locks on cluster-shared
+           -- catalogs (pg_authid, pg_database, ...) report database = 0, and
+           -- those OIDs DO resolve correctly from any database -- filtering
+           -- them out would replace a correct name with NULL.
            CASE
              WHEN bl.relation IS NOT NULL
                THEN (SELECT n.nspname || '.' || c.relname
                      FROM pg_catalog.pg_class c
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                     WHERE c.oid = bl.relation)
+                     WHERE c.oid = bl.relation
+                       AND bl.database IN (0, (SELECT oid FROM pg_catalog.pg_database
+                                                WHERE datname = current_database())))
              ELSE (
                -- transactionid / virtualxid waits have bl.relation = NULL
                -- because the wait is on the blocker's xid, not on a relation.
@@ -258,6 +287,8 @@ export const adminTools = [
                WHERE blocker_locks.pid = blocking.pid
                  AND blocker_locks.locktype = 'relation'
                  AND blocker_locks.granted
+                 AND blocker_locks.database IN (0, (SELECT oid FROM pg_catalog.pg_database
+                                                     WHERE datname = current_database()))
                  AND blocker_locks.mode IN (
                    'RowShareLock', 'RowExclusiveLock', 'ShareLock',
                    'ShareRowExclusiveLock', 'ShareUpdateExclusiveLock',
@@ -1030,8 +1061,7 @@ export const adminTools = [
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE c.relkind IN ('r', 'p')
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-               AND n.nspname NOT LIKE 'pg_%'
+               AND ${userSchemaFilter("n.nspname")}
                AND NOT EXISTS (
                  SELECT 1 FROM pg_catalog.pg_index i
                  WHERE i.indrelid = c.oid AND i.indisprimary
@@ -1170,9 +1200,7 @@ export const adminTools = [
         limit?: number;
         method?: "estimate" | "approx" | "exact";
       };
-      const schemaFilter = schema
-        ? "AND schemaname = $3"
-        : "AND schemaname NOT IN ('pg_catalog', 'information_schema') AND schemaname NOT LIKE 'pg_%'";
+      const schemaFilter = schema ? "AND schemaname = $3" : `AND ${userSchemaFilter("schemaname")}`;
       const params: unknown[] = [minDeadRatio, limit];
       if (schema) params.push(schema);
 

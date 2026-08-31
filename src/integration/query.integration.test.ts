@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
-import { getApplicationName, runInternal, shutdown } from "../api.js";
+import { getApplicationName, runInternal, shutdown, withSharedClient } from "../api.js";
 import { explainTools } from "../tools/explain.js";
 import { healthTools } from "../tools/health.js";
 import { queryTools } from "../tools/query.js";
@@ -579,6 +579,54 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         if (original === undefined) delete process.env.ALLOW_WRITES;
         else process.env.ALLOW_WRITES = original;
       }
+    });
+  });
+
+  // The stacked-query defense above rests on ONE primitive: `queryMode:
+  // "extended"`, which pg only understands because api.ts smuggles it past
+  // @types/pg with an `as UserQueryConfig` cast. A cast is invisible to tsc, so
+  // a rename or a typo -- `queryMode: "extend"`, the flag spelled onto the
+  // wrong key -- silently drops the request back to the SIMPLE protocol with
+  // every type-check and unit test still green. Only a live server can tell the
+  // two protocols apart.
+  //
+  // The ASYMMETRY is the assertion: the same multi-statement string must
+  // SUCCEED without the flag and FAIL with it. Asserting only the failure would
+  // pass just as happily against a runner that rejected everything, and would
+  // not show that the option is what makes the difference.
+  describe("withSharedClient runner", () => {
+    it("honors { extended: true }: the same stacked string passes plain and is rejected extended", async () => {
+      const stacked = "SELECT 1; SELECT 2";
+      await withSharedClient(async (run) => {
+        // No flag -> `values.length > 0` is false -> pg uses the SIMPLE
+        // protocol, which accepts multiple commands in one message. That hole
+        // is the whole reason the option exists.
+        //
+        // Assert `ok`, not rows: on a multi-statement simple query pg returns
+        // an ARRAY of results, so `result.rows` is undefined and the runner's
+        // `r.rowCount ?? r.rows.length` accessor throws -- auditQuery swallows
+        // a throwing accessor by design (an audit must never break the query it
+        // observes), so the call still reports ok with `data` undefined.
+        const plain = await run(stacked);
+        assert.equal(plain.ok, true, `simple protocol must accept multiple commands, got error: ${plain.error}`);
+
+        // Same string, flag on: the extended protocol allows exactly one
+        // statement per request and postgres rejects the rest with 42601.
+        const extended = await run(stacked, [], { extended: true });
+        assert.equal(extended.ok, false, "{ extended: true } must reject a stacked statement");
+        assert.match(
+          extended.error ?? "",
+          /multiple commands|42601/i,
+          "expected the extended-protocol multi-statement rejection",
+        );
+
+        // Control: the flag rejects the stacking, not every zero-parameter
+        // statement -- a runner that failed everything would satisfy the leg
+        // above on its own.
+        const single = await run<{ n: number }>("SELECT 1 AS n", [], { extended: true });
+        assert.equal(single.ok, true, `{ extended: true } must still run a single statement, got: ${single.error}`);
+        assert.equal(single.data?.[0]?.n, 1);
+      });
     });
   });
 

@@ -4,6 +4,10 @@ bin/*
 !bin/postgres-mcp.mjs
 build-tmp/
 dist-release/
+# Throwaway probe scripts / scratch builds from local debugging sessions.
+.scratch/
+.tmp-verify/
+.agent-tsc-out/
 *.tgz
 .env
 .env.local

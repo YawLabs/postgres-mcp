@@ -32,6 +32,8 @@
  * wire, because no unit test of this module can observe it.
  */
 
+import { runWithAuditTool } from "./audit.js";
+
 // The SDK's `CallToolResult` carries an index signature (`[x: string]: unknown`)
 // alongside `content` / `isError`, so this interface has to as well. Dropping it
 // does not merely loosen the type, it breaks the build: `registerTool`'s callback
@@ -99,11 +101,19 @@ function toStructuredContent(serialized: string): Record<string, unknown> | unde
  * entirely once `isError` is set, so a structured body there would be an
  * unvalidated object shaped like nothing in the tool's outputSchema -- and the
  * error text, which is all an error response has to say, is already in `content`.
+ *
+ * `toolName` is what puts the `tool` field on every audit line the handler's SQL
+ * produces. This is the ONLY place it can be supplied: by the time a statement
+ * reaches api.ts the MCP frame is gone, so audit.ts reads the name out of an
+ * AsyncLocalStorage that something upstream has to establish, and this wrapper
+ * is that upstream. Without it an operator reading the trail sees the statements
+ * but not which tool issued them. `runWithAuditTool` short-circuits to a plain
+ * call when auditing is off, so the default path pays nothing for the frame.
  */
-export function wrapToolHandler(handler: ToolHandler): (input: unknown) => Promise<McpToolResponse> {
+export function wrapToolHandler(handler: ToolHandler, toolName: string): (input: unknown) => Promise<McpToolResponse> {
   return async (input: unknown): Promise<McpToolResponse> => {
     try {
-      const result = await handler(input);
+      const result = await runWithAuditTool(toolName, () => handler(input));
 
       // The handler contract is `{ ok, data?, error? }` (api.ts:ApiResponse),
       // but `handler` is typed loosely. Guard before the blind cast so a future

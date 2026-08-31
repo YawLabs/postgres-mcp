@@ -256,12 +256,23 @@ const MODERN_ENVELOPE = {
   },
 } as const;
 
-/** Start the emitted entrypoint with a syntactically valid DSN and nothing else. */
-function spawnServer(): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, [ENTRY], {
-    env: { ...process.env, DATABASE_URL: "postgres://stub-host/stubdb" },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+/**
+ * Start the emitted entrypoint with a syntactically valid DSN and nothing else.
+ *
+ * `overlay` amends that environment the way runLauncher's does, `undefined`
+ * DELETING a key rather than setting it empty. Deletion is the only way to
+ * reach the no-DATABASE_URL paths: the runner's own environment supplies one
+ * whenever the integration suite is armed, and an empty string is a THIRD state
+ * -- getDatabaseUrl rejects it with the same message, but only after the empty
+ * value has been read as present.
+ */
+function spawnServer(overlay: Record<string, string | undefined> = {}): ChildProcessWithoutNullStreams {
+  const env: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: "postgres://stub-host/stubdb" };
+  for (const [k, v] of Object.entries(overlay)) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
+  return spawn(process.execPath, [ENTRY], { env, stdio: ["pipe", "pipe", "pipe"] });
 }
 
 interface ToolsListResponse {
@@ -377,6 +388,166 @@ describe("CLI: tools/call for a tool that does not exist", () => {
       }
     });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Audit attribution -- index.ts must hand each tool its OWN name.
+//
+// `wrapToolHandler(tool.handler, tool.name)` is what puts the `tool` field on
+// every audit line the handler's SQL produces (mcp-wrapper.ts opens the
+// AsyncLocalStorage frame audit.ts reads). Nine lines above that call, in the
+// same object literal, sits `title: tool.annotations.title` -- a per-tool
+// string of the same type. Swap one for the other and tsc stays quiet, every
+// unit test stays green, and the trail an operator relies on to answer "which
+// tool ran this DELETE" starts answering with a display name instead.
+//
+// Nothing else in the suite can see that argument. tools/tools.test.ts builds
+// its own tool array and never imports index.ts; mcp-wrapper.test.ts calls
+// wrapToolHandler directly and so supplies the name itself; and index.ts cannot
+// be imported in-process at all -- it starts a stdio server. The wiring is only
+// observable in the emitted binary, over the protocol, which is here.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** One line of the JSON audit trail -- only the fields asserted below. */
+interface AuditLine {
+  tool?: string;
+  source?: string;
+  ok?: boolean;
+}
+
+/**
+ * Resolve once `count` audit lines have arrived on the child's stderr.
+ *
+ * A wait rather than a sleep: audit.ts's `record()` writes its line
+ * synchronously, BEFORE the tools/call response is serialized, so the line is
+ * guaranteed written by the time that response arrives -- but it reaches this
+ * process down a pipe, so it is not guaranteed READ. Attach before the
+ * handshake so nothing emitted between spawn and the last call is missed.
+ *
+ * The startup banner shares this stream, hence the `{` filter; anything that is
+ * not a JSON record is skipped rather than counted.
+ */
+function collectAuditLines(child: ChildProcessWithoutNullStreams, count: number): Promise<AuditLine[]> {
+  return new Promise((resolve, reject) => {
+    const lines: AuditLine[] = [];
+    let buffer = "";
+    const timer = setTimeout(
+      () => reject(new Error(`only ${lines.length} of ${count} audit lines within 20s`)),
+      20_000,
+    );
+    child.stderr.on("data", (d) => {
+      buffer += String(d);
+      let idx = buffer.indexOf("\n");
+      while (idx !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        // The `sql` field carries newlines, but JSON.stringify escapes them, so
+        // one audit record is always exactly one physical line.
+        if (line.startsWith("{")) {
+          try {
+            lines.push(JSON.parse(line) as AuditLine);
+          } catch {
+            // Not an audit record -- keep reading.
+          }
+        }
+        idx = buffer.indexOf("\n");
+      }
+      if (lines.length >= count) {
+        clearTimeout(timer);
+        resolve(lines);
+      }
+    });
+    child.on("close", () => {
+      clearTimeout(timer);
+      reject(new Error(`process exited after ${lines.length} of ${count} audit lines`));
+    });
+  });
+}
+
+describe("CLI: audit attribution", () => {
+  it("tags each tool's statements with that tool's own name", async () => {
+    // DATABASE_URL is unset ON PURPOSE. getPool() then throws inside
+    // auditQuery's run(), and auditQuery's catch still records an ok:false line
+    // carrying the tool field -- which is the whole field under test. So this
+    // needs no database, opens no socket, and costs a fraction of a millisecond
+    // per call. POSTGRES_AUDIT_LOG_FILE is cleared for a related reason: left
+    // set in the ambient environment it would redirect the lines to a file, and
+    // the failure would read as a missing tool field rather than a misdirected
+    // sink.
+    const child = spawnServer({
+      DATABASE_URL: undefined,
+      POSTGRES_AUDIT_LOG: "stderr",
+      POSTGRES_AUDIT_LOG_FILE: undefined,
+    });
+    const audited = collectAuditLines(child, 2);
+    // If an await below throws first, nothing ever awaits `audited`, and the
+    // SIGKILL in the finally would surface its rejection as an unhandled one --
+    // killing the runner instead of reporting the real failure.
+    audited.catch(() => {});
+
+    try {
+      await waitForBanner(child);
+      await rpc(child, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "coverage-test", version: "0" },
+        },
+      });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+
+      // Two runInternal-backed tools, both with an empty inputSchema, so the
+      // arguments cannot be what tells the two audit lines apart -- only the
+      // name index.ts passed to wrapToolHandler can.
+      const called = ["pg_list_schemas", "pg_list_extensions"] as const;
+      for (const [i, name] of called.entries()) {
+        const res = (await rpc(child, {
+          jsonrpc: "2.0",
+          id: 2 + i,
+          method: "tools/call",
+          params: { name, arguments: {} },
+        })) as { result?: { isError?: boolean } };
+        // The missing DSN is the mechanism, so assert we actually landed on it.
+        // A change that let these calls succeed -- or rejected them at the
+        // protocol level -- would otherwise leave this test measuring some
+        // other path while still passing.
+        assert.equal(res.result?.isError, true, `expected an isError envelope for ${name}, got ${JSON.stringify(res)}`);
+      }
+
+      const lines = await audited;
+      // One statement per tool, so two calls are two lines. A third would mean
+      // a handler grew a fan-out and the positional pairing below no longer
+      // holds -- worth failing on rather than silently re-indexing.
+      assert.equal(lines.length, 2, `expected one audit line per call, got ${JSON.stringify(lines)}`);
+      for (const [i, name] of called.entries()) {
+        assert.equal(lines[i].ok, false, "these lines come from auditQuery's catch -- getPool() has no DSN");
+        assert.equal(lines[i].source, "internal");
+        // THE assertion. `tool.annotations.title` in place of `tool.name` at
+        // the wrapToolHandler call yields "List schemas" / "List installed
+        // extensions" here.
+        assert.equal(
+          lines[i].tool,
+          name,
+          `audit line ${i} is attributed to ${JSON.stringify(lines[i].tool)}, not ${name}`,
+        );
+      }
+      // Equality with the name we CALLED is the load-bearing half above: the
+      // annotations.title swap this test exists for produces two DISTINCT
+      // values too, so distinctness alone would not catch it. Asserted anyway
+      // because it is what an operator reads the trail for -- a `tool` field
+      // holding one string on every line is useless whatever that string says.
+      assert.notEqual(
+        lines[0].tool,
+        lines[1].tool,
+        "both audit lines carry one tool name -- the field is not per-tool",
+      );
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────

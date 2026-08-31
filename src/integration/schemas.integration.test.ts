@@ -882,5 +882,111 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         `case-insensitive wildcard should match 'email', got ${JSON.stringify(mixedRes.data)}`,
       );
     });
+
+    // The no-schema branch is the one that runs userSchemaFilter, and this
+    // pins WHICH schemas that predicate lets through. `_` is a SINGLE-CHARACTER
+    // WILDCARD in SQL LIKE, so the form userSchemaFilter replaced -- `NOT LIKE
+    // 'pg_%'` -- also excluded pgagent, pgboss, pgbouncer and pglogical:
+    // schemas real extensions create, not postgres internals. The split was
+    // user-visible, not cosmetic -- pg_list_schemas used the permissive
+    // predicate and ADVERTISED such a schema, while this tool and the
+    // stats/advisor tools silently returned nothing for it.
+    //
+    // The schema is created HERE rather than in the shared fixture because a
+    // revert is invisible on any cluster whose schema names all fail the
+    // wildcard -- which is every cluster this suite otherwise builds, so the
+    // regression would ship green. Confirmed against PG15/17/18: `SELECT
+    // 'pgagent' LIKE 'pg_%'` is true, and the same search under the old
+    // predicate returns 0 rows for the column created below.
+    it("without a schema arg includes a 'pg'-prefixed user schema (LIKE '_' is a wildcard)", async () => {
+      // pgAgent itself owns this exact schema name, hence the pre-check below:
+      // this test creates and drops `pgagent`, and must never do that to a real
+      // install that happens to share the cluster.
+      const wildcardSchema = "pgagent";
+      const wildcardTable = "pga_jobsteplog";
+      const wildcardColumn = "pgagent_wildcard_probe";
+
+      const existing = (await runInternal<{ nspname: string }>(
+        `SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = $1`,
+        [wildcardSchema],
+      )) as { ok: boolean; data?: { nspname: string }[]; error?: string };
+      assert.equal(existing.ok, true, `namespace probe failed: ${existing.error}`);
+      assert.equal(
+        existing.data?.length ?? 0,
+        0,
+        `schema ${wildcardSchema} already exists -- refusing to create and then drop it. ` +
+          `Drop it by hand if it is a leftover from a crashed run.`,
+      );
+
+      const created = await runInternal(`CREATE SCHEMA ${wildcardSchema}`);
+      assert.equal(created.ok, true, `CREATE SCHEMA ${wildcardSchema} failed: ${created.error}`);
+      try {
+        const table = await runInternal(
+          `CREATE TABLE ${wildcardSchema}.${wildcardTable} (id INT PRIMARY KEY, ${wildcardColumn} TEXT)`,
+        );
+        assert.equal(table.ok, true, `CREATE TABLE ${wildcardSchema}.${wildcardTable} failed: ${table.error}`);
+
+        // The positive half: no `schema` argument, so the handler takes the
+        // userSchemaFilter branch, and `pgagent` must survive it.
+        const res = (await searchColumns.handler({ pattern: wildcardColumn, limit: 100 })) as {
+          ok: boolean;
+          data?: { schema: string; table: string; column: string }[];
+          error?: string;
+        };
+        assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+        const hit = (res.data ?? []).find((r) => r.schema === wildcardSchema);
+        assert.ok(
+          hit,
+          `a schema named '${wildcardSchema}' matches LIKE 'pg_%' but is a USER schema and must be searched; ` +
+            `got ${JSON.stringify(res.data)}`,
+        );
+        assert.equal(hit.table, wildcardTable);
+        assert.equal(hit.column, wildcardColumn);
+
+        // The negative half: the schemas userSchemaFilter names are still gone.
+        // `relname` is the control pattern -- it exists on 19 pg_catalog
+        // relations and 1 information_schema relation on every major in the
+        // matrix, so a filter that stopped excluding them would put real rows
+        // here. The count is re-derived below rather than trusted, otherwise a
+        // future catalog rename turns this half of the test vacuous.
+        const candidates = (await runInternal<{ n: number }>(
+          `SELECT count(*)::int AS n
+             FROM pg_catalog.pg_attribute a
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE a.attname ILIKE 'relname'
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND n.nspname IN ('pg_catalog', 'information_schema')`,
+        )) as { ok: boolean; data?: { n: number }[]; error?: string };
+        assert.equal(candidates.ok, true, `control-pattern probe failed: ${candidates.error}`);
+        assert.ok(
+          (candidates.data?.[0]?.n ?? 0) > 0,
+          `control pattern 'relname' matches no system-schema column, so the exclusion assertion below ` +
+            `would pass vacuously -- pick another pattern`,
+        );
+
+        const systemRes = (await searchColumns.handler({ pattern: "relname", limit: 1000 })) as {
+          ok: boolean;
+          data?: { schema: string; table: string; column: string }[];
+          error?: string;
+        };
+        assert.equal(systemRes.ok, true, `expected ok, got error: ${systemRes.error}`);
+        const leaked = (systemRes.data ?? []).filter(
+          (r) =>
+            r.schema === "pg_catalog" ||
+            r.schema === "information_schema" ||
+            r.schema.startsWith("pg_toast") ||
+            r.schema.startsWith("pg_temp_"),
+        );
+        assert.deepEqual(leaked, [], `pg_search_columns leaked system-schema rows: ${JSON.stringify(leaked)}`);
+      } finally {
+        // Deliberately not asserted: a throw here would replace whatever real
+        // failure sent us into the finally. A drop that silently fails surfaces
+        // on the next run, as the "already exists" assertion above.
+        await runInternal(`DROP SCHEMA IF EXISTS ${wildcardSchema} CASCADE`);
+      }
+    });
   });
 });

@@ -13,6 +13,7 @@ import {
   runWithAuditTool,
   setAuditSinkForTests,
 } from "./audit.js";
+import { wrapToolHandler } from "./mcp-wrapper.js";
 
 const AUDIT_ENV = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
 
@@ -179,6 +180,28 @@ describe("audit record shape", () => {
       ),
     );
     assert.equal(parseOnly(lines).tool, "pg_query");
+  });
+
+  // The test above proves the MECHANISM works when something calls it. This one
+  // proves the production path actually does: runWithAuditTool and the
+  // AsyncLocalStorage behind it shipped with no caller outside this file, so
+  // every real audit line came out missing the one field that says which tool
+  // issued the statement. Asserting through wrapToolHandler -- the exact
+  // function index.ts registers -- is what keeps the wiring from being dropped
+  // again, since a unit test of audit.ts alone cannot observe its absence.
+  it("tags lines through wrapToolHandler, the wiring index.ts actually uses", async () => {
+    const lines = captureAudit();
+    const wrapped = wrapToolHandler(
+      () =>
+        auditQuery(
+          { source: "user", sql: "SELECT 1", paramCount: 0 },
+          () => Promise.resolve({ rows: [], rowCount: 0 }),
+          (r) => r.rowCount,
+        ).then(() => ({ ok: true })),
+      "pg_describe_table",
+    );
+    await wrapped({});
+    assert.equal(parseOnly(lines).tool, "pg_describe_table");
   });
 
   it("omits the tool field entirely when no tool context is active", async () => {

@@ -147,7 +147,7 @@ function createServer(): McpServer {
         outputSchema: tool.outputSchema,
         annotations: tool.annotations,
       },
-      wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>),
+      wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>, tool.name),
     );
   }
 

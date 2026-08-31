@@ -312,7 +312,7 @@ export async function setupFixtures(): Promise<void> {
   // exercise the positive path. If the binary isn't installed (e.g. PGDG
   // hasn't packaged it for this PG major yet), the test falls back to
   // exercising the "extension not installed" error path.
-  await runInternal(`CREATE EXTENSION IF NOT EXISTS hypopg`);
+  _hypopgAvailable = (await runInternal(`CREATE EXTENSION IF NOT EXISTS hypopg`)).ok;
 
   // Best-effort: pgstattuple ships in postgresql-contrib and needs no
   // shared_preload_libraries entry, so a plain CREATE EXTENSION is enough.
@@ -347,6 +347,16 @@ let _fdwAvailable = false;
 /** True when the postgres_fdw foreign table fixture is in place. */
 export function fdwFixtureAvailable(): boolean {
   return _fdwAvailable;
+}
+
+// Tracks whether HypoPG could be installed. pg_index_advisor refuses to run
+// without it, so its tests skip rather than assert on the missing-extension
+// error path they were not written for.
+let _hypopgAvailable = false;
+
+/** True when the HypoPG extension is installed and usable. */
+export function hypopgAvailable(): boolean {
+  return _hypopgAvailable;
 }
 
 // PG18-only fixture object names. Every one of these lives inside
