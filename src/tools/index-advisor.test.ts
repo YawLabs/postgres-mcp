@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import pg from "pg";
-import { shutdown } from "../api.js";
+import { formatPgError, shutdown } from "../api.js";
 import {
   applySkipScanGate,
+  assertSingleStatement,
   buildCandidates,
   classifyRole,
   extractIdentifiers,
@@ -436,6 +437,129 @@ describe("renderCreateIndex", () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────
+// The stacked-query guard.
+//
+// These tests exist because the ONLY other coverage of this function is an
+// integration test gated behind POSTGRES_MCP_INTEGRATION=1, which the default
+// `npm test` does not set. That was demonstrated by mutation: deleting the
+// `{ extended: true }` argument from the probe -- which fully restores the
+// stacked-query vulnerability, confirmed by a live canary table being DROPped --
+// left the entire suite green. The `extended: true` assertion below is the one
+// that kills that mutant, so do not relax it.
+//
+// The postgres error fixtures are built by calling the REAL formatPgError
+// rather than hand-writing its output. BIND_COUNT_MISMATCH matches on the
+// `(code: 08P01)` fragment that function renders, so going through it keeps the
+// guard's regex coupled to the real renderer: if formatPgError ever stops
+// emitting that fragment, case (b) fails here instead of the guard silently
+// starting to reject every parameterized statement in production.
+// ─────────────────────────────────────────────────────────────────────────
+describe("assertSingleStatement: the stacked-query guard", () => {
+  /** A pg-shaped error: an Error carrying a SQLSTATE on `code`. */
+  function pgError(message: string, code: string): Error {
+    return Object.assign(new Error(message), { code });
+  }
+
+  /**
+   * Minimal SharedRunner stand-in. Savepoint traffic always succeeds; the one
+   * non-savepoint statement (the probe) returns whatever the test supplies.
+   */
+  function fakeRunner(probeResult: unknown) {
+    const calls: { sql: string; params?: unknown[]; options?: { extended?: boolean } }[] = [];
+    const run = (async (sql: string, params?: unknown[], options?: { extended?: boolean }) => {
+      calls.push({ sql, params, options });
+      if (/^\s*(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT)\b/i.test(sql)) {
+        return { ok: true, data: [] };
+      }
+      return probeResult;
+    }) as unknown as Parameters<typeof assertSingleStatement>[0];
+    const probes = () => calls.filter((c) => !/^\s*(SAVEPOINT|ROLLBACK|RELEASE)\b/i.test(c.sql));
+    return { run, calls, probes };
+  }
+
+  it("sends the probe on the EXTENDED protocol -- the whole guard", async () => {
+    // Without this argument pg picks the protocol from the values array, an
+    // empty array selects the SIMPLE protocol, and the simple protocol executes
+    // every command in a multi-statement string.
+    const { run, probes } = fakeRunner({
+      ok: true,
+      data: [{ "QUERY PLAN": [{ Plan: { "Total Cost": 917.54 } }] }],
+    });
+    await assertSingleStatement(run, "EXPLAIN (FORMAT JSON, VERBOSE) SELECT 1");
+    assert.equal(probes().length, 1, "expected exactly one probe statement");
+    assert.equal(
+      probes()[0]?.options?.extended,
+      true,
+      "the probe MUST go out on the extended protocol -- this is the stacked-query defense",
+    );
+  });
+
+  it("(a) reuses the plan when the statement has no placeholders", async () => {
+    const { run, probes } = fakeRunner({
+      ok: true,
+      data: [{ "QUERY PLAN": [{ Plan: { "Total Cost": 917.54 } }] }],
+    });
+    const out = await assertSingleStatement(run, "EXPLAIN (FORMAT JSON, VERBOSE) SELECT 1");
+    assert.equal(out.ok, true);
+    assert.equal(out.cost, 917.54, "a successful probe IS a complete EXPLAIN; its plan must be reused");
+    assert.equal(probes().length, 1, "reusing the plan means no second round trip");
+  });
+
+  it("(b) treats an 08P01 bind-count mismatch as proof of a single statement", async () => {
+    // BIND happens after PARSE, so reaching a bind error proves the string
+    // parsed as ONE command -- it just carries unbound $n placeholders.
+    const { run } = fakeRunner({
+      ok: false,
+      error: formatPgError(
+        pgError('bind message supplies 0 parameters, but prepared statement "" requires 1', "08P01"),
+      ),
+    });
+    const out = await assertSingleStatement(run, "EXPLAIN (FORMAT JSON, VERBOSE, GENERIC_PLAN) SELECT $1");
+    assert.equal(out.ok, true, "a parameterized statement must be cleared, not rejected");
+    assert.equal(out.cost, undefined, "nothing was planned, so the caller has to run the real EXPLAIN");
+  });
+
+  it("(c) rejects a 42601 multi-command string", async () => {
+    const { run } = fakeRunner({
+      ok: false,
+      error: formatPgError(pgError("cannot insert multiple commands into a prepared statement", "42601")),
+    });
+    const out = await assertSingleStatement(run, "EXPLAIN (FORMAT JSON) SELECT 1; DROP TABLE users;");
+    assert.equal(out.ok, false, "a stacked payload must be rejected");
+    assert.match(out.error ?? "", /multiple commands/);
+  });
+
+  it("rejects any other error rather than assuming it is safe", async () => {
+    // The guard is allow-list shaped: only 08P01 clears a statement it could
+    // not plan. Anything else -- a syntax error, a permission denial, a
+    // SQLSTATE this code has never seen -- must not fall through to the simple
+    // protocol.
+    for (const [message, code] of [
+      ["syntax error at or near \\", "42601"],
+      ["permission denied for table users", "42501"],
+      ["some future error", "XX999"],
+    ] as const) {
+      const { run } = fakeRunner({ ok: false, error: formatPgError(pgError(message, code)) });
+      const out = await assertSingleStatement(run, "EXPLAIN (FORMAT JSON) SELECT 1");
+      assert.equal(out.ok, false, `SQLSTATE ${code} must not clear the guard`);
+    }
+  });
+
+  it("releases the savepoint on both the success and the failure path", async () => {
+    // ROLLBACK TO clears the aborted state but LEAVES the savepoint, so a
+    // missing RELEASE leaks one per failed statement for the life of the txn.
+    const ok = fakeRunner({ ok: true, data: [{ "QUERY PLAN": [{ Plan: { "Total Cost": 1 } }] }] });
+    await assertSingleStatement(ok.run, "EXPLAIN (FORMAT JSON) SELECT 1");
+    assert.equal(ok.calls.filter((c) => /^RELEASE SAVEPOINT/i.test(c.sql)).length, 1);
+
+    const bad = fakeRunner({ ok: false, error: formatPgError(pgError("nope", "42601")) });
+    await assertSingleStatement(bad.run, "EXPLAIN (FORMAT JSON) SELECT 1; SELECT 2;");
+    assert.equal(bad.calls.filter((c) => /^ROLLBACK TO SAVEPOINT/i.test(c.sql)).length, 1);
+    assert.equal(bad.calls.filter((c) => /^RELEASE SAVEPOINT/i.test(c.sql)).length, 1);
+  });
+});
+
 describe("greedySearch bounded search", () => {
   /** Every candidate cuts the cost of each statement it touches by 90%. */
   const alwaysHelps = async (c: IndexCandidate, indices: number[]): Promise<Map<number, number>> => {
@@ -552,6 +676,115 @@ describe("greedySearch bounded search", () => {
     assert.equal(result.accepted[0]?.costAfter, 10);
     // Round 1 evaluated both; round 2 evaluated the survivor and rejected it.
     assert.equal(seen.length, 3);
+  });
+
+  // The greedy contract is that each accepted index STAYS IN PLACE while the
+  // rest are re-costed on top of it. `evaluate` measures one candidate and undoes
+  // it, so without an onAccept hook to persist the winner nothing survives the
+  // round boundary and the loop silently degrades into an independent
+  // per-candidate ranking -- two candidates fixing the same statement each get
+  // full credit for it. These pin the hook itself, which is the part a
+  // database-free test can observe.
+  it("persists each accepted candidate before the next round", async () => {
+    const persisted: string[] = [];
+    const result = await greedySearch({
+      candidates: [candidate("a", ["x"], { statements: [0] }), candidate("b", ["y"], { statements: [1] })],
+      currentCosts: [1000, 1000],
+      weights: [1, 1],
+      explainBudget: 100,
+      minImprovement: 0.1,
+      maxRecommendations: 2,
+      evaluate: async (_c, indices) => new Map(indices.map((i) => [i, 10])),
+      onAccept: async (c) => {
+        persisted.push(c.table);
+      },
+    });
+    assert.equal(result.accepted.length, 2);
+    assert.deepEqual(
+      persisted,
+      result.accepted.map((a) => a.candidate.table),
+      "every accepted candidate must be persisted, in acceptance order",
+    );
+  });
+
+  // The sibling test above pins the SET and the ORDER of the persisted
+  // candidates, which a version that batches every onAccept AFTER the loop
+  // satisfies just as well. What that version loses is the INTERLEAVING, and
+  // the interleaving is the whole point: the persist has to land between round
+  // N and round N+1 or round N+1 measures against the bare baseline again.
+  it("runs onAccept BETWEEN rounds, not batched after the search", async () => {
+    // One shared ordered log, written by both callbacks, so the assertion can
+    // see the two interleave rather than only that both happened.
+    const trace: string[] = [];
+    const result = await greedySearch({
+      candidates: [candidate("a", ["x"], { statements: [0] }), candidate("b", ["y"], { statements: [1] })],
+      currentCosts: [1000, 1000],
+      weights: [1, 1],
+      explainBudget: 100,
+      minImprovement: 0.1,
+      maxRecommendations: 2,
+      evaluate: async (c, indices) => {
+        trace.push(`evaluate:${c.table}`);
+        return new Map(indices.map((i) => [i, 10]));
+      },
+      onAccept: async (c) => {
+        trace.push(`accept:${c.table}`);
+      },
+    });
+    assert.equal(result.accepted.length, 2);
+    // Round 1 costs both candidates and accepts `a`; `a` is then persisted; only
+    // then does round 2 re-cost the survivor on top of it. Hoisting the persists
+    // out of the loop yields evaluate,evaluate,evaluate,accept,accept -- same
+    // accepted set, same acceptance order, wrong search.
+    assert.deepEqual(trace, ["evaluate:a", "evaluate:b", "accept:a", "evaluate:b", "accept:b"]);
+    // Restated as the property itself, so a future change to the round shape
+    // still fails here for the right reason instead of on the literal above.
+    assert.ok(
+      trace.indexOf("accept:a") < trace.lastIndexOf("evaluate:b"),
+      `no evaluate ran after an accept, so every persist trailed the search: ${trace.join(" -> ")}`,
+    );
+  });
+
+  it("never lets a statement's cost move back up", async () => {
+    // An index cannot make the planner choose a worse plan than it already had,
+    // so a higher reading is estimate wobble. Storing it would let the running
+    // total climb above an earlier round's and make the search non-monotonic.
+    const result = await greedySearch({
+      candidates: [candidate("a", ["x"], { statements: [0, 1] })],
+      currentCosts: [1000, 1000],
+      weights: [1, 1],
+      explainBudget: 100,
+      minImprovement: 0.1,
+      maxRecommendations: 1,
+      // Statement 0 improves sharply; statement 1 comes back WORSE.
+      evaluate: async () =>
+        new Map([
+          [0, 10],
+          [1, 5000],
+        ]),
+    });
+    assert.equal(result.accepted.length, 1);
+    const accepted = result.accepted[0];
+    assert.equal(accepted?.costAfter, 1010, "the regressed statement must keep its original 1000, not take 5000");
+    assert.equal(accepted?.perStatement.has(1), false, "a statement that got worse was not helped by this index");
+  });
+
+  it("refunds the budget when a candidate could not be costed at all", async () => {
+    // HypoPG declines shapes it cannot model, and evaluate returns null without
+    // ever issuing an EXPLAIN. Charging for that overstates explains_used and
+    // can report budget_exhausted on a search that never reached its cap.
+    const result = await greedySearch({
+      candidates: [candidate("a", ["x"], { statements: [0, 1, 2] })],
+      currentCosts: [1000, 1000, 1000],
+      weights: [1, 1, 1],
+      explainBudget: 10,
+      minImprovement: 0.1,
+      maxRecommendations: 5,
+      evaluate: async () => null,
+    });
+    assert.equal(result.accepted.length, 0);
+    assert.equal(result.explainsUsed, 0, "an un-costable candidate issues no EXPLAIN, so it must cost no budget");
+    assert.equal(result.budgetExhausted, false);
   });
 
   it("weights a statement's cost by its call count", async () => {
@@ -895,6 +1128,44 @@ describe("pg_index_advisor end-to-end against a stubbed server", () => {
       assert.equal(data.final_workload_cost, 10);
       assert.equal(data.skip_scan_available, true);
       assert.equal(data.budget_exhausted, false);
+    });
+  });
+
+  // The guard's own test pins that ONE probe leaves assertSingleStatement. This
+  // pins the other half -- that the CALLER honors the plan it came back with.
+  // assertSingleStatement returns {ok, cost, plan} for a placeholder-free
+  // statement because its extended-protocol probe already WAS a complete
+  // EXPLAIN; the baseline loop is supposed to `continue` on that instead of
+  // running the identical EXPLAIN a second time. A regression that always falls
+  // through to explainStatement is invisible from the response -- baseline
+  // EXPLAINs are deliberately not charged against `max_explains`, so
+  // `explains_used` does not move -- and doubles the baseline round trips
+  // against the server. Only the wire traffic shows it.
+  it("reuses the guard's plan and issues no second baseline EXPLAIN", async () => {
+    const sql = "SELECT * FROM users WHERE status = 'active'";
+    await withStubbedServer({}, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: [sql] })) as {
+        ok: boolean;
+        data?: { statements: { planned: boolean; baseline_cost: number | null }[] };
+      };
+      assert.equal(result.ok, true);
+
+      // The search re-EXPLAINs this same text once per candidate it costs, so
+      // the count is only meaningful BEFORE the first hypothetical index exists.
+      const texts = session.texts();
+      const firstCreate = texts.findIndex((s) => s.includes("hypopg_create_index"));
+      assert.ok(firstCreate > 0, "the search never created a hypothetical index, so there is no baseline phase");
+      const baselineExplains = texts.slice(0, firstCreate).filter((s) => s.startsWith("EXPLAIN") && s.includes(sql));
+      assert.equal(
+        baselineExplains.length,
+        1,
+        `baseline issued ${baselineExplains.length} EXPLAINs for one statement: ${JSON.stringify(baselineExplains)}`,
+      );
+
+      // ...and the one that ran is the one whose cost was kept, so "one EXPLAIN"
+      // means the plan was REUSED, not that the baseline was skipped.
+      assert.equal(result.data?.statements[0]?.planned, true);
+      assert.equal(result.data?.statements[0]?.baseline_cost, 1000);
     });
   });
 

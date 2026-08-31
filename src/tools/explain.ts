@@ -3,6 +3,8 @@ import {
   type ApiResponse,
   getServerVersionNum,
   isWritesAllowed,
+  PG12,
+  PG13,
   PG16,
   PG17,
   type RunHooks,
@@ -11,15 +13,6 @@ import {
   runReadWriteRollback,
 } from "../api.js";
 import { identSchema, paramsArray } from "./params.js";
-
-/**
- * Two more `server_version_num` cut points, in the same major * 10000 shape as
- * the `PG16`/`PG17`/`PG18` constants api.ts exports. They live here rather than
- * there because nothing else in the codebase gates on 12 or 13 -- and a bare
- * `120_000` in a version comparison reads as a row count, not a major version.
- */
-const PG12 = 120_000;
-const PG13 = 130_000;
 
 // EXPLAIN's SERIALIZE is an enum, not a boolean: it picks how far the executor
 // takes the result rows (skip serialization / build text / build binary).

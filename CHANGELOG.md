@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`pg_index_advisor` ran caller-supplied SQL on a protocol that accepts
+  MULTIPLE statements.** Every other tool sends user SQL through
+  `runReadOnly`, which pins `queryMode: 'extended'` precisely because the
+  extended protocol refuses to parse a multi-command string. The advisor
+  instead reached the server through `withSharedClient`, which called
+  `client.query(sql, [])` -- and pg picks its protocol from the values array,
+  where an EMPTY one selects the SIMPLE protocol. So a workload entry like
+  `SELECT 1; COMMIT; DROP SCHEMA public CASCADE;` ended the enclosing
+  `BEGIN READ ONLY` transaction mid-string and ran the rest in the autocommit
+  that followed. This is the same stacked-query class that defeated the
+  archived reference server. The reachable vector is the `statements` argument:
+  `pg_stat_statements` records a multi-command string one statement at a time,
+  so a stacked payload cannot arrive through the tool's other input. The tool is
+  annotated `readOnlyHint: true`, so hosts routinely auto-allow it.
+
+  Forcing the extended protocol everywhere is NOT the fix, and the reason is
+  worth recording: that protocol requires the bind parameter COUNT to match the
+  statement's placeholders, while this tool exists to plan normalized
+  `pg_stat_statements` text whose `$n` are deliberately unbound
+  (`EXPLAIN GENERIC_PLAN`). Binding NULLs to satisfy it was measured and
+  rejected -- `col = NULL` is provably false, so the planner collapses to a
+  zero-cost `Result` node (a real 917.54-cost plan became 0), which would have
+  left `min_improvement` unsatisfiable and the advisor silently recommending
+  nothing.
+
+  Each statement is now validated ONCE on the extended protocol and routed by
+  SQLSTATE: success means a single command with no placeholders, and its plan is
+  reused rather than re-planned; `08P01` (bind-count mismatch) means a single
+  command whose placeholders are unbound, since BIND is only reachable once
+  PARSE has already succeeded; anything else is refused, which catches `42601`
+  without matching on message text postgres localizes. Pinned by unit tests and
+  by an integration test per major that fires the payload at a canary table and
+  asserts it survives.
+
+### Fixed
+
+- **The advisor's greedy search was not greedy.** Its contract is that each
+  accepted index stays in place while the remaining candidates are re-costed on
+  top of it -- that interaction is the whole reason to run a search rather than
+  rank candidates independently. But the per-candidate evaluation dropped the
+  hypothetical index it created, and nothing recreated the winner, so every
+  round re-measured against the bare baseline. Two candidates that fixed the
+  same statement were therefore both credited in full for it. Accepted
+  candidates now persist across rounds. Two related corrections came out of the
+  same pass: a statement is never recorded as more expensive than it already was
+  (an index only ever ADDS a path, so a higher reading is estimate wobble, and
+  storing it let the reported total climb between rounds), and the EXPLAIN
+  budget is refunded when HypoPG declines a candidate outright, since no EXPLAIN
+  was ever issued for it.
+
+- **Audit lines never carried the `tool` field they advertise.** The
+  `AsyncLocalStorage` that tags a statement with the tool that issued it shipped
+  in 0.12.0 with no caller outside its own test, so every real audit line was
+  missing the one field that tells an operator which tool ran a statement.
+  `wrapToolHandler` now takes the tool name as a required argument, so a future
+  refactor that drops it fails to compile rather than silently emptying the
+  field.
+
+- **`pg_inspect_locks` could name the wrong table entirely.** `pg_locks` is
+  cluster-wide, but the relation lookup resolved its `pg_class` OID against the
+  CURRENT database's catalog with no database predicate -- and OIDs are not
+  unique across a cluster. `CREATE DATABASE staging TEMPLATE prod` preserves
+  them verbatim, so a lock held in `staging` rendered to a session connected to
+  `prod` as `prod`'s table, indistinguishable from real local contention. An
+  agent could then kill a backend or roll back a migration against the wrong
+  database. Resolution is now scoped to the current database plus
+  cluster-shared catalogs (`pg_locks.database = 0`, which legitimately resolve
+  from anywhere); a lock in another database reports `relation: null`.
+
+- **`POSTGRES_MCP_SANDBOX=1` stripped ten connection variables.** The oam
+  allowlist was derived by scanning the bundle for literal `process.env.X`
+  reads, but pg builds most of its names at runtime as
+  `process.env['PG' + key.toUpperCase()]`, so `PGHOST`, `PGUSER`, `PGPASSWORD`,
+  `PGPORT`, `PGDATABASE` and friends were invisible to that scan. A denied
+  variable is ABSENT rather than an error, so pg fell back to its own defaults
+  and the connection failed with something that named neither the sandbox nor
+  the variable. Only bites when `DATABASE_URL` is not self-contained, which is
+  why it survived this long.
+
+- **Half the tools silently ignored schemas whose names merely start with
+  "pg".** Two spellings of the system-schema filter had drifted apart, and `_`
+  is a single-character WILDCARD in SQL `LIKE`: `NOT LIKE 'pg_%'` therefore
+  excluded `pgagent`, `pgboss`, `pgbouncer` and `pglogical` -- schemas real
+  extensions create. `pg_list_schemas` used the other, precise spelling, so it
+  ADVERTISED such a schema while `pg_search_columns`, the stats tools and the
+  advisor all returned nothing for it, with no reason given. Both spellings are
+  now one shared predicate that excludes only `pg_catalog`,
+  `information_schema`, `pg_toast*` and `pg_temp_*`.
+
+- **`shutdown()` held the event loop open for five seconds.** It races
+  `pool.end()` against a timeout so a wedged query cannot stall exit forever,
+  but never cleared the timer when the pool won. Invisible under the server
+  itself, where a `process.exit` follows immediately, and a five-second stall
+  for any in-process embedder or test teardown that calls it and keeps running.
+
 ## [0.12.0] - 2026-08-23
 
 ### Added

@@ -465,6 +465,52 @@ describe("getPool without DATABASE_URL", () => {
   });
 });
 
+// shutdown() races `pool.end()` against a 5s timeout so a wedged query cannot
+// stall process exit forever, and the LOSER of that race has to be cleaned up:
+// an un-cleared setTimeout holds the event loop open for its full 5 seconds, so
+// a process with nothing left to do still waits. Invisible under index.ts (a
+// process.exit follows immediately) but a 5s stall for any in-process embedder
+// -- or a test file -- that calls shutdown() and expects to carry on.
+//
+// process.getActiveResourcesInfo() names every handle currently keeping the
+// loop alive, one "Timeout" entry per live timer. The assertion is a DELTA, not
+// a count of zero: the test runner owns timers of its own, and only the ones
+// this shutdown() adds are ours to answer for. Confirmed to distinguish the two
+// shapes rather than pass vacuously -- with the clearTimeout removed the delta
+// is 1 and the test process lingers ~5s at exit.
+describe("shutdown timer cleanup", () => {
+  const original = process.env.DATABASE_URL;
+  afterEach(async () => {
+    if (original === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = original;
+    await shutdown();
+  });
+
+  function liveTimers(): number {
+    return process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  }
+
+  it("clears the 5s race timer instead of leaving a live handle behind", async () => {
+    await shutdown();
+    // A parseable DSN that nothing ever dials. getPool() only CONSTRUCTS the
+    // pool -- pg connects lazily, on the first connect()/query() -- and end()
+    // on a pool with no clients resolves immediately, so shutdown() gets a real
+    // pool to race against without this becoming an integration test. The
+    // non-null pool is load-bearing: with `pool === null` shutdown() returns
+    // before the timer is ever created and the assertion below proves nothing.
+    process.env.DATABASE_URL = "postgres://u:p@127.0.0.1:1/postgres_mcp_never_dialed";
+    assert.ok(getPool(), "sanity: shutdown() needs a real pool for the race to run at all");
+
+    const before = liveTimers();
+    await shutdown();
+    assert.equal(
+      liveTimers(),
+      before,
+      "shutdown() left its 5s race timer live -- the event loop stays open for the full timeout",
+    );
+  });
+});
+
 // getServerVersionNum gates nearly every version-dependent catalog query in
 // the codebase, and its whole contract lives in module-scoped cache state:
 // what is cached, what deliberately is not, and what a concurrent shutdown()

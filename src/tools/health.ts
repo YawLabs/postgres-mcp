@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { withSharedClient } from "../api.js";
+import { userSchemaFilter, withSharedClient } from "../api.js";
 import { warningsField } from "./output.js";
 
 export const healthTools = [
@@ -362,9 +362,7 @@ export const healthTools = [
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE c.relkind IN ('r', 'p')
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-               AND n.nspname NOT LIKE 'pg_toast%'
-               AND n.nspname NOT LIKE 'pg_temp_%'`,
+               AND ${userSchemaFilter("n.nspname")}`,
           ),
         ]);
 

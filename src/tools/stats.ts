@@ -1,5 +1,12 @@
 import { z } from "zod";
-import { type ApiResponse, getServerVersionNum, PG16, runInternal, withSharedClient } from "../api.js";
+import {
+  type ApiResponse,
+  getServerVersionNum,
+  PG16,
+  runInternal,
+  userSchemaFilter,
+  withSharedClient,
+} from "../api.js";
 import { warningsField } from "./output.js";
 import { identSchema } from "./params.js";
 
@@ -419,9 +426,7 @@ export const statsTools = [
       // api.ts caches the probe process-wide, so this costs one extra
       // round-trip on the first stats call and nothing afterwards.
       const serverVersion = await getServerVersionNum();
-      const schemaFilter = schema
-        ? "AND schemaname = $3"
-        : "AND schemaname NOT IN ('pg_catalog', 'information_schema') AND schemaname NOT LIKE 'pg_%'";
+      const schemaFilter = schema ? "AND schemaname = $3" : `AND ${userSchemaFilter("schemaname")}`;
       const params: unknown[] = [minSize, limit];
       if (schema) params.push(schema);
       // Two queries on one connection -- see api.ts:withSharedClient. They are
@@ -546,9 +551,7 @@ export const statsTools = [
       // See pg_seq_scan_tables above for why the version is probed first:
       // s.last_idx_scan does not exist before PG16.
       const serverVersion = await getServerVersionNum();
-      const schemaFilter = schema
-        ? "AND s.schemaname = $3"
-        : "AND s.schemaname NOT IN ('pg_catalog', 'information_schema') AND s.schemaname NOT LIKE 'pg_%'";
+      const schemaFilter = schema ? "AND s.schemaname = $3" : `AND ${userSchemaFilter("s.schemaname")}`;
       const params: unknown[] = [maxScans, limit];
       if (schema) params.push(schema);
       // Two queries on one connection -- see api.ts:withSharedClient. The

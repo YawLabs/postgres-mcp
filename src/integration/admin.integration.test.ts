@@ -436,6 +436,172 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         }
       }
     });
+
+    // Cluster-SHARED catalog contention -- the case the literal 0 in
+    // `bl.database IN (0, <current db oid>)` exists for. pg_locks reports
+    // database = 0 for a lock on a shared relation (pg_authid, pg_database,
+    // ...) and NEVER the current database's OID, so "simplifying" that
+    // predicate to `bl.database = <current db oid>` blanks `relation` for
+    // exactly the pg_authid / pg_database contention that hangs logins -- the
+    // wait this tool exists to diagnose, reported with no name attached.
+    //
+    // EXCLUSIVE mode on both sides, deliberately not ACCESS EXCLUSIVE:
+    // ExclusiveLock self-conflicts (so the waiter really queues) but does NOT
+    // conflict with AccessShareLock, so pg_stat_activity, pg_locks, and the
+    // handler's own `SELECT oid FROM pg_catalog.pg_database` keep running while
+    // the lock is held. ACCESS EXCLUSIVE on a shared catalog would block the
+    // tool's own query and this test would hang instead of asserting. A pending
+    // Exclusive request does not gate AccessShare either -- the conflict set of
+    // AccessShare is AccessExclusive alone -- so the queued waiter cannot stall
+    // the assertions below.
+    //
+    // Locking a shared catalog needs owner/superuser rights. That is not
+    // treated as a capability skip: setupFixtures already requires CREATE ROLE
+    // and CREATE DATABASE, so a failure here is an environment problem worth
+    // failing loudly on rather than a reason to silently not run.
+    it("resolves a shared-catalog lock (pg_locks.database = 0) to its pg_catalog name", async () => {
+      const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      const waiter = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await holder.connect();
+      await waiter.connect();
+      let waiterPromise: Promise<unknown> | undefined;
+      try {
+        const holderPid = (await holder.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+        const waiterPid = (await waiter.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+
+        await holder.query("BEGIN");
+        await holder.query("LOCK TABLE pg_catalog.pg_authid IN EXCLUSIVE MODE");
+
+        // Same mode on the same shared catalog: the waiter queues on a
+        // `relation` lock whose pg_locks.database is 0, not this database's OID.
+        await waiter.query("BEGIN");
+        waiterPromise = waiter.query("LOCK TABLE pg_catalog.pg_authid IN EXCLUSIVE MODE").catch((e: unknown) => e);
+
+        const deadline = Date.now() + 5000;
+        let registered = false;
+        while (Date.now() < deadline) {
+          const probe = (await runInternal<{ blockers: number[] }>("SELECT pg_blocking_pids($1)::int[] AS blockers", [
+            waiterPid,
+          ])) as { ok: boolean; data?: { blockers: number[] }[] };
+          if (probe.ok && (probe.data?.[0]?.blockers ?? []).length > 0) {
+            registered = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        assert.ok(registered, `waiter pid ${waiterPid} never appeared in pg_blocking_pids within 5s`);
+
+        // The distinction, made explicit against the REAL lock row: the same
+        // pg_locks entry evaluated by the shipped predicate and by the
+        // simplification. `with_zero` is what the handler computes;
+        // `without_zero` is what it would compute with the 0 dropped. This is
+        // what stops the case degrading into one that stays green after the
+        // removal -- if the two ever agree, the row under test is not a
+        // shared-catalog lock and the tool-level assertion below proves nothing.
+        const resolution = (await runInternal<{
+          lock_database: number;
+          lock_type: string;
+          with_zero: string | null;
+          without_zero: string | null;
+        }>(
+          `SELECT
+             bl.database::int AS lock_database,
+             bl.locktype AS lock_type,
+             (SELECT n.nspname || '.' || c.relname
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               WHERE c.oid = bl.relation
+                 AND bl.database IN (0, (SELECT oid FROM pg_catalog.pg_database
+                                          WHERE datname = current_database()))) AS with_zero,
+             (SELECT n.nspname || '.' || c.relname
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               WHERE c.oid = bl.relation
+                 AND bl.database = (SELECT oid FROM pg_catalog.pg_database
+                                     WHERE datname = current_database())) AS without_zero
+           FROM pg_catalog.pg_locks bl
+           WHERE bl.pid = $1
+             AND NOT bl.granted
+             AND bl.relation IS NOT NULL`,
+          [waiterPid],
+        )) as {
+          ok: boolean;
+          data?: { lock_database: number; lock_type: string; with_zero: string | null; without_zero: string | null }[];
+          error?: string;
+        };
+        assert.equal(resolution.ok, true, `lock-resolution probe failed: ${resolution.error}`);
+        const lock = resolution.data?.[0];
+        assert.ok(
+          lock,
+          `expected an ungranted relation lock for pid ${waiterPid}, got ${JSON.stringify(resolution.data)}`,
+        );
+        assert.equal(lock.lock_type, "relation");
+        assert.equal(
+          lock.lock_database,
+          0,
+          `a lock on a cluster-shared catalog must report pg_locks.database = 0, got ${lock.lock_database}`,
+        );
+        assert.equal(
+          lock.with_zero,
+          "pg_catalog.pg_authid",
+          `the shipped predicate must name the shared catalog, got ${JSON.stringify(lock.with_zero)}`,
+        );
+        assert.equal(
+          lock.without_zero,
+          null,
+          `dropping the 0 must blank this row -- if it still resolves to ${JSON.stringify(lock.without_zero)}, ` +
+            `this test no longer distinguishes the two predicates`,
+        );
+
+        const res = (await inspectLocks.handler({ limit: 50 })) as {
+          ok: boolean;
+          data?: {
+            blocked_pid: number;
+            blocking_pid: number;
+            blocked_query: string;
+            relation: string | null;
+            lock_type: string;
+          }[];
+          error?: string;
+        };
+        assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+        const pair = (res.data ?? []).find((r) => r.blocked_pid === waiterPid && r.blocking_pid === holderPid);
+        assert.ok(pair, `expected a blocked=${waiterPid} blocking=${holderPid} pair, got ${JSON.stringify(res.data)}`);
+        assert.equal(pair.lock_type, "relation");
+        assert.match(pair.blocked_query, /pg_authid/i);
+        // The payload: database = 0 still resolves through the tool itself.
+        // Equality, not `includes` -- `without_zero` above pins the alternative
+        // to NULL, so anything other than the exact name is a regression.
+        assert.equal(
+          pair.relation,
+          "pg_catalog.pg_authid",
+          `a shared-catalog lock (database = 0) must still resolve to its pg_catalog name, got ` +
+            `${JSON.stringify(pair.relation)}`,
+        );
+
+        await holder.query("ROLLBACK");
+      } finally {
+        // Same ordering as the two contention cases above: release the holder
+        // first, then let the waiter finish, then close it.
+        try {
+          await holder.end();
+        } catch {
+          // Best-effort.
+        }
+        if (waiterPromise) {
+          try {
+            await waiterPromise;
+          } catch {
+            // May reject if waiter.end() raced ahead -- benign.
+          }
+        }
+        try {
+          await waiter.end();
+        } catch {
+          // Best-effort.
+        }
+      }
+    });
   });
 
   describe("pg_list_roles", () => {

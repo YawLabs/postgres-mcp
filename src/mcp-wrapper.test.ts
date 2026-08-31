@@ -8,13 +8,15 @@ import { type McpToolResponse, wrapToolHandler } from "./mcp-wrapper.js";
 // GAP 1: the index.ts MCP wrapper maps handler results to the MCP envelope.
 //
 // `wrapToolHandler` is the exact function index.ts registers on every tool
-// (index.ts passes `wrapToolHandler(tool.handler)` to `server.tool`). Testing
-// it directly exercises the production mapping with no replication/drift.
+// (index.ts passes `wrapToolHandler(tool.handler, tool.name)` to
+// `registerTool`). Testing it directly exercises the production mapping with no
+// replication/drift. The second argument is what tags the tool's audit lines --
+// see the audit-context test at the bottom of this file.
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("wrapToolHandler: ok result -> content block (no isError)", () => {
   it("serializes data as pretty JSON in a single text block", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: true, data: { rows: [1, 2], count: 2 } }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: { rows: [1, 2], count: 2 } }), "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, undefined, "success response must not set isError");
     assert.equal(res.content.length, 1);
@@ -25,7 +27,7 @@ describe("wrapToolHandler: ok result -> content block (no isError)", () => {
   });
 
   it("substitutes { success: true } when ok is true but data is absent", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: true }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true }), "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, undefined);
     assert.equal(res.content[0]!.text, JSON.stringify({ success: true }, null, 2));
@@ -33,7 +35,7 @@ describe("wrapToolHandler: ok result -> content block (no isError)", () => {
 
   it("substitutes { success: true } when data is explicitly null/undefined", async () => {
     for (const data of [null, undefined]) {
-      const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+      const wrapped = wrapToolHandler(async () => ({ ok: true, data }), "pg_test");
       const res = await wrapped({});
       // `data ?? { success: true }` -- nullish coalescing, so both null and
       // undefined fall through to the success sentinel.
@@ -45,7 +47,7 @@ describe("wrapToolHandler: ok result -> content block (no isError)", () => {
     // ?? only catches null/undefined, so a falsy-but-present payload must be
     // serialized verbatim -- NOT replaced by { success: true }.
     for (const data of [0, false, "", []] as const) {
-      const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+      const wrapped = wrapToolHandler(async () => ({ ok: true, data }), "pg_test");
       const res = await wrapped({});
       assert.equal(res.content[0]!.text, JSON.stringify(data, null, 2));
       assert.equal(res.isError, undefined);
@@ -59,7 +61,7 @@ describe("wrapToolHandler: malformed (non-ApiResponse) result -> distinct isErro
     // contract must NOT collapse into 'Unknown error' -- it gets a distinct,
     // diagnosable message so the misbehaving handler is obvious.
     for (const value of [42, { rows: [] }, "plain string"] as const) {
-      const wrapped = wrapToolHandler(async () => value);
+      const wrapped = wrapToolHandler(async () => value, "pg_test");
       const res = await wrapped({});
       assert.equal(res.isError, true);
       assert.equal(res.content[0]!.text, "Error: tool handler returned a malformed result (missing ok)");
@@ -67,7 +69,7 @@ describe("wrapToolHandler: malformed (non-ApiResponse) result -> distinct isErro
   });
 
   it("maps a null result to the malformed-result message (not 'Unknown error')", async () => {
-    const wrapped = wrapToolHandler(async () => null);
+    const wrapped = wrapToolHandler(async () => null, "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, true);
     assert.equal(res.content[0]!.text, "Error: tool handler returned a malformed result (missing ok)");
@@ -77,14 +79,17 @@ describe("wrapToolHandler: malformed (non-ApiResponse) result -> distinct isErro
 describe("wrapToolHandler: bigint data serializes as a string (no JSON crash)", () => {
   it("serializes a top-level bigint payload as its decimal string", async () => {
     // JSON.stringify throws on BigInt by default; the replacer must convert it.
-    const wrapped = wrapToolHandler(async () => ({ ok: true, data: 10n }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: 10n }), "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, undefined, "bigint serialization must not be treated as an error");
     assert.equal(res.content[0]!.text, '"10"');
   });
 
   it("serializes nested bigint values inside an object payload", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: true, data: { id: 9007199254740993n, name: "row" } }));
+    const wrapped = wrapToolHandler(
+      async () => ({ ok: true, data: { id: 9007199254740993n, name: "row" } }),
+      "pg_test",
+    );
     const res = await wrapped({});
     assert.equal(res.isError, undefined);
     assert.equal(res.content[0]!.text, JSON.stringify({ id: "9007199254740993", name: "row" }, null, 2));
@@ -93,7 +98,7 @@ describe("wrapToolHandler: bigint data serializes as a string (no JSON crash)", 
 
 describe("wrapToolHandler: { ok: false } result -> isError 'Error: <msg>' block", () => {
   it("maps a handler error string to an isError text block", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: false, error: "permission denied for table users" }));
+    const wrapped = wrapToolHandler(async () => ({ ok: false, error: "permission denied for table users" }), "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, true);
     assert.equal(res.content.length, 1);
@@ -108,7 +113,7 @@ describe("wrapToolHandler: { ok: false } result -> isError 'Error: <msg>' block"
       async () => ({ ok: false, error: "" }),
       async () => ({ ok: false, error: undefined }),
     ]) {
-      const wrapped = wrapToolHandler(handler);
+      const wrapped = wrapToolHandler(handler, "pg_test");
       const res = await wrapped({});
       assert.equal(res.isError, true);
       assert.equal(res.content[0]!.text, "Error: Unknown error");
@@ -120,7 +125,7 @@ describe("wrapToolHandler: a THROWN exception -> its own isError block", () => {
   it("catches a thrown Error and surfaces err.message", async () => {
     const wrapped = wrapToolHandler(async () => {
       throw new Error("boom from inside the handler");
-    });
+    }, "pg_test");
     // Must resolve (not reject) -- the wrapper's job is to never let a tool
     // throw bubble out and crash the server.
     const res = await wrapped({});
@@ -132,14 +137,14 @@ describe("wrapToolHandler: a THROWN exception -> its own isError block", () => {
     const wrapped = wrapToolHandler(async () => {
       // Deliberately throwing a non-Error to exercise the String(err) branch.
       throw "a bare string rejection";
-    });
+    }, "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, true);
     assert.equal(res.content[0]!.text, "Error: a bare string rejection");
   });
 
   it("handles a rejected promise from the handler (async throw)", async () => {
-    const wrapped = wrapToolHandler(() => Promise.reject(new Error("async rejection")));
+    const wrapped = wrapToolHandler(() => Promise.reject(new Error("async rejection")), "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, true);
     assert.equal(res.content[0]!.text, "Error: async rejection");
@@ -159,7 +164,7 @@ describe("wrapToolHandler: a THROWN exception -> its own isError block", () => {
 describe("wrapToolHandler: structuredContent mirrors the content text", () => {
   it("carries an object payload through unchanged, byte-identical to the text block", async () => {
     const data = { rows: [{ id: 1 }], rowCount: 1, nested: { a: [1, 2] } };
-    const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data }), "pg_test");
     const res = await wrapped({});
     assert.deepEqual(res.structuredContent, data);
     // The two halves must never disagree -- a client reading `content` and one
@@ -172,7 +177,7 @@ describe("wrapToolHandler: structuredContent mirrors the content text", () => {
     // arrays. The wrap lives here and in tools/output.ts:rowsOutput; `content`
     // stays unwrapped so no client reading it today sees a changed payload.
     const data = [{ schema_name: "public" }, { schema_name: "app" }];
-    const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data }), "pg_test");
     const res = await wrapped({});
     assert.deepEqual(res.structuredContent, { rows: data });
     assert.equal(res.content[0]!.text, JSON.stringify(data, null, 2));
@@ -180,14 +185,14 @@ describe("wrapToolHandler: structuredContent mirrors the content text", () => {
   });
 
   it("wraps an EMPTY array too (an empty list is a real answer, not a missing one)", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: true, data: [] }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: [] }), "pg_test");
     const res = await wrapped({});
     assert.deepEqual(res.structuredContent, { rows: [] });
     assert.equal(res.content[0]!.text, "[]");
   });
 
   it("carries the { success: true } sentinel when ok is true but data is absent", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: true }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true }), "pg_test");
     const res = await wrapped({});
     assert.deepEqual(res.structuredContent, { success: true });
   });
@@ -197,7 +202,7 @@ describe("wrapToolHandler: structuredContent mirrors the content text", () => {
     // advertise a shape no tool's outputSchema declares, so the key is left
     // off and `content` still carries the value verbatim.
     for (const data of [0, false, "", 42, "plain"] as const) {
-      const wrapped = wrapToolHandler(async () => ({ ok: true, data }));
+      const wrapped = wrapToolHandler(async () => ({ ok: true, data }), "pg_test");
       const res = await wrapped({});
       assert.equal("structuredContent" in res, false, `scalar ${JSON.stringify(data)} produced structuredContent`);
       assert.equal(res.content[0]!.text, JSON.stringify(data, null, 2));
@@ -210,7 +215,7 @@ describe("wrapToolHandler: structuredContent mirrors the content text", () => {
     // bigint left in it throws "Do not know how to serialize a BigInt" inside
     // the SDK, outside this module's try/catch, where nothing is left to shape
     // it into an error envelope -- so the value must already be a string here.
-    const wrapped = wrapToolHandler(async () => ({ ok: true, data: { id: 9007199254740993n, ok: true } }));
+    const wrapped = wrapToolHandler(async () => ({ ok: true, data: { id: 9007199254740993n, ok: true } }), "pg_test");
     const res = await wrapped({});
     assert.equal(res.isError, undefined);
     assert.deepEqual(res.structuredContent, { id: "9007199254740993", ok: true });
@@ -234,7 +239,7 @@ describe("wrapToolHandler: no error path carries structuredContent", () => {
       async () => 42,
     ];
     for (const handler of handlers) {
-      const res = await wrapToolHandler(handler)({});
+      const res = await wrapToolHandler(handler, "pg_test")({});
       assert.equal(res.isError, true);
       assert.equal("structuredContent" in res, false, "an error envelope must not carry structuredContent");
       assert.match(res.content[0]!.text, /^Error: /);
@@ -319,7 +324,7 @@ describe("index.ts wrapper shapes a withSharedClient connect throw into an error
     // withSharedClient(...), whose connect rejection bubbles out as a throw.
     // The wrapper's outer catch must convert it to an error content block.
     const handler = async () => withSharedClient(async (run) => run("SELECT version()"));
-    const wrapped = wrapToolHandler(handler as (input: unknown) => Promise<unknown>);
+    const wrapped = wrapToolHandler(handler as (input: unknown) => Promise<unknown>, "pg_test");
 
     // Resolves, not rejects -- if the wrapper let the throw bubble, this await
     // would reject and fail the test. Reaching the assertions proves it

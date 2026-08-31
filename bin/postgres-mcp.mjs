@@ -190,6 +190,20 @@ function sandboxFlags() {
   // getApplicationName() in src/api.ts; PGAPPNAME is pg's own env fallback for
   // the same setting (connection-parameters.js: val('application_name', config,
   // 'PGAPPNAME')), so omitting it would drop a name set the driver's way.
+  //
+  // Most of the PG* names below CANNOT be found by grepping the bundle for
+  // `process.env.PGFOO`, which is why they were missing: pg builds them at
+  // runtime as `process.env['PG' + key.toUpperCase()]`
+  // (connection-parameters.js:15), so PGUSER / PGDATABASE / PGHOST / PGPORT /
+  // PGPASSWORD / PGOPTIONS / PGBINARY / PGCLIENT_ENCODING / PGREPLICATION all
+  // exist only as a computed string. Their absence bites precisely when
+  // DATABASE_URL is not self-contained -- `postgres:///mydb` leaning on PGHOST,
+  // or password-free DSNs leaning on PGPASSWORD -- and it bites in the silent
+  // direction: the var is stripped, pg falls back to its own default, and the
+  // connection fails with something that names neither the sandbox nor the
+  // variable. Only the two spelled literally in pg's source (PGSSLMODE at
+  // connection-parameters.js:26, PGCONNECT_TIMEOUT at :127) plus the explicit
+  // third arguments (PGAPPNAME, PGSSLNEGOTIATION) are greppable.
   // POSTGRES_AUDIT_LOG_FILE is granted as a VARIABLE here, but the sandbox
   // still denies the filesystem, so the file sink cannot actually open its
   // target under POSTGRES_MCP_SANDBOX=1. The audit module fails loudly on an
@@ -197,7 +211,7 @@ function sandboxFlags() {
   // refuses to start -- which is the correct outcome (an audit control that
   // quietly disables itself is worse than none), but it is a surprising one to
   // hit at runtime. Use the stderr sink under the sandbox.
-  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGCONNECT_TIMEOUT","PGSSLMODE","POSTGRES_APPLICATION_NAME","POSTGRES_AUDIT_LOG","POSTGRES_AUDIT_LOG_FILE","POSTGRES_AUDIT_REDACT","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
+  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGBINARY","PGCLIENT_ENCODING","PGCONNECT_TIMEOUT","PGDATABASE","PGHOST","PGOPTIONS","PGPASSWORD","PGPORT","PGREPLICATION","PGSSLMODE","PGSSLNEGOTIATION","PGUSER","POSTGRES_APPLICATION_NAME","POSTGRES_AUDIT_LOG","POSTGRES_AUDIT_LOG_FILE","POSTGRES_AUDIT_REDACT","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
 
   const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];
   return flags;
