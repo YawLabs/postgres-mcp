@@ -12,22 +12,18 @@ Built and maintained by [Yaw Labs](https://yaw.sh).
 
 One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
-## What's new in 0.11.0
+## What's new in 0.12
 
-PostgreSQL 18 support, a new I/O observability tool, and version-gated catalog queries. Full detail in the [CHANGELOG](CHANGELOG.md).
+An index advisor, opt-in audit logging, structured tool output, and support for current-revision MCP clients. Full detail in the [CHANGELOG](CHANGELOG.md).
 
-**Three breaking changes if you are upgrading from 0.10.x:**
+- **`pg_index_advisor`** recommends indexes for a workload and keeps only the ones that measurably lower estimated cost. Candidates are costed with HypoPG hypothetical indexes, never created on disk, and the search knows that PostgreSQL 18's skip scan changes which multi-column indexes are useful.
+- **Opt-in audit logging** of the SQL tools send: one JSON line per audited statement, to stderr or a file. Bound parameter values are never recorded. Off by default, and not a complete record -- see [Audit logging](#audit-logging).
+- **Structured tool output.** Every tool declares an `outputSchema` and returns `structuredContent` alongside the unchanged text block, so anything reading the text today keeps working.
+- **Both MCP protocol eras.** The server used to speak only the legacy (2025) protocol revisions, which a client on the current 2026-07-28 revision fails against. It now serves both.
 
-1. **`pg_seq_scan_tables`, `pg_unused_indexes` and `pg_top_queries` return an envelope, not a bare row array.** Read `data.rows` where you used to read `data`. The envelope carries `stats_reset`, because a cumulative scan count means nothing without knowing when the counters were last reset -- if that happened an hour ago, every index looks unused, which is how a load-bearing index gets dropped.
-2. **`pg_explain` with `analyze: true` now emits `BUFFERS`**, matching what PostgreSQL 18 does server-side. Plans get longer; pass `buffers: false` for the old output.
-3. **Node 22 is the floor.** Node 20 reached end of life.
+**On 0.12.0? Upgrade.** 0.12.1 closes a stacked-query hole in `pg_index_advisor`: SQL passed in its `statements` argument ran on a protocol that accepts several commands in one string, so `SELECT 1; COMMIT; DROP SCHEMA public CASCADE;` escaped the read-only transaction. The tool is annotated read-only, so hosts often auto-allow it. The same release stops `pg_inspect_locks` attributing a lock held in another database to whichever local table shares its OID, fixes the advisor's greedy search, and makes audit lines carry the `tool` field they were missing.
 
-**Worth knowing even if you are not upgrading yet:**
-
-- `pg_describe_table` now flags generated and identity columns. Previously a generated column's expression surfaced as `default_value` with nothing marking it, so an agent read the column as optional-with-a-default and wrote an `INSERT` that PostgreSQL rejects.
-- New `pg_io_stats` exposes `pg_stat_io` (PG16+) plus in-flight async I/O from `pg_aios` and the active `io_method` (PG18+).
-- `pg_advisor` checks multixact wraparound alongside transaction-ID wraparound. A lock-heavy workload can exhaust multixacts while `relfrozenxid` still looks healthy.
-- Every version-dependent column is gated on `server_version_num`, so older servers get a thinner answer rather than an error.
+**Coming from 0.10.x?** 0.11.0 has three breaking changes: `pg_seq_scan_tables`, `pg_unused_indexes` and `pg_top_queries` return an envelope (read `data.rows` where you used to read `data`), `pg_explain` with `analyze: true` emits `BUFFERS` (pass `buffers: false` for the old output), and Node 22 is the floor. Details in the [0.11.0 changelog entry](CHANGELOG.md#0110---2026-08-23).
 
 ## Backstory
 
@@ -141,7 +137,7 @@ GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO mcp_writer;
 
 Set `ALLOW_WRITES=1` so `pg_query` will issue writes, and rely on the role to keep the agent away from DDL and other schemas.
 
-**Per-tool gating in the host:**
+<a id="per-tool-gating-in-the-host"></a>**Per-tool gating in the host:**
 
 Tools split cleanly across two authority classes:
 
@@ -219,8 +215,12 @@ All env vars are read from the MCP server's environment:
 | `POSTGRES_POOL_MAX` | `5` | Max pool connections. Set to `1` for single-threaded backends (pglite-socket, PgBouncer transaction mode). |
 | `POSTGRES_SSL_REJECT_UNAUTHORIZED` | unset | Set to `false` to skip TLS cert verification (for managed DBs using private-CA certs). Connection is still encrypted. |
 | `POSTGRES_APPLICATION_NAME` | `postgres-mcp` | Value reported in `pg_stat_activity.application_name`, so agent traffic is identifiable to whoever is watching the database. An `application_name` in `DATABASE_URL` takes precedence over this. |
+| `POSTGRES_AUDIT_LOG` | unset (off) | `1`, `true` or `stderr` turns on the audit log, one JSON line per audited statement, written to stderr unless `POSTGRES_AUDIT_LOG_FILE` is also set. `0`, `false` or `off` is the explicit off. Case-insensitive; an empty value counts as unset. Any other value stops the server at startup. See [Audit logging](#audit-logging). |
+| `POSTGRES_AUDIT_LOG_FILE` | unset | Append the audit lines to this file instead of stderr. Setting it alone turns auditing on. The server refuses to start if the value is empty, if the file cannot be opened, or if `POSTGRES_AUDIT_LOG` is explicitly off. |
+| `POSTGRES_AUDIT_REDACT` | unset (off) | `1` or `true` logs each statement's first keyword plus a SHA-256 of its text instead of the SQL. `0`, `false` or `off` is the explicit off; an empty value counts as unset, so full SQL is logged. Does not turn auditing on by itself. Any other value stops the server at startup, even with auditing off. |
 | `POSTGRES_MCP_RUNTIME` | `auto` | Which JS runtime executes the server: `auto` (prefer [oam](https://oamjs.org), fall back to Node), `oam` (require oam, fail if absent), `node` (never use oam). See [Runtime](#runtime). |
 | `OAM_BIN` | unset | Explicit path to an `oam` binary, checked before PATH and the default install locations. |
+| `POSTGRES_MCP_SANDBOX` | unset | Exactly `1` runs the server under oam's `--permission` sandbox: filesystem and child processes denied, network limited to the host and port in `DATABASE_URL` (port `5432` if the URL names none). If `DATABASE_URL` names no host (e.g. `postgres:///db` with `PGHOST`), lists several hosts, or cannot be parsed, the network grant is left open. Any other value is ignored without a warning. It has no effect unless the server really runs under oam, and a fallback to Node does not mention it, so pair it with `POSTGRES_MCP_RUNTIME=oam`, which exits instead of falling back. The launcher accepts oam 0.9.0+, but use a current oam: per oam's changelog, `--permission` did not cover all of `fs` and `child_process` until 0.9.1, and the port grant was not exact until 0.15.0. The file audit sink cannot open under the sandbox; use the stderr sink. |
 
 ### Supported Postgres versions
 
@@ -244,7 +244,7 @@ The published `postgres-mcp` command is a small launcher that prefers the [oam](
 
 **If you do not have oam, nothing changes.** The fallback is not a re-exec: npm already started Node to run the launcher, so falling back is a plain `import()` of the server into that same process. It costs a few `existsSync` calls and no subprocess, and behaves identically to running `dist/index.js` under Node directly.
 
-**If you do have oam,** the server runs under it. Verified equivalent on both runtimes: all 22 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
+**If you do have oam,** the server runs under it. Verified equivalent on both runtimes: all 23 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
 
 **Startup cost, measured.** windows-arm64, 1.4 MB bundle, `postgres-mcp version` (full module init), every binary warmed first, mean of 12 runs:
 
@@ -304,6 +304,58 @@ postgres://user:pass@host:5432/db?sslmode=require&sslnegotiation=direct
 
 It is opt-in rather than a default because a PG16-or-older server will reject the connection outright, and the saving is one round trip per pooled connection -- worth it on a distant managed database, invisible on a local one.
 
+### Audit logging
+
+Off by default. Turn it on in the `env` block with `POSTGRES_AUDIT_LOG=stderr`, or with `POSTGRES_AUDIT_LOG_FILE` alone:
+
+```json
+"env": {
+  "DATABASE_URL": "postgres://...",
+  "POSTGRES_AUDIT_LOG_FILE": "/var/log/postgres-mcp/audit.jsonl"
+}
+```
+
+The server then writes one JSON line per audited statement. Two captured from PostgreSQL 17 -- a parameterized query, then a failing one:
+
+```json
+{"ts":"2026-09-12T19:26:42.587Z","tool":"pg_query","source":"user","sql":"SELECT $1::int AS n","params":1,"ms":2.827,"rows":1,"ok":true}
+{"ts":"2026-09-12T19:26:42.591Z","tool":"pg_readonly","source":"user","sql":"SELECT * FROM does_not_exist_xyz","params":0,"ms":2.217,"rows":null,"ok":false,"sqlstate":"42P01"}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `ts` | ISO 8601 time the line was written, just after the statement finished. |
+| `tool` | The MCP tool that issued the statement. Absent only when the server's query functions are called outside a tool handler, e.g. when embedding it in-process. |
+| `source` | `user` for SQL passed to `pg_query`, `pg_readonly` or `pg_explain`. `internal` for everything else: the server's own catalog queries (one `pg_describe_table` call writes several), and every statement `pg_index_advisor` runs -- including workload SQL passed in its `statements`. Filtering on `user` does not show all agent-supplied SQL. |
+| `sql` | The statement text as sent. For `pg_explain` that is the composed statement: `EXPLAIN SELECT ...`, or `EXPLAIN (ANALYZE, BUFFERS) SELECT ...` with options. |
+| `sqlKeyword`, `sqlSha256` | Replace `sql` when `POSTGRES_AUDIT_REDACT` is on: the first run of letters after any leading whitespace or `(`, uppercased (`UNKNOWN` when anything else comes first, such as a comment), and a hex SHA-256 of the full text. The keyword is the first word, not the effect: a CTE that deletes logs `WITH`, and every `pg_explain` line logs `EXPLAIN`. |
+| `params` | How many bound parameters were passed. The count, never the values. |
+| `ms` | Wall-clock milliseconds for the audited step, not server execution time. `user` lines include the row-cap cursor's round trips; `internal` lines can include waiting for a pool connection or behind the same call's other catalog queries. |
+| `rows` | `null` on failure. Otherwise the count postgres reported, or the rows returned when it reports none (`SET` logs `0`). A capped `SELECT` reports at most `POSTGRES_MAX_ROWS` + 1, the extra row being how truncation is detected; statements that cannot use the cursor (`EXPLAIN`, `SHOW`, `... RETURNING`) report their full count even when the response is truncated. |
+| `ok` | Whether the statement ran. For agent SQL it does not mean it committed: the `COMMIT` that follows is not logged, so a write whose commit fails still reads `true`. |
+| `sqlstate` | Only when `ok` is `false` and the error carries a code. Usually a five-character SQLSTATE such as `42P01`, but a failed connection can record a Node error code instead (`ECONNREFUSED`, `ENOTFOUND`), and a connect timeout records none. |
+
+**Never logged, in any mode:** bound parameter values (only their count) and error messages (only the code), since postgres quotes offending values back in its messages. Statement text is logged as written, so pass sensitive literals as `params` to `pg_query`, `pg_readonly` or `pg_explain`. `pg_index_advisor` takes no `params`; write `$1`-style placeholders in its `statements` instead (planned with `GENERIC_PLAN`, PostgreSQL 16+).
+
+**Values are parsed strictly.** A value outside the accepted sets in the [Configuration](#configuration) table -- `yes`, `on`, `hash` -- stops the server at startup instead of reading as off, even for `POSTGRES_AUDIT_REDACT` with auditing off. An audit control that quietly disabled itself would be worse than none. Case and surrounding whitespace are ignored, and an empty `POSTGRES_AUDIT_LOG` or `POSTGRES_AUDIT_REDACT` counts as unset -- so check that a variable your MCP client expands really has a value.
+
+**The file sink.** `POSTGRES_AUDIT_LOG_FILE` alone turns auditing on, and it wins over `POSTGRES_AUDIT_LOG=stderr` without a warning when both are set. Unlike the other two variables, an empty or whitespace-only value is an error, not unset. The path must name a file in an existing directory: the file is created if missing, opened for append at startup, and held open for the life of the process. Use an absolute path; a relative one resolves against whatever directory your MCP client launches the server from. A write that fails later (full disk) never fails the query: one warning goes to stderr and later lines keep trying.
+
+**On stderr,** audit lines are mixed with the startup banner and warnings, so skip lines that are not JSON; the file sink holds only audit lines. stdout is never used -- it is the MCP protocol channel.
+
+**Redaction hides text, not guesses.** Identical statements hash identically, so you can still count and correlate them -- and for the same reason, anyone holding the log can confirm a guessed statement, so a short literal inside a predictable query is recoverable. Bound parameters are the safe place for sensitive values.
+
+**Under `POSTGRES_MCP_SANDBOX=1`** the sandbox denies the filesystem, so the file sink cannot open and the server exits at startup (`could not be opened for append: Access to this API has been restricted`). Use `POSTGRES_AUDIT_LOG=stderr` there; all three audit variables pass through the sandbox.
+
+**What the trail does not show.**
+
+- **`pg_kill` writes no line.** Its `pg_cancel_backend` / `pg_terminate_backend` call bypasses the audit path. If it cancelled one of this server's own statements, that statement's line reads `ok: false` (`sqlstate` `57014`), with nothing tying it to `pg_kill`.
+- The scaffolding around agent SQL (`BEGIN READ ONLY`, the row-cap savepoint and cursor, the closing `COMMIT` / `ROLLBACK`), the server-version probe, the `pg_type` lookup behind `dataTypeName`, and the `hypopg_create_index` / `hypopg_reset` calls behind `pg_explain`'s `hypothetical_indexes`. `pg_index_advisor` is the exception: apart from the version probe, everything it sends is logged, including its transaction control and the `EXPLAIN` of each workload statement.
+- Usually, a call that never gets a database connection. Tools that start with a single catalog query (the `pg_list_*` tools, `pg_search_columns`, `pg_inspect_locks`, `pg_table_privileges`, `pg_table_bloat`, `pg_top_queries`, `pg_index_advisor`, and `pg_explain` with `hypothetical_indexes`) log the failed attempt as `ok: false`; every other tool writes nothing.
+- A `pg_explain` call whose hypothetical index cannot be created never runs its statement, so its only line is the `ok: true` check that HypoPG is installed.
+
+PostgreSQL's own logging is the complete server-side record: `log_statement = 'all'` records every statement that reaches execution, and `log_min_error_statement`, at its default `error`, adds statements that fail earlier. It also records exactly what this trail keeps out -- bound parameter values and full error messages.
+
 ## Troubleshooting
 
 **`DATABASE_URL is not set`** - Your MCP client is launching the server without the env var. On Windows especially, env vars set in bash / PowerShell profiles are not inherited by MCP servers launched via `cmd`. Put `DATABASE_URL` directly in the `env` block of `.mcp.json`.
@@ -315,6 +367,8 @@ It is opt-in rather than a default because a PG16-or-older server will reject th
 **`canceling statement due to statement timeout`** - A single query exceeded `POSTGRES_STATEMENT_TIMEOUT_MS` (default 30s). Increase it, narrow the query with `WHERE`, or add an index. This is working as designed -- the timeout exists so a runaway query cannot hang the agent.
 
 **`Write blocked: this server is in read-only mode`** - You asked the agent to write via `pg_query` but `ALLOW_WRITES` is not set. Either add `ALLOW_WRITES=1` to the `env` block of `.mcp.json` and restart your MCP client (dev/test DBs), or - cleaner for production - use a role with `INSERT/UPDATE/DELETE` grants in `DATABASE_URL` and keep `ALLOW_WRITES` unset. See [Configuring access](#configuring-access). Note that `pg_readonly` always rejects writes; if you want writes, the call has to go through `pg_query`.
+
+**`Error: [postgres-mcp] POSTGRES_AUDIT_...` or `Error: [postgres-mcp] audit log file ... could not be opened for append` at startup** - An audit variable is misconfigured, and the server exits with a stack trace rather than guess. The `Error:` line says which case you hit: an unrecognized value (it lists the accepted ones), an empty `POSTGRES_AUDIT_LOG_FILE`, a file set while `POSTGRES_AUDIT_LOG` is off, or the OS error from opening the file -- `ENOENT` usually means its directory does not exist, and `Access to this API has been restricted` means `POSTGRES_MCP_SANDBOX=1`. See [Audit logging](#audit-logging).
 
 **Connection pool exhaustion with PgBouncer transaction mode or pglite-socket** - These backends don't support concurrent queries on a single connection. Set `POSTGRES_POOL_MAX=1` in the env block.
 
