@@ -106,11 +106,29 @@ release_exit_banner() {
 trap 'RELEASE_STATUS=$?; if [ "$RELEASE_STATUS" -ne 0 ]; then release_exit_banner "$RELEASE_STATUS"; fi; exit $RELEASE_STATUS' EXIT
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
-# no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
-# segfaults on exit-cleanup (platform-windows.md). NOTE: this repo has no CI
-# lint gate (release.yml was dropped when registry publish moved into this
-# script), so with SKIP_LINT=1 lint runs NOWHERE for this release -- run
-# `npx biome check src/` on a working runner before tagging.
+# no-ops.
+#
+# THIS SHOULD NOW BE UNNECESSARY, and reaching for it is a signal something
+# regressed. `npm run lint` routes through scripts/lint.mjs, which picks a
+# biome binary that works on the host -- on Windows ARM64 it provisions the x64
+# build of the version the LOCKFILE installs and runs it under emulation rather
+# than trusting whichever arm64 build npm resolved. Verified: `npm run lint`
+# exits 0 on that host.
+#
+# The earlier text here blamed "the MINGW64-ARM64 npm-run-script wrapper". That
+# was wrong: `npm run` is fine on that host, and the crash comes from the arm64
+# biome executable of the affected version itself, reproducible by invoking
+# that binary directly with no npm in the picture. Measured here: arm64 2.5.4
+# exits 139 on this repo's src/, while 2.4.16, 2.5.13 and the 2.5.1 the
+# lockfile installs all run correctly -- so the crash is per-build, and the
+# native path is healthy only by accident of which build npm resolved.
+#
+# The no-CI warning below remains correct: there is no .github directory, so no
+# CI lint gate exists and with SKIP_LINT=1 lint runs NOWHERE for this release.
+#
+# So: only set SKIP_LINT=1 if scripts/lint.mjs cannot produce a result at all,
+# and treat that as a bug to fix rather than a step to routinely skip. Without
+# it, step 1 fails the release on ANY non-zero lint exit, a crash included.
 if [ "${SKIP_LINT:-}" = "1" ]; then
   warn "SKIP_LINT=1 -- lint will not run anywhere this release (no CI lint gate exists); run 'npx biome check src/' on a working runner before tagging"
   npm() {

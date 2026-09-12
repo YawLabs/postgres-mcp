@@ -44,8 +44,8 @@
     "test": "npm run build && node scripts/run-tests.mjs dist",
     "test:ci": "npm run test",
     "test:integration": "npm run build && node scripts/run-tests.mjs dist --integration",
-    "lint": "biome check src/",
-    "lint:fix": "biome check --write src/",
+    "lint": "node scripts/lint.mjs check src/",
+    "lint:fix": "node scripts/lint.mjs check --write src/",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
