@@ -44,12 +44,19 @@
  * no `oam --version` probe, no second oam. OAM_BIN is a discovery input, so it
  * is not consulted on that path: the host has already chosen which oam runs.
  *
- * Two cases still spawn, deliberately. POSTGRES_MCP_SANDBOX=1, because
- * `--permission` is a process-level flag that only a FRESH oam can apply --
- * serving in-process there would drop the sandbox, and with it the net grant
- * pinned to DATABASE_URL, without a word: a security downgrade dressed up as an
- * optimisation. And a host oam below the floor, which takes the discovery path
- * exactly as it always did.
+ * Two cases take the discovery path instead, deliberately.
+ * POSTGRES_MCP_SANDBOX=1, because `--permission` is a process-level flag that
+ * only a FRESH oam can apply -- choosing to serve in-process there would drop the sandbox, and with
+ * it the net grant pinned to DATABASE_URL, without a word: a security downgrade
+ * dressed up as an optimisation. And a host oam below the floor, which takes
+ * the discovery path exactly as it always did.
+ *
+ * The discovery path does NOT guarantee a fresh oam, sandboxed or otherwise.
+ * Discovery can still fail -- no runnable binary, one below the floor, or a
+ * spawn that errors -- and under POSTGRES_MCP_RUNTIME=auto (the default) the
+ * existing fallback then imports the server into THIS process WITHOUT
+ * `--permission`, and nothing it prints says the sandbox was dropped. Only
+ * POSTGRES_MCP_RUNTIME=oam turns those failures into a hard exit.
  *
  * THE `--permission` SANDBOX (oam 0.9.0+, opt-in)
  * `POSTGRES_MCP_SANDBOX=1` runs the server under oam's permission model.
@@ -188,9 +195,9 @@ function atLeast(v, min) {
  * `hostOam` is `process.versions.oam`: oam's own key, absent on Node, so on
  * Node every mode but `node` is the discovery path it always was. `sandbox`
  * is whether a spawn would carry flags only a fresh oam can apply; see ALREADY
- * RUNNING ON OAM above for why that alone forces the spawn. The floor is
- * OAM_MIN itself, not a parameter, so a host oam and a discovered one can never
- * be held to different minimums.
+ * RUNNING ON OAM above for why that alone forces discovery, and why discovery
+ * can still end in-process. The floor is OAM_MIN itself, not a parameter, so a
+ * host oam and a discovered one can never be held to different minimums.
  *
  * Pure on purpose: every input is passed in, so the whole decision is testable
  * without booting a runtime.
