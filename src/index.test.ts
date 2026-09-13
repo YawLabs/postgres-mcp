@@ -931,14 +931,21 @@ const PACKAGE_VERSION = (
  *
  * The selection variables are deleted so a POSTGRES_MCP_* exported by the
  * developer's shell cannot change what is being asserted.
+ *
+ * `extraPreload` is appended to the same preload module, for a test that has to
+ * change something else about the launcher's process before it runs.
  */
-function runAsHost(hostOam: string | undefined, overlay: Record<string, string | undefined> = {}): Promise<RunResult> {
+function runAsHost(
+  hostOam: string | undefined,
+  overlay: Record<string, string | undefined> = {},
+  extraPreload = "",
+): Promise<RunResult> {
   const exitMarker = `import { writeSync } from "node:fs"; process.on("exit", () => { try { writeSync(2, "LAUNCHER_ARGV1=" + process.argv[1] + "\\n"); } catch {} });`;
   const posing =
     hostOam === undefined
       ? ""
       : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`;
-  const nodeArgs = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}`)}`];
+  const nodeArgs = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}${extraPreload}`)}`];
   return runLauncher(
     ["version"],
     { POSTGRES_MCP_RUNTIME: undefined, POSTGRES_MCP_SANDBOX: undefined, OAM_BIN: process.execPath, ...overlay },
@@ -1029,6 +1036,33 @@ describe("launcher: no usable oam", () => {
     assert.equal(strict.code, 1, JSON.stringify(strict));
     assert.equal(strict.stdout, "");
     assert.match(strict.stderr, /no usable oam \(0\.15\.2 or newer\) was found/);
+  });
+
+  it("still falls back when the chosen oam fails to spawn on an oam host", async () => {
+    // The chosen binary passed its --version probe and then could not be
+    // spawned (deleted or replaced in between). A failed spawn emits 'error'
+    // and then 'close' with the negative errno, and on an oam host the launcher
+    // waits for 'close' -- so an unguarded close handler exited the launcher
+    // mid-fallback and nothing served. The preload makes the FIRST spawn target
+    // a path that does not exist; the Node fallback spawns normally.
+    const failFirstSpawn = [
+      'import childProcess from "node:child_process";',
+      'import { syncBuiltinESMExports } from "node:module";',
+      "const realSpawn = childProcess.spawn;",
+      "let failed = false;",
+      "childProcess.spawn = function (cmd, args, opts) {",
+      "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+      "  failed = true;",
+      '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+      "};",
+      "syncBuiltinESMExports();",
+    ].join("\n");
+    const run = await runAsHost("0.9.0", noOamAnywhere({ OAM_BIN: process.execPath }), failFirstSpawn);
+    assert.equal(run.code, 0, JSON.stringify(run));
+    assert.equal(run.stdout.trim(), PACKAGE_VERSION, "the Node fallback must still serve");
+    assert.match(run.stderr, /failed to launch oam at .*using Node instead/);
+    // Served by the Node child the fallback handed off to, not in this process.
+    assert.match(run.stderr, HANDED_OFF_MARK);
   });
 });
 

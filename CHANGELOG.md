@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there is neither -- with or without `POSTGRES_MCP_SANDBOX=1`. Any spawn from
   an oam host pipes stdio, because an oam before 0.9.0 treats `inherit` as
   `pipe` and the MCP handshake never answers.
+- **A chosen oam that fails to spawn still falls back.** When the oam passed
+  its version check but could not be started (deleted or replaced in between),
+  the failed child still emits `close`, and an oam host waits for `close` --
+  so without a guard the launcher would exit in the middle of the fallback and
+  serve nothing. The exit mirror, the stdio pipes and signal forwarding now
+  all wait for the child's `spawn` event, which also keeps an in-process
+  fallback from inheriting signal handlers meant for a child that never ran.
 - **A bad `OAM_BIN` is reported instead of silently ignored.** A path that does
   not exist, an oam below the floor, or a binary that will not run is named on
   stderr, and discovery carries on instead of dropping straight to Node.
