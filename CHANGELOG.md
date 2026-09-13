@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Audit logging is documented in the README.** `POSTGRES_AUDIT_LOG`,
+  `POSTGRES_AUDIT_LOG_FILE` and `POSTGRES_AUDIT_REDACT` shipped in 0.12.0 with
+  no user-facing documentation outside this file. The Configuration table now
+  lists them, and a new section covers the line format, what is never logged,
+  the strict value parsing, the file sink, the sandbox caveat, and which
+  statements the trail does not show -- notably `pg_kill`, which writes no
+  line. Every field and edge case was checked against a running server,
+  including PostgreSQL 17.
+- **`POSTGRES_MCP_SANDBOX` is documented**, with its sharp edges: only the
+  exact value `1` enables it, it does nothing unless the server really runs
+  under oam, and the network grant is left open when `DATABASE_URL` names no
+  single host.
+- The "What's new" section describes 0.12 instead of 0.11.0, the Runtime
+  section counts 23 tools rather than 22, and the two links to
+  "Per-tool gating in the host" resolve again.
+
+## [0.12.2] - 2026-09-12
+
+No runtime changes.
+
+### Changed
+
+- The npm package description, keywords and homepage are sharper, lint runs
+  biome through the version the lockfile installs, and the README has an X
+  follow badge.
+
 ## [0.12.1] - 2026-08-31
 
 ### Security
