@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The launcher always uses the newest oam, and the minimum is now the latest
+  release, 0.15.2.** It used to take the FIRST oam binary it found and only
+  then check its version, so a stale copy hid a current one. Every oam binary
+  it can see -- the installed locations, then `PATH` -- is now asked for its
+  version, and the newest at or above 0.15.2 wins; a tie keeps the installed
+  copy.
+- **An oam host older than the floor no longer serves the server itself.**
+  When a client ran `oam run bin/postgres-mcp.mjs` with an old oam and no
+  usable one was found, the server ran on that old oam. It now hands off to
+  the newest usable oam, or to Node on `PATH`, or exits with an error when
+  there is neither -- with or without `POSTGRES_MCP_SANDBOX=1`. Any spawn from
+  an oam host pipes stdio, because an oam before 0.9.0 treats `inherit` as
+  `pipe` and the MCP handshake never answers.
+- **A chosen oam that fails to spawn still falls back.** When the oam passed
+  its version check but could not be started (deleted or replaced in between),
+  the failed child still emits `close`, and an oam host waits for `close` --
+  so without a guard the launcher would exit in the middle of the fallback and
+  serve nothing. The exit mirror, the stdio pipes and signal forwarding now
+  all wait for the child's `spawn` event, which also keeps an in-process
+  fallback from inheriting signal handlers meant for a child that never ran.
+- **A bad `OAM_BIN` is reported instead of silently ignored.** A path that does
+  not exist, an oam below the floor, or a binary that will not run is named on
+  stderr, and discovery carries on instead of dropping straight to Node.
+- **`POSTGRES_MCP_RUNTIME=node` now always means Node.** Launched under
+  `oam run`, it hands off to Node on `PATH` rather than staying on oam.
+- Each `oam --version` probe is bounded at 5s, so a wedged binary on `PATH`
+  cannot hang the launch.
+
+`POSTGRES_MCP_SANDBOX=1` still forces a freshly launched oam on a supported oam
+host, and when none is usable under `POSTGRES_MCP_RUNTIME=auto` the server
+still runs without the sandbox, in the host oam itself, as before.
+
 ## [0.12.3] - 2026-09-12
 
 ### Fixed
