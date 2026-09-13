@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The launcher no longer starts a second, nested oam when a host already runs
+  it on oam.** A host that resolves the package's `bin` and launches
+  `oam run bin/postgres-mcp.mjs` -- Yaw MCP does -- paid for two runtime boots
+  per server: the launcher discovered an oam binary and spawned it without
+  checking what it was already running on, measured on Windows as `oam.exe`
+  with a nested `oam.exe` + `conhost.exe` underneath. When `process.versions.oam`
+  clears the same 0.9.0 floor a discovered binary must, the server is now
+  imported into the running process, with no discovery, no `oam --version`
+  probe, and `OAM_BIN` not consulted. `POSTGRES_MCP_SANDBOX=1` still goes
+  through discovery, because `--permission` only applies to a freshly launched
+  oam -- but, as before, if discovery fails under the default
+  `POSTGRES_MCP_RUNTIME=auto`, the fallback serves in-process without the
+  sandbox. A host oam below the floor takes the discovery path as it always did.
+
 ### Documentation
 
 - **Audit logging is documented in the README.** `POSTGRES_AUDIT_LOG`,
