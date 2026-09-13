@@ -218,9 +218,9 @@ All env vars are read from the MCP server's environment:
 | `POSTGRES_AUDIT_LOG` | unset (off) | `1`, `true` or `stderr` turns on the audit log, one JSON line per audited statement, written to stderr unless `POSTGRES_AUDIT_LOG_FILE` is also set. `0`, `false` or `off` is the explicit off. Case-insensitive; an empty value counts as unset. Any other value stops the server at startup. See [Audit logging](#audit-logging). |
 | `POSTGRES_AUDIT_LOG_FILE` | unset | Append the audit lines to this file instead of stderr. Setting it alone turns auditing on. The server refuses to start if the value is empty, if the file cannot be opened, or if `POSTGRES_AUDIT_LOG` is explicitly off. |
 | `POSTGRES_AUDIT_REDACT` | unset (off) | `1` or `true` logs each statement's first keyword plus a SHA-256 of its text instead of the SQL. `0`, `false` or `off` is the explicit off; an empty value counts as unset, so full SQL is logged. Does not turn auditing on by itself. Any other value stops the server at startup, even with auditing off. |
-| `POSTGRES_MCP_RUNTIME` | `auto` | Which JS runtime executes the server: `auto` (prefer [oam](https://oamjs.org), fall back to Node), `oam` (require oam, fail if absent), `node` (never use oam). See [Runtime](#runtime). |
-| `OAM_BIN` | unset | Explicit path to an `oam` binary, checked before PATH and the default install locations. |
-| `POSTGRES_MCP_SANDBOX` | unset | Exactly `1` runs the server under oam's `--permission` sandbox: filesystem and child processes denied, network limited to the host and port in `DATABASE_URL` (port `5432` if the URL names none). If `DATABASE_URL` names no host (e.g. `postgres:///db` with `PGHOST`), lists several hosts, or cannot be parsed, the network grant is left open. Any other value is ignored without a warning. It has no effect unless the server really runs under oam, and a fallback to Node does not mention it, so pair it with `POSTGRES_MCP_RUNTIME=oam`, which exits instead of falling back. The launcher accepts oam 0.9.0+, but use a current oam: per oam's changelog, `--permission` did not cover all of `fs` and `child_process` until 0.9.1, and the port grant was not exact until 0.15.0. The file audit sink cannot open under the sandbox; use the stderr sink. |
+| `POSTGRES_MCP_RUNTIME` | `auto` | Which JS runtime executes the server: `auto` (the newest [oam](https://oamjs.org) at 0.15.2 or newer, else Node), `oam` (the same, but exit with an error instead of falling back to Node), `node` (always Node -- launched with `oam run`, it hands off to Node on `PATH`). Case-insensitive; any other value behaves like `auto`. See [Runtime](#runtime). |
+| `OAM_BIN` | unset | Path to an `oam` binary to use in preference to discovery, when it is 0.15.2 or newer. If it does not exist, is older, or will not run, the launcher says so on stderr and carries on with discovery. |
+| `POSTGRES_MCP_SANDBOX` | unset | Exactly `1` runs the server under oam's `--permission` sandbox: filesystem and child processes denied, network limited to the host and port in `DATABASE_URL` (port `5432` if the URL names none). If `DATABASE_URL` names no host (e.g. `postgres:///db` with `PGHOST`), lists several hosts, or cannot be parsed, the network grant is left open. Any other value is ignored without a warning. It has no effect unless the server really runs under a freshly launched oam, and a fallback that runs without it does not say so, so pair it with `POSTGRES_MCP_RUNTIME=oam`, which exits instead of falling back. The launcher only runs oam 0.15.2 or newer; per oam's changelog, `--permission` did not cover all of `fs` and `child_process` until 0.9.1, and the port grant was not exact until 0.15.0. The file audit sink cannot open under the sandbox; use the stderr sink. |
 
 ### Supported Postgres versions
 
@@ -240,11 +240,13 @@ If the version probe fails, the server assumes the oldest supported shape rather
 
 ### Runtime
 
-The published `postgres-mcp` command is a small launcher that prefers the [oam](https://oamjs.org) runtime and falls back to Node.
+The published `postgres-mcp` command is a small launcher that prefers the newest [oam](https://oamjs.org) runtime it can find and falls back to Node.
 
 **If you do not have oam, nothing changes.** The fallback is not a re-exec: npm already started Node to run the launcher, so falling back is a plain `import()` of the server into that same process. It costs a few `existsSync` calls and no subprocess, and behaves identically to running `dist/index.js` under Node directly.
 
-**If you do have oam,** the server runs under it. Verified equivalent on both runtimes: all 23 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
+**Which oam.** Only oam 0.15.2 or newer -- the latest release -- is used. The launcher looks in the installed locations (`%LOCALAPPDATA%\oam\bin` then `~/.oam/bin` on Windows, `~/.oam/bin` elsewhere) and on `PATH`, asks every `oam` it finds for its version, and runs the newest; on a tie the installed copy wins. An older oam is passed over with a note on stderr. On Windows only `oam.exe` counts; an `oam.cmd` / `oam.bat` shim is named on stderr but never run. When a host launches the command with `oam run` on oam 0.15.2 or newer, the server runs inside that oam with no second one -- except under `POSTGRES_MCP_SANDBOX=1`, which needs a freshly launched oam. A host oam older than 0.15.2 never serves the server itself: it hands off to the newest usable oam, else to Node on `PATH`, else exits with an error.
+
+**If you do have a usable oam,** the server runs under it. Verified equivalent on both runtimes: all 23 tools register, queries return identical rows and `dataTypeName` values, and the error paths match. oam supplies every `node:` builtin the driver needs, including `net`, `tls`, `crypto`, and `dns` (SCRAM auth and the extended query protocol both work).
 
 **Startup cost, measured.** windows-arm64, 1.4 MB bundle, `postgres-mcp version` (full module init), every binary warmed first, mean of 12 runs:
 
@@ -256,7 +258,7 @@ The published `postgres-mcp` command is a small launcher that prefers the [oam](
 | launcher -> Node (in-process) | 370ms |
 | launcher -> oam (spawn) | 409ms |
 
-oam starts **faster** than Node here. What the launcher costs is the *spawn*: reaching oam means Node has already booted, and that hop (~100ms) is larger than oam's ~52ms advantage. So through the npm `bin`, the two land within ~40ms of each other, and `POSTGRES_MCP_RUNTIME=node` is a marginal win rather than a meaningful one.
+oam starts **faster** than Node here. What the launcher costs is the *spawn*: reaching oam means Node has already booted, and that hop (~100ms) is larger than oam's ~52ms advantage. So through the npm `bin`, the two land within ~40ms of each other, and `POSTGRES_MCP_RUNTIME=node` is a marginal win rather than a meaningful one. Those figures were taken with one oam on the machine: the launcher now runs `--version` on every oam binary it finds, so each extra copy adds a probe.
 
 Either way it is a **one-time cost per MCP session**, not per tool call -- hosts spawn the server once and hold it open. If startup genuinely matters, the standalone binary avoids the launcher entirely and is the fastest option.
 
