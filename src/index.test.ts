@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -560,15 +560,26 @@ describe("CLI: audit attribution", () => {
 
 const LAUNCHER = fileURLToPath(new URL("../bin/postgres-mcp.mjs", import.meta.url));
 
-/** Run the launcher with an env overlay. `undefined` deletes a key. */
-function runLauncher(args: string[], overlay: Record<string, string | undefined>): Promise<RunResult> {
+/**
+ * Run the launcher with an env overlay. `undefined` deletes a key.
+ *
+ * `nodeArgs` go to the Node running the launcher, BEFORE the launcher path --
+ * the "already hosted on oam" tests use it to preload a `process.versions.oam`.
+ * `timeoutMs` is a hang detector only; the discovery path boots up to three Node
+ * processes, which can outrun the default on a contended Windows box.
+ */
+function runLauncher(
+  args: string[],
+  overlay: Record<string, string | undefined>,
+  { nodeArgs = [], timeoutMs = 30_000 }: { nodeArgs?: string[]; timeoutMs?: number } = {},
+): Promise<RunResult> {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const [k, v] of Object.entries(overlay)) {
     if (v === undefined) delete env[k];
     else env[k] = v;
   }
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [LAUNCHER, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [...nodeArgs, LAUNCHER, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => {
@@ -580,8 +591,8 @@ function runLauncher(args: string[], overlay: Record<string, string | undefined>
     child.on("error", reject);
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error(`launcher did not exit within 30s for ${JSON.stringify(args)}`));
-    }, 30_000);
+      reject(new Error(`launcher did not exit within ${timeoutMs / 1000}s for ${JSON.stringify(args)}`));
+    }, timeoutMs);
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, stdout, stderr });
@@ -675,6 +686,181 @@ describe("launcher: oam path", () => {
     const viaOam = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "oam", OAM_BIN: oamBin as string });
     const viaNode = await runLauncher(["version"], { POSTGRES_MCP_RUNTIME: "node", OAM_BIN: undefined });
     assert.equal(viaOam.stdout, viaNode.stdout, "the two runtimes must not disagree about the version string");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// launcher: already hosted on oam.
+//
+// A host that resolves the package `bin` and launches `oam run
+// bin/postgres-mcp.mjs` (Yaw MCP does, and so does oam's sidecar regression
+// matrix) used to get a SECOND, nested oam: the launcher discovered and spawned
+// one without asking what it was already running on.
+// ─────────────────────────────────────────────────────────────────────────
+
+type Plan = "in-process" | "discover";
+type RuntimePlan = (ctx: { mode: string; hostOam: string | undefined; sandbox: boolean }) => Plan;
+
+/**
+ * Evaluate the REAL `runtimePlan` source, together with the declarations it
+ * closes over, without importing the launcher.
+ *
+ * Why not import it: the launcher's module body resolves a runtime at import
+ * time and either spawns oam or imports the server, so importing it from a
+ * test would launch a server. Making it importable would mean gating that body
+ * behind an entry-point check -- a behaviour change to a shipped runtime
+ * artifact whose failure mode (the guard reads false under an npm shim, and the
+ * launcher silently does nothing) is worse than the gap this closes. The
+ * sandbox allowlist test below reads the launcher's source the same way.
+ *
+ * Extracting the text exercises the shipped logic rather than a copy that can
+ * drift, and a failed extraction is a loud assertion, not a silent skip.
+ */
+function loadRuntimePlan(): RuntimePlan {
+  const source = readFileSync(LAUNCHER, "utf8");
+  const pieces = [
+    /const OAM_MIN = \[[^\]]*\];/,
+    /function parseVersion\(text\) \{[\s\S]*?\r?\n\}/,
+    /function atLeast\(v, min\) \{[\s\S]*?\r?\n\}/,
+    /function runtimePlan\(\{ mode, hostOam, sandbox \}\) \{[\s\S]*?\r?\n\}/,
+  ].map((pattern) => {
+    const match = source.match(pattern);
+    assert.ok(match, `could not extract ${pattern} from bin/postgres-mcp.mjs -- renamed or reformatted?`);
+    return match[0];
+  });
+  return new Function(`${pieces.join("\n")}\nreturn runtimePlan;`)() as RuntimePlan;
+}
+
+describe("launcher: runtimePlan()", () => {
+  const runtimePlan = loadRuntimePlan();
+
+  it("serves in-process when already hosted on an oam at or above the floor", () => {
+    // `auto` and `oam` both have to take the shortcut -- `oam` demands oam, and
+    // the host already is one.
+    //
+    // 0.9.0 pins the floor as inclusive (it IS the supported release), and
+    // 0.10.0 pins a numeric compare: it sorts BEFORE 0.9.0 as a string, so a
+    // compare over the raw text would spawn a nested oam on every 0.10+ host.
+    for (const mode of ["auto", "oam"]) {
+      for (const hostOam of ["0.9.0", "0.10.0", "0.15.1", "1.0.0", "0.16.0-dev"]) {
+        assert.equal(runtimePlan({ mode, hostOam, sandbox: false }), "in-process", `mode=${mode} hostOam=${hostOam}`);
+      }
+    }
+  });
+
+  it("keeps spawning a fresh oam when the sandbox is requested, even on oam", () => {
+    // `--permission` is a process-level flag: only a FRESH oam can apply it.
+    // Serving in-process here would silently drop the sandbox the operator
+    // asked for -- and the net grant pinned to DATABASE_URL with it -- a
+    // security downgrade that no other symptom would reveal.
+    for (const mode of ["auto", "oam"]) {
+      assert.equal(runtimePlan({ mode, hostOam: "0.15.1", sandbox: true }), "discover", `mode=${mode}`);
+    }
+  });
+
+  it("leaves a host oam below the floor on the discovery path", () => {
+    // Same floor as a discovered binary. Below it, behaviour is exactly what it
+    // was before the shortcut existed.
+    for (const mode of ["auto", "oam"]) {
+      for (const hostOam of ["0.8.9", "0.8.2", "0.0.1"]) {
+        assert.equal(runtimePlan({ mode, hostOam, sandbox: false }), "discover", `mode=${mode} hostOam=${hostOam}`);
+      }
+    }
+  });
+
+  it("discovers as before on Node, where process.versions has no oam key", () => {
+    // An unreadable value must not count as "new enough" either: that would
+    // skip discovery on a host that never proved it is a supported oam.
+    for (const mode of ["auto", "oam"]) {
+      for (const hostOam of [undefined, "", "dev"]) {
+        assert.equal(runtimePlan({ mode, hostOam, sandbox: false }), "discover", `mode=${mode} hostOam=${hostOam}`);
+      }
+    }
+  });
+
+  it("runs POSTGRES_MCP_RUNTIME=node in-process whatever the host is", () => {
+    for (const hostOam of [undefined, "0.8.2", "0.15.1"]) {
+      assert.equal(runtimePlan({ mode: "node", hostOam, sandbox: false }), "in-process", `hostOam=${hostOam}`);
+    }
+  });
+});
+
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")) as { version: string }
+).version;
+
+/**
+ * Run the REAL launcher under Node, optionally posing as oam by preloading a
+ * `process.versions.oam` key.
+ *
+ * The unit tests above prove the decision; these prove the launcher WIRES it
+ * -- that the call site actually reads `process.versions.oam` and the sandbox
+ * grant list -- which no amount of testing `runtimePlan` in isolation can. A
+ * real oam cannot be assumed on every box this suite runs on, and the preload
+ * changes exactly the one fact the launcher branches on.
+ *
+ * OAM_BIN is pinned to the Node binary running this test, which makes the two
+ * outcomes unmistakable without a real oam. In-process, `version` reaches
+ * dist/index.js and prints the package version with exit 0. On the discovery
+ * path, findOam returns that pinned Node, `node --version` clears the floor,
+ * and the launcher spawns `node [flags] run <entry>` -- which has no `run`
+ * subcommand, prints no version and exits non-zero. It also keeps a real oam
+ * installed on the developer's box out of reach, since findOam checks the
+ * override first and never scans past it.
+ *
+ * The selection variables are deleted so a POSTGRES_MCP_* exported by the
+ * developer's shell cannot change what is being asserted.
+ */
+function runAsHost(hostOam: string | undefined, overlay: Record<string, string | undefined> = {}): Promise<RunResult> {
+  const nodeArgs =
+    hostOam === undefined
+      ? []
+      : [
+          "--import",
+          `data:text/javascript,${encodeURIComponent(
+            `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`,
+          )}`,
+        ];
+  return runLauncher(
+    ["version"],
+    { POSTGRES_MCP_RUNTIME: undefined, POSTGRES_MCP_SANDBOX: undefined, OAM_BIN: process.execPath, ...overlay },
+    // Each case boots one to three Node processes, and a bare Node start has
+    // been measured at ~11s on a contended Windows box.
+    { nodeArgs, timeoutMs: 90_000 },
+  );
+}
+
+const servedInProcess = (run: RunResult) => run.code === 0 && run.stdout.trim() === PACKAGE_VERSION;
+
+describe("launcher: already hosted on oam", () => {
+  it("control: on plain Node the launcher still discovers and spawns", async () => {
+    // Without this, the in-process cases below would also pass for a launcher
+    // that ALWAYS runs in-process and never uses oam at all.
+    const run = await runAsHost(undefined);
+    assert.equal(servedInProcess(run), false, `expected a spawn, got ${JSON.stringify(run)}`);
+    assert.notEqual(run.code, 0);
+  });
+
+  it("serves in-process instead of spawning a nested oam", async () => {
+    for (const overlay of [{}, { POSTGRES_MCP_RUNTIME: "oam" }] as Record<string, string>[]) {
+      const run = await runAsHost("0.15.1", overlay);
+      assert.equal(servedInProcess(run), true, `${JSON.stringify(overlay)} -> ${JSON.stringify(run)}`);
+    }
+  });
+
+  it("still spawns under POSTGRES_MCP_SANDBOX=1, so --permission is not dropped", async () => {
+    const run = await runAsHost("0.15.1", { POSTGRES_MCP_SANDBOX: "1" });
+    assert.equal(servedInProcess(run), false, `the sandbox must force a spawn, got ${JSON.stringify(run)}`);
+    assert.notEqual(run.code, 0);
+    // A spawned child failing, not the launcher diagnosing: every launcher
+    // message starts with `postgres-mcp: `.
+    assert.doesNotMatch(run.stderr, /^postgres-mcp: /m);
+  });
+
+  it("still discovers when the host oam is below the floor", async () => {
+    const run = await runAsHost("0.8.9");
+    assert.equal(servedInProcess(run), false, `a below-floor host must not shortcut, got ${JSON.stringify(run)}`);
+    assert.notEqual(run.code, 0);
   });
 });
 
