@@ -176,8 +176,11 @@ export const explainTools = [
       "Get the query plan for a SQL statement. By default, this uses plain EXPLAIN (no execution). " +
       "Set `analyze: true` to run the query with EXPLAIN ANALYZE - for non-SELECT statements, " +
       "ALLOW_WRITES=1 is required (since ANALYZE actually executes the statement). Writes " +
-      "executed during EXPLAIN ANALYZE are always rolled back, so you can inspect a plan for " +
-      "an INSERT/UPDATE/DELETE without persisting the mutation. Format is `text` (default) or " +
+      "executed during EXPLAIN ANALYZE are rolled back, so you can inspect a plan for an " +
+      "INSERT/UPDATE/DELETE without persisting the rows -- but only what Postgres rolls back is " +
+      "undone: a sequence the statement advanced (nextval, a serial or identity column) stays " +
+      "advanced, and any side effect of a function the statement called that lands outside " +
+      "table data (pg_terminate_backend, an advisory lock) persists. Format is `text` (default) or " +
       "`json`. Pass the raw SQL (not an EXPLAIN-prefixed statement). " +
       "Planner options (all optional): `buffers` reports shared/local/temp block hits and is the " +
       "fastest way to tell a bad plan from a cold cache - it defaults to TRUE whenever `analyze` " +
