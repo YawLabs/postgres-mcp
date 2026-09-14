@@ -22,6 +22,14 @@
  * control that quietly disables itself is worse than none, because the
  * operator believes they have a trail.
  *
+ * A value that is present but empty, or only whitespace, is rejected too, by
+ * all three. That is what an MCP client config can hand the server for an env
+ * entry whose variable is unset where the client runs -- common on Windows,
+ * where variables set in a bash or WSL profile do not reach a server launched
+ * via cmd. Reading it as unset would turn
+ * `"POSTGRES_AUDIT_REDACT": "${AUDIT_REDACT}"` into full SQL on disk. Only an
+ * absent variable counts as unset.
+ *
  * Default destination is stderr because a stdio MCP server owns stdout for
  * protocol framing -- an audit line written there lands mid-JSON-RPC frame and
  * kills the session.
@@ -72,28 +80,61 @@ let sinkFailureReported = false;
 const OFF_VALUES = ["0", "false", "off"];
 
 /**
- * Returns true/false for a recognized value, null when the var is absent or
- * empty (a shell that exports the name with no value). Anything else throws --
- * see the module header for why a typo must not read as "off".
+ * Returns true/false for a recognized value, null only when the var is absent.
+ * Anything else throws -- see the module header for why neither a typo nor an
+ * empty value may read as "off". An empty value gets its own message because
+ * its likely cause is an unexpanded variable, not a typo, and a list of
+ * accepted values does not tell the operator that.
+ *
+ * `refusal` finishes the "Refusing to start ..." sentence of each message,
+ * because what a misread costs depends on the variable: a log flag read as off
+ * leaves the trail empty, while a redact flag read as off fills it with SQL.
  */
-function parseStrictFlag(name: string, raw: string | undefined, onValues: string[]): boolean | null {
+function parseStrictFlag(
+  name: string,
+  raw: string | undefined,
+  onValues: string[],
+  refusal: { unrecognized: string; empty: string },
+): boolean | null {
   if (raw === undefined) return null;
   const value = raw.trim().toLowerCase();
-  if (value === "") return null;
+  if (value === "") {
+    throw new Error(
+      `[postgres-mcp] ${name} is set but empty (an unexpanded variable in the MCP config?). ` +
+        `Refusing to start ${refusal.empty}`,
+    );
+  }
   if (onValues.includes(value)) return true;
   if (OFF_VALUES.includes(value)) return false;
   const expected = [...onValues, ...OFF_VALUES].map((v) => JSON.stringify(v)).join(", ");
   throw new Error(
     `[postgres-mcp] ${name}=${JSON.stringify(raw)} is not a recognized value; expected one of ${expected}. ` +
-      "Refusing to start rather than run with the audit trail silently off.",
+      `Refusing to start ${refusal.unrecognized}`,
   );
 }
 
 export function getAuditConfig(): AuditConfig {
   // "stderr" is accepted as an on-value so the destination can be read off the
   // variable itself; it selects the same sink as "1".
-  const flag = parseStrictFlag("POSTGRES_AUDIT_LOG", process.env.POSTGRES_AUDIT_LOG, ["1", "true", "stderr"]);
-  const redact = parseStrictFlag("POSTGRES_AUDIT_REDACT", process.env.POSTGRES_AUDIT_REDACT, ["1", "true"]) ?? false;
+  const flag = parseStrictFlag("POSTGRES_AUDIT_LOG", process.env.POSTGRES_AUDIT_LOG, ["1", "true", "stderr"], {
+    unrecognized: "rather than run with the audit trail silently off.",
+    // Not "silently off" here: with POSTGRES_AUDIT_LOG_FILE also set, reading
+    // an empty value as unset would have left auditing on. Either way it is a
+    // guess at what the config meant.
+    empty:
+      "rather than guess whether you wanted an audit trail. " +
+      "Remove the variable, or set it to 1 to turn auditing on or 0 to leave it off.",
+  });
+  // Worded to hold whether or not auditing is on: these refusals fire either
+  // way, so the risk they name is the SQL, not a trail that may not exist.
+  const redactRisk = "which would log full, unredacted SQL whenever auditing is on.";
+  const redact =
+    parseStrictFlag("POSTGRES_AUDIT_REDACT", process.env.POSTGRES_AUDIT_REDACT, ["1", "true"], {
+      unrecognized: `rather than read it as off, ${redactRisk}`,
+      empty:
+        `rather than read it as unset, ${redactRisk} ` +
+        "Remove the variable or set it to 0 for full SQL, or set it to 1 for a keyword and hash instead.",
+    }) ?? false;
 
   let file: string | null = null;
   const rawFile = process.env.POSTGRES_AUDIT_LOG_FILE;

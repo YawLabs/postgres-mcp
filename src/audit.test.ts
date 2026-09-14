@@ -113,6 +113,23 @@ describe("audit is off by default", () => {
   });
 });
 
+/** Sets the var, or deletes it for `undefined` -- the absent case, not an empty one. */
+function setEnv(name: (typeof AUDIT_ENV)[number], value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+/** The message getAuditConfig() refuses the current env with; fails the test when it does not refuse. */
+function refusal(label: string): string {
+  try {
+    getAuditConfig();
+  } catch (err) {
+    assert.ok(err instanceof Error, label);
+    return err.message;
+  }
+  assert.fail(`${label}: expected getAuditConfig() to refuse this config`);
+}
+
 describe("audit config rejects ambiguity loudly", () => {
   it("throws on an unrecognized POSTGRES_AUDIT_LOG value", () => {
     process.env.POSTGRES_AUDIT_LOG = "yes";
@@ -125,6 +142,68 @@ describe("audit config rejects ambiguity loudly", () => {
     process.env.POSTGRES_AUDIT_LOG = "1";
     process.env.POSTGRES_AUDIT_REDACT = "hash";
     assert.throws(() => getAuditConfig(), /POSTGRES_AUDIT_REDACT="hash" is not a recognized value/);
+  });
+
+  it("names unredacted SQL, not a silently-off trail, as the risk of a bad POSTGRES_AUDIT_REDACT", () => {
+    // Reading REDACT as off never empties the trail -- it fills it with SQL. And
+    // the refusal fires with auditing off too, so the risk it names must hold then.
+    for (const log of ["1", undefined]) {
+      setEnv("POSTGRES_AUDIT_LOG", log);
+      process.env.POSTGRES_AUDIT_REDACT = "hash";
+      const label = `POSTGRES_AUDIT_LOG=${log}`;
+      const message = refusal(label);
+      assert.match(message, /unredacted SQL whenever auditing is on/, label);
+      assert.doesNotMatch(message, /silently off/, label);
+    }
+  });
+
+  // An env entry whose variable did not expand where the MCP client runs
+  // reaches the server as present and empty. POSTGRES_AUDIT_LOG_FILE refuses
+  // that below; reading it as unset on the two flags would leave the trail off,
+  // or -- on POSTGRES_AUDIT_REDACT -- log full SQL for an operator who asked
+  // for hashes.
+  it("throws when POSTGRES_AUDIT_LOG is set but empty or whitespace-only", () => {
+    // With a file configured too, empty-as-unset turned auditing on through the
+    // file -- still a guess about what the empty value was meant to say.
+    for (const file of [undefined, "/tmp/pgmcp-audit.log"]) {
+      setEnv("POSTGRES_AUDIT_LOG_FILE", file);
+      for (const value of ["", "   ", "\t"]) {
+        process.env.POSTGRES_AUDIT_LOG = value;
+        const label = `POSTGRES_AUDIT_LOG=${JSON.stringify(value)}, POSTGRES_AUDIT_LOG_FILE=${file}`;
+        const message = refusal(label);
+        assert.match(message, /POSTGRES_AUDIT_LOG is set but empty/, label);
+        assert.match(message, /unexpanded variable/, label);
+        assert.match(message, /Remove the variable, or set it to 1/, label);
+      }
+    }
+  });
+
+  it("throws when POSTGRES_AUDIT_REDACT is set but empty or whitespace-only, with auditing on", () => {
+    process.env.POSTGRES_AUDIT_LOG = "1";
+    for (const value of ["", "   ", "\t"]) {
+      process.env.POSTGRES_AUDIT_REDACT = value;
+      const label = `POSTGRES_AUDIT_REDACT=${JSON.stringify(value)}`;
+      const message = refusal(label);
+      assert.match(message, /POSTGRES_AUDIT_REDACT is set but empty/, label);
+      assert.match(message, /unexpanded variable/, label);
+      assert.match(message, /unredacted SQL/, label);
+      assert.match(message, /Remove the variable/, label);
+    }
+  });
+
+  it("throws when POSTGRES_AUDIT_REDACT is set but empty or whitespace-only, with auditing off", () => {
+    // Same rule as an unrecognized value: refused while nothing is logged, so the
+    // mistake surfaces now rather than on the day someone turns auditing on.
+    for (const log of [undefined, "0"]) {
+      setEnv("POSTGRES_AUDIT_LOG", log);
+      for (const value of ["", "   "]) {
+        process.env.POSTGRES_AUDIT_REDACT = value;
+        const label = `POSTGRES_AUDIT_LOG=${log}, POSTGRES_AUDIT_REDACT=${JSON.stringify(value)}`;
+        const message = refusal(label);
+        assert.match(message, /POSTGRES_AUDIT_REDACT is set but empty/, label);
+        assert.match(message, /unredacted SQL whenever auditing is on/, label);
+      }
+    }
   });
 
   it("throws when POSTGRES_AUDIT_LOG_FILE is set but empty", () => {

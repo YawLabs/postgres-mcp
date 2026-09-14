@@ -232,6 +232,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with nothing under `[Unreleased]` got no entry at all, and every GitHub
   release page showed raw commit subjects.
 
+### Fixed
+
+- **An empty `POSTGRES_AUDIT_LOG` or `POSTGRES_AUDIT_REDACT` stops the server
+  at startup instead of counting as unset.** An MCP client config entry such
+  as `"POSTGRES_AUDIT_REDACT": "${AUDIT_REDACT}"`, whose variable is unset
+  where the client runs, can reach the server as present and empty -- and with
+  auditing on, that logged full SQL for an operator who had asked for hashes,
+  with no warning. An empty `POSTGRES_AUDIT_LOG` silently left auditing off.
+  Both now refuse to start, whitespace-only values included, as
+  `POSTGRES_AUDIT_LOG_FILE` already did; only a variable that is not set at
+  all counts as unset. A config that relied on an empty value must remove the
+  variable or set it to `0` or `1`. The error for an unrecognized
+  `POSTGRES_AUDIT_REDACT` now names the real risk, unredacted SQL, instead of
+  a silently disabled audit trail (#40).
+
 ## [0.13.0] - 2026-09-13
 
 No runtime changes.
