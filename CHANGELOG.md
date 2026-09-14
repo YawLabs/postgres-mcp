@@ -7,20 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.13.1] - 2026-09-14
-
-### Changed
-
-- npm and MCP Registry listing metadata: bugs URL, core keywords, and
-  server.json title/repository/websiteUrl.
-- `release.sh` writes a `## [x.y.z]` changelog entry for every release --
-  promoting `[Unreleased]` when it has content, otherwise generating one from
-  the commit subjects since the previous tag -- keeps Keep-a-Changelog link
-  references current when a file has them, and takes the GitHub release notes
-  from that entry instead of from `git log` subjects. Before this, a release
-  with nothing under `[Unreleased]` got no entry at all, and every GitHub
-  release page showed raw commit subjects.
-
 ### Fixed
 
 - **The server no longer exits when a connection it has checked out dies.**
@@ -113,6 +99,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   says what an `EXPLAIN ANALYZE` rollback does not undo: a sequence the
   statement advanced stays advanced, and a side effect of a function the
   statement called (`pg_terminate_backend`, an advisory lock) persists.
+
+## [0.13.1] - 2026-09-14
+
+### Changed
+
+- npm and MCP Registry listing metadata: bugs URL, core keywords, and
+  server.json title/repository/websiteUrl.
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release --
+  promoting `[Unreleased]` when it has content, otherwise generating one from
+  the commit subjects since the previous tag -- keeps Keep-a-Changelog link
+  references current when a file has them, and takes the GitHub release notes
+  from that entry instead of from `git log` subjects. Before this, a release
+  with nothing under `[Unreleased]` got no entry at all, and every GitHub
+  release page showed raw commit subjects.
 
 ## [0.13.0] - 2026-09-13
 
