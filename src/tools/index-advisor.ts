@@ -59,13 +59,16 @@ type OnTransactionLost = (error: string | undefined) => void;
  *
  * Two kinds of failure come out of here, and the caller must not confuse them.
  * The STATEMENT failing is the isolated, soft case the savepoint exists for.
- * The SAVEPOINT failing is not: it can only fail when the transaction is
- * aborted or the connection is dead, and after that every later isolated
- * statement fails the same way. That case is reported through `onLost` (and
- * also returned as a failure, since no result exists). A ROLLBACK TO or
- * RELEASE that fails leaves the transaction aborted too, but nothing checks
- * them here: the next isolated statement's SAVEPOINT is refused and reports
- * it, and a statement that already ran keeps its result.
+ * The SAVEPOINT, ROLLBACK TO or RELEASE failing is not: those can only fail
+ * when the transaction is aborted or the connection is dead, and after that
+ * every later statement fails the same way. Each is reported through `onLost`
+ * with its own error, at the moment it happens. "The next SAVEPOINT will be
+ * refused and report it" is NOT a substitute: when the statement that died
+ * was the last one the search sends, the next savepoint is on the far side of
+ * the check that turns a loss into an error, and the call would report a
+ * search that converged on nothing (measured: a socket death during the only
+ * candidate's hypopg_create_index). A statement that already ran keeps its
+ * result even when the RELEASE after it fails.
  */
 async function runIsolated<R extends Record<string, unknown>>(
   run: SharedRunner,
@@ -82,11 +85,20 @@ async function runIsolated<R extends Record<string, unknown>>(
   const res = await run<R>(sql, params, options);
   if (!res.ok) {
     const restored = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-    // A RELEASE into a still-aborted transaction would only be refused too.
-    if (restored.ok) await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    if (!restored.ok) {
+      // Both errors, in order: the ROLLBACK TO's is what lost the transaction
+      // (a cancel, a dead socket), the statement's is what it was recovering
+      // from -- which may be the same socket death, or a benign refusal that
+      // would be misleading on its own.
+      onLost?.(`${restored.error} (while recovering from: ${res.error})`);
+      return res;
+    }
+    const released = await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    if (!released.ok) onLost?.(released.error);
     return res;
   }
-  await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  const released = await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  if (!released.ok) onLost?.(released.error);
   return res;
 }
 
@@ -947,12 +959,16 @@ async function explainStatement(
  * declined. Null is a "skip this candidate" signal: HypoPG refuses index shapes
  * it cannot model (an unsupported opclass, a column type with no btree
  * ordering), and that is a normal outcome for a generated candidate, not a tool
- * failure.
+ * failure. It is still reported through `onDeclined`, with the server's own
+ * words, because a candidate that vanishes without a trace reads as "no index
+ * helps" -- and a statement timeout on the create looks exactly like a refusal
+ * from here.
  */
 async function createHypotheticalIndex(
   run: SharedRunner,
   candidate: IndexCandidate,
   onLost?: OnTransactionLost,
+  onDeclined?: (error: string) => void,
 ): Promise<number | null> {
   const cols = candidate.columns.map(quoteIdent).join(", ");
   const createSql =
@@ -967,10 +983,20 @@ async function createHypotheticalIndex(
     undefined,
     onLost,
   );
-  if (!res.ok) return null;
+  if (!res.ok) {
+    // Also reached when the transaction was lost, which onLost has already
+    // reported; the caller then returns that error and never shows the
+    // declined list, so no second filter is needed here.
+    onDeclined?.(res.error ?? "unknown error");
+    return null;
+  }
   const raw = res.data?.[0]?.indexrelid;
   const oid = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN;
-  return Number.isFinite(oid) ? oid : null;
+  if (!Number.isFinite(oid)) {
+    onDeclined?.("hypopg_create_index returned no index oid");
+    return null;
+  }
+  return oid;
 }
 
 /** Shorten a statement for echoing back, so one huge query cannot dominate the response. */
@@ -1325,7 +1351,15 @@ export const indexAdvisorTools = [
           // the search_path fails HERE, with an error worth showing verbatim.
           const entryReset = await run("SELECT hypopg_reset()");
           if (!entryReset.ok) {
-            return { ok: false, error: `HypoPG is installed but hypopg_reset() failed: ${entryReset.error}` };
+            // 42883 is "function does not exist": pg_extension lists HypoPG, so
+            // the role cannot see its functions -- the schema is off the
+            // search_path or EXECUTE was revoked. Anything else (a cancel, a
+            // dead socket) is reported as what it is.
+            const hint = /\(code: 42883\)/.test(entryReset.error ?? "")
+              ? " HypoPG is installed, but this role cannot call it: check that the schema it was created in " +
+                "is on the DATABASE_URL role's search_path and that EXECUTE on its functions is granted."
+              : "";
+            return { ok: false, error: `hypopg_reset() failed before the search started: ${entryReset.error}.${hint}` };
           }
           hypopgUsable = true;
 
@@ -1336,6 +1370,9 @@ export const indexAdvisorTools = [
           const needsGenericPlan: boolean[] = [];
 
           for (const statement of workload) {
+            // Every statement after a loss would only send a savepoint that is
+            // refused and add a "could not plan" line the error below discards.
+            if (transactionLost !== undefined) break;
             // A `$n` placeholder means the statement cannot be planned without
             // GENERIC_PLAN. Testing the raw text is a heuristic, but it is safe
             // in BOTH directions: a false positive (a `$1` inside a string
@@ -1465,7 +1502,12 @@ export const indexAdvisorTools = [
                 AND c.relname = ANY($2)`,
             [schemas, tables],
           );
-          if (!colsRes.ok) return { ok: false, error: colsRes.error };
+          if (!colsRes.ok) {
+            return {
+              ok: false,
+              error: `could not read the columns of the tables the workload scans: ${colsRes.error}`,
+            };
+          }
 
           const knownColumns = new Map<string, Set<string>>();
           const columnStats = new Map<string, Map<string, ColumnStats>>();
@@ -1575,6 +1617,11 @@ export const indexAdvisorTools = [
 
           // ─── Greedy search over HypoPG ───
 
+          // Candidates HypoPG would not create, with its reason. Collected
+          // rather than warned one by one so a wide search cannot bury the
+          // result under a warning per shape.
+          const declined: string[] = [];
+
           const evaluate = async (
             candidate: IndexCandidate,
             statementIndices: number[],
@@ -1583,7 +1630,9 @@ export const indexAdvisorTools = [
             // the budget -- the right accounting for a candidate that was never
             // sent because the transaction is already gone.
             if (transactionLost !== undefined) return null;
-            const created = await createHypotheticalIndex(run, candidate, onLost);
+            const created = await createHypotheticalIndex(run, candidate, onLost, (error) => {
+              declined.push(`${candidate.schema}.${candidate.table} (${candidate.columns.join(", ")}): ${error}`);
+            });
             if (created === null) return null;
             try {
               const costs = new Map<number, number>();
@@ -1666,6 +1715,16 @@ export const indexAdvisorTools = [
           // accepted list is not the search's answer, only where it stopped.
           if (transactionLost !== undefined) return lostError();
 
+          if (declined.length > 0) {
+            const shown = declined.slice(0, 5);
+            const more = declined.length - shown.length;
+            warnings.push(
+              `${declined.length} candidate index(es) could not be costed because hypopg_create_index refused ` +
+                `them, so they were skipped rather than rejected: ${shown.join("; ")}` +
+                (more > 0 ? `; and ${more} more` : ""),
+            );
+          }
+
           if (search.budgetExhausted) {
             warnings.push(
               `the search stopped at the \`max_explains\` budget of ${max_explains} EXPLAIN round trips, ` +
@@ -1705,8 +1764,9 @@ export const indexAdvisorTools = [
           }
           if (transactionLost !== undefined) {
             warnings.push(
-              `the transaction was lost while sizing the recommended indexes (${transactionLost}), so ` +
-                "`estimated_size_bytes` is missing; the recommendations themselves were measured before that",
+              `the transaction was lost while sizing the recommended indexes (${transactionLost}); every ` +
+                "`estimated_size_bytes` not read by then is null. The recommendations themselves were measured " +
+                "before that and stand",
             );
           }
 

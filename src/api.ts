@@ -565,23 +565,105 @@ function toQueryResult(
  * `teardown` runs in `finally` (always executed) so it can clean up
  * session-scoped state (e.g. HypoPG hypothetical indexes) even on error.
  *
- * **teardown runs AFTER ROLLBACK/COMMIT, not inside the user's transaction.**
- * The success path is BEGIN -> setup -> user SQL -> ROLLBACK/COMMIT, and only
- * then `finally` -> teardown. So teardown executes in autocommit on the same
- * pooled client. This is fine for session-scoped state (HypoPG's
- * `hypopg_reset()` lives at the session level, not the transaction level) but
- * any hook that needs to run *inside* the open transaction won't work with
- * this signature -- the txn is already gone by the time teardown fires.
+ * **teardown runs INSIDE the transaction, after a `ROLLBACK TO` the savepoint
+ * taken before `setup`.** The path is BEGIN -> SAVEPOINT -> setup -> user SQL
+ * -> (`finally`) ROLLBACK TO -> teardown -> ROLLBACK. The ROLLBACK TO is what
+ * lets teardown run whatever the user's SQL did to the transaction: a failed
+ * statement leaves it aborted, and an aborted transaction refuses everything
+ * but ROLLBACK / ROLLBACK TO with SQLSTATE 25P02. Inside matters for
+ * session-scoped state behind a transaction-mode pooler (PgBouncer, which the
+ * README lists as supported): a backend is pinned to this connection only
+ * until the transaction ends, so a `hypopg_reset()` sent after the ROLLBACK
+ * could reach a different backend than the one holding the indexes, and
+ * report success. Anything `setup` did that IS transactional is undone by
+ * the ROLLBACK TO before teardown sees it.
  *
- * **Reserved savepoint name:** `runUserQueryBounded` opens
- * `SAVEPOINT __pgmcp_sp` around the user SQL and `RELEASE`s it at the end.
- * Hooks MUST NOT create a savepoint with that name -- the inner `RELEASE`
- * here would unwind hook-owned state too. If you need a savepoint inside a
- * hook, pick any other name.
+ * A teardown that fails leaves the session in a state the next borrower of
+ * this pooled connection would inherit, so the connection is destroyed
+ * instead of reused (and stderr says so). The call's own result is never
+ * replaced by a teardown failure.
+ *
+ * **Reserved savepoint names:** `runUserQueryBounded` opens
+ * `SAVEPOINT __pgmcp_sp` around the user SQL and `RELEASE`s it at the end,
+ * and the hook savepoint above is `__pgmcp_hooks`. Hooks MUST NOT create a
+ * savepoint with either name -- the inner `RELEASE` would unwind hook-owned
+ * state too. If you need a savepoint inside a hook, pick any other name.
  */
 export interface RunHooks {
   setup?: (client: pg.PoolClient) => Promise<void>;
   teardown?: (client: pg.PoolClient) => Promise<void>;
+}
+
+/** See {@link RunHooks}: taken before `setup`, rolled back to before `teardown`. */
+const HOOK_SAVEPOINT = "__pgmcp_hooks";
+
+/**
+ * Check a client out of the pool with an `error` listener attached for as long
+ * as it is checked out.
+ *
+ * pg-pool listens for `error` on IDLE clients (and forwards it to the pool's
+ * own `error` event, logged in getPool), but it removes that listener when a
+ * client is checked out and only re-adds it on release. node-pg emits `error`
+ * on the client when its socket dies -- a backend terminated by a DBA, an
+ * `idle_in_transaction_session_timeout`, a network drop -- and an
+ * EventEmitter with no `error` listener THROWS from the emit, out of the
+ * socket callback, as an uncaught exception that ends this process. Measured
+ * on PostgreSQL 15: `pg_terminate_backend` on a checked-out client raised two
+ * uncaught exceptions with no listener and none with one, and the query in
+ * flight was rejected either way.
+ *
+ * The listener only logs. pg has already rejected the query in flight and
+ * marked the client unqueryable, and pg-pool destroys an unqueryable client on
+ * release, so there is nothing else for it to do. `release(err)` destroys the
+ * client instead of pooling it, for a caller that left session state behind.
+ */
+async function acquireClient(): Promise<{ client: pg.PoolClient; release: (discard?: Error) => void }> {
+  const client = await getPool().connect();
+  const onError = (err: Error): void => {
+    console.error(`[postgres-mcp] connection error on a checked-out client: ${err.message}`);
+  };
+  client.on("error", onError);
+  return {
+    client,
+    release: (discard) => {
+      if (discard) console.error(`[postgres-mcp] discarding pooled connection: ${discard.message}`);
+      // Removed AFTER release: pg-pool ends a client it is not keeping, and an
+      // `error` that emits during that end still needs a listener.
+      client.release(discard);
+      client.removeListener("error", onError);
+    },
+  };
+}
+
+/**
+ * End a transaction one of the user-SQL runners opened: ROLLBACK TO the hook
+ * savepoint, run `teardown` inside the still-open transaction, then ROLLBACK.
+ * Returns the error to discard the connection over, if cleanup failed. See
+ * {@link RunHooks} for why this order.
+ */
+async function finishTransaction(
+  client: pg.PoolClient,
+  state: { began: boolean; hookSavepoint: boolean },
+  teardown: RunHooks["teardown"],
+): Promise<Error | undefined> {
+  if (!state.began) return undefined;
+  let failure: Error | undefined;
+  const attempt = async (what: string, fn: () => Promise<unknown>): Promise<void> => {
+    try {
+      await fn();
+    } catch (err) {
+      failure ??= new Error(
+        `${what} failed, connection discarded: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+  if (teardown) {
+    if (state.hookSavepoint)
+      await attempt("hook savepoint rollback", () => client.query(`ROLLBACK TO SAVEPOINT ${HOOK_SAVEPOINT}`));
+    await attempt("teardown", () => teardown(client));
+  }
+  await attempt("ROLLBACK", () => client.query("ROLLBACK"));
+  return failure;
 }
 
 export async function runReadOnly(
@@ -589,31 +671,24 @@ export async function runReadOnly(
   params: unknown[] = [],
   hooks: RunHooks = {},
 ): Promise<ApiResponse<QueryResult>> {
-  const client = await getPool().connect();
+  const { client, release } = await acquireClient();
   const maxRows = getMaxRows();
+  const state = { began: false, hookSavepoint: false };
   try {
     await client.query("BEGIN READ ONLY");
+    state.began = true;
+    if (hooks.teardown) {
+      await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
+      state.hookSavepoint = true;
+    }
     if (hooks.setup) await hooks.setup(client);
     const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
-    await client.query("ROLLBACK");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      // Already rolled back or connection broken - swallow.
-    }
     return { ok: false, error: formatPgError(err) };
   } finally {
-    if (hooks.teardown) {
-      try {
-        await hooks.teardown(client);
-      } catch {
-        // Teardown is best-effort - never let it shadow a real error.
-      }
-    }
-    client.release();
+    release(await finishTransaction(client, state, hooks.teardown));
   }
 }
 
@@ -625,7 +700,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
       error: "Write blocked: ALLOW_WRITES is not set. Set ALLOW_WRITES=1 in the MCP server env to enable DML/DDL.",
     };
   }
-  const client = await getPool().connect();
+  const { client, release } = await acquireClient();
   const maxRows = getMaxRows();
   try {
     await client.query("BEGIN");
@@ -641,7 +716,7 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
     }
     return { ok: false, error: formatPgError(err) };
   } finally {
-    client.release();
+    release();
   }
 }
 
@@ -663,31 +738,24 @@ export async function runReadWriteRollback(
       error: "Write blocked: ALLOW_WRITES is not set. Set ALLOW_WRITES=1 in the MCP server env to enable DML/DDL.",
     };
   }
-  const client = await getPool().connect();
+  const { client, release } = await acquireClient();
   const maxRows = getMaxRows();
+  const state = { began: false, hookSavepoint: false };
   try {
     await client.query("BEGIN");
+    state.began = true;
+    if (hooks.teardown) {
+      await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
+      state.hookSavepoint = true;
+    }
     if (hooks.setup) await hooks.setup(client);
     const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
-    await client.query("ROLLBACK");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      // Already rolled back or connection broken - swallow.
-    }
     return { ok: false, error: formatPgError(err) };
   } finally {
-    if (hooks.teardown) {
-      try {
-        await hooks.teardown(client);
-      } catch {
-        // Teardown is best-effort.
-      }
-    }
-    client.release();
+    release(await finishTransaction(client, state, hooks.teardown));
   }
 }
 
@@ -777,7 +845,7 @@ export async function withSharedClient<T>(
     controls: SharedClientControls,
   ) => Promise<T>,
 ): Promise<T> {
-  const client = await getPool().connect();
+  const { client, release } = await acquireClient();
   let discardReason: Error | undefined;
   const controls: SharedClientControls = {
     discard(reason) {
@@ -808,12 +876,7 @@ export async function withSharedClient<T>(
     };
     return await fn(runOnClient, controls);
   } finally {
-    // pg-pool removes and ends a client released WITH an error, rather than
-    // keeping it idle for reuse. It emits no log of its own for that, so the
-    // reason is written here, or a teardown that keeps failing would churn
-    // connections with no trace on stderr.
-    if (discardReason) console.error(`[postgres-mcp] discarding pooled connection: ${discardReason.message}`);
-    client.release(discardReason);
+    release(discardReason);
   }
 }
 

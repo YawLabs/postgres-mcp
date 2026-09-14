@@ -392,6 +392,13 @@ interface StubSession {
   explainSql(): string;
   /** The CREATE INDEX text handed to hypopg_create_index, or "". */
   hypoCreateSql(): string;
+  /** The argument of each client.release() call; an Error there makes pg-pool destroy the client. */
+  releases: unknown[];
+}
+
+interface StubBehavior {
+  /** Statements the fake server rejects, with a statement timeout. */
+  failWhen?: (sql: string) => boolean;
 }
 
 // runUserQueryBounded wraps the user statement in this, so the EXPLAIN the
@@ -426,14 +433,17 @@ async function withStubbedServer<T>(
   versionNum: number,
   fn: (session: StubSession) => Promise<T>,
   planRows: string[] = ["Seq Scan on t  (cost=0.00..1.00 rows=1 width=4)"],
+  behavior: StubBehavior = {},
 ): Promise<T> {
   const originalConnect = pg.Pool.prototype.connect;
   const originalQuery = pg.Pool.prototype.query;
   const originalDbUrl = process.env.DATABASE_URL;
 
   const statements: StubStatement[] = [];
+  const releases: unknown[] = [];
   const session: StubSession = {
     statements,
+    releases,
     connects: 0,
     explainSql() {
       return statements.find((s) => s.sql.startsWith(DECLARE_PREFIX))?.sql.slice(DECLARE_PREFIX.length) ?? "";
@@ -449,6 +459,9 @@ async function withStubbedServer<T>(
       const sql = typeof config === "string" ? config : ((config as { text?: string }).text ?? "");
       const values = typeof config === "string" ? params : ((config as { values?: unknown[] }).values ?? params);
       statements.push({ sql, params: values });
+      if (behavior.failWhen?.(sql)) {
+        throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+      }
 
       const fetch = /^FETCH (\d+) FROM/.exec(sql);
       if (fetch) {
@@ -469,8 +482,15 @@ async function withStubbedServer<T>(
       // oid list, so the stub never has to fake pg_catalog.pg_type.
       return { rows: [], fields: [], command: "", rowCount: 0 };
     },
-    release() {
-      /* no-op */
+    release(err?: unknown) {
+      releases.push(err);
+    },
+    // acquireClient() attaches an 'error' listener for the checked-out lifetime.
+    on() {
+      return this;
+    },
+    removeListener() {
+      return this;
     },
   };
 
@@ -714,6 +734,92 @@ describe("pg_explain text-plan truncation notice", () => {
         assert.equal(result.ok, true);
         assert.equal(result.data?.plan, "line-1");
       }, ["line-1", "line-2", "line-3", "line-4"]);
+    });
+  });
+});
+
+describe("pg_explain HypoPG teardown order (stubbed)", () => {
+  // Statement indexes of the three teardown steps, or -1 when a step was not
+  // sent. `ROLLBACK` is matched exactly: `ROLLBACK TO SAVEPOINT` contains it.
+  function teardownOrder(session: StubSession) {
+    const sqls = session.statements.map((s) => s.sql);
+    return {
+      hookSavepoint: sqls.indexOf("SAVEPOINT __pgmcp_hooks"),
+      restore: sqls.indexOf("ROLLBACK TO SAVEPOINT __pgmcp_hooks"),
+      reset: sqls.findIndex((s) => s.includes("hypopg_reset")),
+      rollback: sqls.indexOf("ROLLBACK"),
+      last: sqls.length - 1,
+    };
+  }
+  const withIndexes = {
+    sql: "SELECT * FROM t WHERE a = 1",
+    format: "text",
+    hypothetical_indexes: [{ table: "t", columns: ["a"] }],
+  };
+
+  it("resets inside the transaction: after ROLLBACK TO the hook savepoint, before the final ROLLBACK", async () => {
+    // HypoPG indexes are session-scoped. Behind a transaction-mode pooler the
+    // backend is pinned to this connection only until the transaction ends, so
+    // a reset sent after the ROLLBACK can reach a different backend than the
+    // one holding the indexes, and report success.
+    await withStubbedServer(180_000, async (session) => {
+      const result = (await pgExplain.handler(withIndexes)) as { ok: boolean };
+      assert.equal(result.ok, true);
+      const o = teardownOrder(session);
+      assert.ok(o.hookSavepoint >= 0, "no hook savepoint was taken");
+      assert.ok(o.restore > o.hookSavepoint, "no ROLLBACK TO the hook savepoint");
+      assert.ok(o.reset > o.restore, "the reset ran before the ROLLBACK TO");
+      assert.ok(o.rollback > o.reset, "the reset ran after the ROLLBACK, outside the transaction");
+      assert.equal(o.rollback, o.last, "something was sent after the ROLLBACK");
+      assert.deepEqual(session.releases, [undefined]);
+    });
+  });
+
+  it("keeps that order when the user's statement fails and the transaction is aborted", async () => {
+    // Both the cursor DECLARE and the direct fallback are rejected, so the
+    // transaction is aborted when the teardown runs; the ROLLBACK TO is what
+    // lets the reset through.
+    await withStubbedServer(
+      180_000,
+      async (session) => {
+        const result = (await pgExplain.handler(withIndexes)) as { ok: boolean; error?: string };
+        assert.equal(result.ok, false);
+        assert.match(result.error ?? "", /statement timeout/);
+        const o = teardownOrder(session);
+        assert.ok(o.restore >= 0 && o.reset > o.restore && o.rollback > o.reset);
+        assert.deepEqual(session.releases, [undefined]);
+      },
+      undefined,
+      { failWhen: (sql) => sql.startsWith("DECLARE") || sql.startsWith("EXPLAIN") },
+    );
+  });
+
+  it("destroys the connection instead of pooling it when the reset fails, and keeps the plan", async () => {
+    await withStubbedServer(
+      180_000,
+      async (session) => {
+        const result = (await pgExplain.handler(withIndexes)) as { ok: boolean };
+        assert.equal(result.ok, true, "a cleanup failure replaced the call's own result");
+        assert.equal(session.releases.length, 1);
+        const released = session.releases[0];
+        assert.ok(released instanceof Error, "a connection that may still hold hypothetical indexes was pooled");
+        assert.match(released.message, /teardown failed/);
+        assert.match(released.message, /statement timeout/);
+      },
+      undefined,
+      { failWhen: (sql) => sql.includes("hypopg_reset") },
+    );
+  });
+
+  it("takes no hook savepoint when there are no hooks, so the plain path pays no extra round trip", async () => {
+    await withStubbedServer(180_000, async (session) => {
+      const result = (await pgExplain.handler({ sql: "SELECT 1", format: "text" })) as { ok: boolean };
+      assert.equal(result.ok, true);
+      const o = teardownOrder(session);
+      assert.equal(o.hookSavepoint, -1);
+      assert.equal(o.restore, -1);
+      assert.equal(o.reset, -1);
+      assert.equal(o.rollback, o.last);
     });
   });
 });

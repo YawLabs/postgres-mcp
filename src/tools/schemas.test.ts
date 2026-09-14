@@ -138,6 +138,13 @@ describe("pg_describe_table version gating (stubbed connect, no live DB)", () =>
       release() {
         /* no-op */
       },
+      // acquireClient() attaches an 'error' listener for the checked-out lifetime.
+      on() {
+        return this;
+      },
+      removeListener() {
+        return this;
+      },
     };
     pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
       return Promise.resolve(client);
