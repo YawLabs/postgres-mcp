@@ -62,7 +62,7 @@ A few other things worth knowing:
 
 **Memory-bounded fetch.** The reference server's `MAX_ROWS` slice happened after node-pg had already materialized the full result into Node memory. A `SELECT * FROM big1 CROSS JOIN big2` could OOM the MCP process before `statement_timeout` fired. `postgres-mcp` wraps user SQL in a server-side `DECLARE ... CURSOR FOR` and fetches only `MAX_ROWS + 1` rows. Postgres does the heavy lifting; Node never holds more than the response.
 
-**EXPLAIN ANALYZE that doesn't persist.** If you ask the reference server for an `EXPLAIN ANALYZE` of an `INSERT`, it inserts the row. `postgres-mcp` wraps the analyze in a transaction that always rolls back, so the plan comes back with real timing and row counts, but the mutation doesn't.
+**EXPLAIN ANALYZE that doesn't persist.** If you ask the reference server for an `EXPLAIN ANALYZE` of an `INSERT`, it inserts the row. `postgres-mcp` wraps the analyze in a transaction that always rolls back, so the plan comes back with real timing and row counts, but the rows it wrote don't. (What Postgres never rolls back still sticks: a sequence the `INSERT` advanced stays advanced.)
 
 **Perf diagnostics the reference server never had.** `pg_top_queries` (from `pg_stat_statements`), `pg_seq_scan_tables`, `pg_unused_indexes`, `pg_table_bloat`, `pg_inspect_locks`, `pg_replication_status`. The "why is this slow?" question now answers in one tool call.
 

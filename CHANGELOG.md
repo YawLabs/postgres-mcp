@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **The README's per-tool gating list covers every tool.** `pg_io_stats`,
+  `pg_seq_scan_tables` and `pg_index_advisor` were in neither authority class;
+  all three are annotated read-only and join Auto-allow. `pg_explain` moves to
+  Always prompt, where its `destructiveHint: true` annotation already put it:
+  the old "without ANALYZE-of-write" condition depended on a call argument that
+  no per-tool toggle can see. The `pg_query` entry now says writes also need
+  `ALLOW_WRITES=1`, the duplicate `pg_list_roles` entry is gone, and the
+  `ALLOW_WRITES` configuration row names `pg_kill`, which it also gates (#34).
+- The `EXPLAIN ANALYZE` rollback is described precisely: the written rows do
+  not persist, but a sequence the statement advanced stays advanced.
+
 ## [0.12.4] - 2026-09-13
 
 ### Fixed
