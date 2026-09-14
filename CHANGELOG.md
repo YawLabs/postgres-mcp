@@ -743,6 +743,11 @@ the diff, so it is less detailed than the entries around it.
 
 ## [0.6.21] - 2026-06-11
 
+Tagged but never published to npm: this release shipped only as the
+single-file binaries attached to the GitHub release (its `release.yml` built
+and uploaded them and had no npm publish step), so npm went from 0.6.20
+straight to 0.7.0.
+
 ### Added
 
 - **A single-file binary for every supported platform, attached to the
@@ -1239,7 +1244,7 @@ No runtime changes.
   workflows and `release.sh` is now an ASCII hyphen. Mechanical; no logic
   changes.
 
-## [0.5.3] - 2026-05-14
+## [0.5.3] - 2026-05-13
 
 ### Security
 - Transitive deps patched via `npm audit fix`: in-range bumps to `hono`,
@@ -1263,7 +1268,7 @@ No runtime changes.
 - Dev dependencies bumped via Dependabot (`@biomejs/biome`, `zod`, plus
   transitives) -- in-range, dev-only.
 
-## [0.5.2] - 2026-05-14
+## [0.5.2] - 2026-05-13
 
 ### Fixed
 - `pg_describe_table` now emits a `kind fetch failed, reported as "table"`
