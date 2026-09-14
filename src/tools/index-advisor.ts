@@ -1,5 +1,13 @@
 import { z } from "zod";
-import { type ApiResponse, getServerVersionNum, PG16, PG18, runInternal, withSharedClient } from "../api.js";
+import {
+  type ApiResponse,
+  getServerVersionNum,
+  PG16,
+  PG18,
+  runInternal,
+  TERMINATE_OWN_BACKEND_SQL,
+  withSharedClient,
+} from "../api.js";
 import { warningsField } from "./output.js";
 import { identSchema } from "./params.js";
 import { compareVersions } from "./stats.js";
@@ -1853,23 +1861,57 @@ export const indexAdvisorTools = [
           //   3. ROLLBACK.
           //
           // The runner reports failure as `ok: false` and never throws, so each
-          // result is checked explicitly. If any of the three failed, this
-          // connection's session state is unknown, and it is destroyed rather
-          // than pooled. Best-effort, as explain.ts's teardown is: a failure
-          // here never replaces the real result or the real error.
+          // result is checked explicitly. A reset a LIVE server refused is
+          // retried once after another ROLLBACK TO (the savepoint survives one,
+          // and the retry clears the abort the failure caused). If the retry
+          // fails too, the session's own backend is terminated from inside the
+          // transaction: discarding the connection alone ends at a pooler, and
+          // the backend would hand the indexes to its next client -- see
+          // TERMINATE_OWN_BACKEND_SQL in api.ts. Either way the connection is
+          // then destroyed rather than pooled. Best-effort, as explain.ts's
+          // teardown is: a failure here never replaces the real result or the
+          // real error.
           let failure: string | undefined;
+          let terminated = false;
+          let restored = true;
           if (teardownSavepointTaken) {
-            const restored = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
-            if (!restored.ok) failure ??= restored.error;
+            const res = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
+            restored = res.ok;
+            if (!res.ok) failure ??= res.error;
           }
-          if (hypopgUsable) {
+          if (hypopgUsable && restored) {
             const reset = await run("SELECT hypopg_reset()");
-            if (!reset.ok) failure ??= reset.error;
+            if (!reset.ok) {
+              failure ??= reset.error;
+              if (reset.serverError && teardownSavepointTaken) {
+                const again = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
+                const retry = again.ok ? await run("SELECT hypopg_reset()") : again;
+                if (retry.ok) {
+                  console.error(
+                    `[postgres-mcp] pg_index_advisor: hypopg_reset() failed (${reset.error}) and succeeded on retry; the connection is kept`,
+                  );
+                  failure = undefined;
+                } else if (retry.serverError) {
+                  console.error(`[postgres-mcp] pg_index_advisor: hypopg_reset() failed again (${retry.error})`);
+                  // The retry's failure aborted the transaction again, and an
+                  // aborted transaction refuses the terminate like anything else.
+                  await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
+                  await run(TERMINATE_OWN_BACKEND_SQL);
+                  terminated = true;
+                }
+              }
+            }
           }
-          const rolledBack = await run("ROLLBACK");
-          if (!rolledBack.ok) failure ??= rolledBack.error;
-          if (failure !== undefined) {
-            discard(new Error(`pg_index_advisor teardown failed, connection discarded: ${failure}`));
+          if (terminated) {
+            // No ROLLBACK: the backend, and with it the transaction, is gone
+            // by design. The connection is destroyed for the same reason.
+            discard(new Error(`pg_index_advisor teardown failed twice, backend terminated: ${failure}`));
+          } else {
+            const rolledBack = await run("ROLLBACK");
+            if (!rolledBack.ok) failure ??= rolledBack.error;
+            if (failure !== undefined) {
+              discard(new Error(`pg_index_advisor teardown failed, connection discarded: ${failure}`));
+            }
           }
         }
       });

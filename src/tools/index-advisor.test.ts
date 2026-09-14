@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import pg from "pg";
-import { formatPgError, shutdown } from "../api.js";
+import { formatPgError, shutdown, TERMINATE_OWN_BACKEND_SQL } from "../api.js";
 import {
   applySkipScanGate,
   assertSingleStatement,
@@ -906,8 +906,11 @@ interface StubOptions {
   failDropIndex?: boolean;
   /** Make hypopg_relation_size time out. */
   failSizing?: boolean;
-  /** Make every hypopg_reset after the entry one time out, so the teardown itself fails. */
-  failTeardownReset?: boolean;
+  /**
+   * Make the hypopg_reset after the entry one time out: `always` fails the
+   * retry too, `once` lets the retry through.
+   */
+  failTeardownReset?: "once" | "always";
   /** Make the plain ROLLBACK time out, leaving the transaction open. */
   failTeardownRollback?: boolean;
   /** Columns pg_attribute reports for public.users. */
@@ -979,7 +982,7 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     failIndexCatalog = false,
     failDropIndex = false,
     failSizing = false,
-    failTeardownReset = false,
+    failTeardownReset,
     failTeardownRollback = false,
     columns = ["id", "status", "created_at"],
   } = options;
@@ -1092,6 +1095,15 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
       killSocket();
       throw deadError(true);
     }
+    if (sql.includes("pg_terminate_backend(pg_backend_pid())")) {
+      // What the server does with it, measured on PG15 and PG18: answers the
+      // statement with 57P01 and closes the socket. Refused like anything
+      // else in an aborted transaction, and outside one it is an error too.
+      if (!inTransaction) throw noTransaction("pg_terminate_backend probe");
+      if (aborted) throw abortedError();
+      killSocket();
+      throw pgError("terminating connection due to administrator command", "57P01");
+    }
     if (sql.startsWith("BEGIN")) {
       if (failBegin) throw abortedError();
       if (aborted) throw abortedError();
@@ -1167,7 +1179,8 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
         throw pgError("function hypopg_reset() does not exist", "42883");
       }
       if (failEntryReset === "timeout" && resetCalls === 1) throw timeout();
-      if (failTeardownReset && resetCalls > 1) throw timeout();
+      if (failTeardownReset === "always" && resetCalls > 1) throw timeout();
+      if (failTeardownReset === "once" && resetCalls === 2) throw timeout();
       liveHypoIndexes = 0;
       return ok("SELECT");
     }
@@ -1798,18 +1811,84 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
     });
   });
 
-  it("destroys the connection instead of pooling it when the teardown reset fails", async () => {
-    await withStubbedServer({ failTeardownReset: true }, async (session) => {
+  it("retries a teardown reset a live server refused, and keeps the connection when the retry succeeds", async () => {
+    // The refused reset aborted the transaction; the teardown savepoint
+    // survives the first ROLLBACK TO, so a second one clears the abort and the
+    // reset runs again, still pinned to the backend holding the indexes.
+    await withStubbedServer({ failTeardownReset: "once" }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as { ok: boolean };
+      assert.equal(result.ok, true);
+      assert.equal(session.count("ROLLBACK TO SAVEPOINT __pgmcp_advisor_teardown"), 2);
+      assert.equal(session.sent("hypopg_reset"), 3, "entry, the refused teardown reset, and its retry");
+      assert.equal(session.sent("pg_terminate_backend"), 0, "a backend was terminated over a transient");
+      assert.ok(
+        session.stderr.some((l) => /succeeded on retry; the connection is kept/.test(l)),
+        JSON.stringify(session.stderr),
+      );
+      assertSessionClean(session);
+    });
+  });
+
+  it("terminates its own backend when the teardown reset fails twice on a live server, then discards", async () => {
+    // Discarding the connection alone ends at a transaction-mode pooler; the
+    // backend would keep the hypothetical indexes for its next client. Ending
+    // the backend from inside the transaction is pinned to the right one.
+    await withStubbedServer({ failTeardownReset: "always" }, async (session) => {
       const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as { ok: boolean };
       // Cleanup never replaces the call's own result.
       assert.equal(result.ok, true);
-      assert.ok(session.liveHypoIndexes() > 0, "precondition: the failed reset left indexes behind");
-      assert.equal(session.releases.length, 1);
+      const terminate = session.statements.find((s) => s.sql.includes("pg_terminate_backend(pg_backend_pid())"));
+      assert.ok(terminate, "the backend was not terminated");
+      assert.equal(terminate.inTransaction, true, "the terminate was sent after the transaction ended");
+      assert.equal(terminate.code, "57P01", "the server's answer to a terminate is 57P01, and it must not be refused");
+      assert.equal(session.sent("hypopg_reset"), 3, "the reset was not retried before terminating");
+      assert.equal(
+        session.statements.at(-1)?.sql,
+        TERMINATE_OWN_BACKEND_SQL,
+        "something was sent to a backend that is gone",
+      );
+      assert.equal(session.statements.filter((s) => s.sql === "ROLLBACK").length, 0);
       const released = session.releases[0];
-      assert.ok(released instanceof Error, "a connection still holding hypothetical indexes went back to the pool");
-      assert.match(released.message, /teardown failed/);
+      assert.ok(released instanceof Error, "a connection whose backend was ended went back to the pool");
+      assert.match(released.message, /^pg_index_advisor teardown failed twice, backend terminated: /);
       assert.match(released.message, new RegExp(TIMEOUT.message));
     });
+  });
+
+  it("neither retries nor terminates when the teardown reset failed because the socket died", async () => {
+    // No SQLSTATE means no server answered: nothing to retry against, no
+    // backend to end. The connection is discarded and that is all.
+    await withStubbedServer({ dieDuring: { containing: "hypopg_reset", ordinal: 2 } }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as { ok: boolean };
+      assert.equal(result.ok, true);
+      assert.equal(session.sent("hypopg_reset"), 2, "a dead socket was retried");
+      assert.equal(
+        session.sent("ROLLBACK TO SAVEPOINT __pgmcp_advisor_teardown"),
+        1,
+        "a retry's ROLLBACK TO was sent into a dead socket",
+      );
+      assert.equal(session.sent("pg_terminate_backend"), 0, "a dead socket was 'terminated'");
+      assert.ok(session.releases[0] instanceof Error);
+    });
+  });
+
+  it("does not claim to have terminated a backend when the socket died during the retry", async () => {
+    // A live server refused the first teardown reset; the socket dies during
+    // the retry. There is no backend left to end, and the discard reason must
+    // not say there was.
+    await withStubbedServer(
+      { failTeardownReset: "once", dieDuring: { containing: "hypopg_reset", ordinal: 3 } },
+      async (session) => {
+        const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as { ok: boolean };
+        assert.equal(result.ok, true);
+        assert.equal(session.sent("hypopg_reset"), 3, "the retry was not attempted");
+        assert.equal(session.sent("pg_terminate_backend"), 0, "a dead socket was 'terminated'");
+        const released = session.releases[0];
+        assert.ok(released instanceof Error);
+        assert.doesNotMatch(released.message, /backend terminated/);
+        assert.match(released.message, new RegExp(TIMEOUT.message));
+      },
+    );
   });
 
   it("destroys the connection when the teardown ROLLBACK fails, naming that failure", async () => {
