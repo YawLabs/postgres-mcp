@@ -41,28 +41,49 @@ const ADVISOR_SAVEPOINT = "__pgmcp_advisor_sp";
 const ADVISOR_TEARDOWN_SAVEPOINT = "__pgmcp_advisor_teardown";
 
 /**
+ * Called when the advisor's transaction can no longer be used: a savepoint
+ * statement itself failed, which means the transaction is already aborted or
+ * the connection is gone. Everything sent after that is refused, so the search
+ * has to stop and say so rather than read every refusal as a soft "skip".
+ */
+type OnTransactionLost = (error: string | undefined) => void;
+
+/**
  * Run one statement behind {@link ADVISOR_SAVEPOINT}, so its failure cannot
  * abort the advisor's transaction and take every later statement down with
  * SQLSTATE 25P02.
  *
  * `ROLLBACK TO` clears the aborted state but LEAVES the savepoint in place, so
  * the `RELEASE` after it is still required -- skipping it leaks one savepoint
- * per failed statement for the life of the transaction. A `SAVEPOINT` that
- * itself fails means the transaction is already aborted or the connection is
- * gone; the caller sees that as the statement's failure.
+ * per failed statement for the life of the transaction.
+ *
+ * Two kinds of failure come out of here, and the caller must not confuse them.
+ * The STATEMENT failing is the isolated, soft case the savepoint exists for.
+ * The SAVEPOINT failing is not: it can only fail when the transaction is
+ * aborted or the connection is dead, and after that every later isolated
+ * statement fails the same way. That case is reported through `onLost` (and
+ * also returned as a failure, since no result exists). A ROLLBACK TO or
+ * RELEASE that fails leaves the transaction aborted too, but nothing checks
+ * them here: the next isolated statement's SAVEPOINT is refused and reports
+ * it, and a statement that already ran keeps its result.
  */
 async function runIsolated<R extends Record<string, unknown>>(
   run: SharedRunner,
   sql: string,
   params: unknown[] = [],
   options?: Parameters<SharedRunner>[2],
+  onLost?: OnTransactionLost,
 ): Promise<ApiResponse<R[]>> {
   const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-  if (!sp.ok) return { ok: false, error: sp.error };
+  if (!sp.ok) {
+    onLost?.(sp.error);
+    return { ok: false, error: sp.error };
+  }
   const res = await run<R>(sql, params, options);
   if (!res.ok) {
-    await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-    await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    const restored = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    // A RELEASE into a still-aborted transaction would only be refused too.
+    if (restored.ok) await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
     return res;
   }
   await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
@@ -859,8 +880,12 @@ const BIND_COUNT_MISMATCH = /\(code: 08P01\)/;
  * defended by the default suite instead of only by a run someone remembers to
  * opt into.
  */
-export async function assertSingleStatement(run: SharedRunner, explainSql: string): Promise<ExplainOutcome> {
-  const probe = await runIsolated<{ "QUERY PLAN": unknown }>(run, explainSql, [], { extended: true });
+export async function assertSingleStatement(
+  run: SharedRunner,
+  explainSql: string,
+  onLost?: OnTransactionLost,
+): Promise<ExplainOutcome> {
+  const probe = await runIsolated<{ "QUERY PLAN": unknown }>(run, explainSql, [], { extended: true }, onLost);
   if (probe.ok) {
     // No placeholders: the validating call WAS a complete, protocol-guarded
     // EXPLAIN, so its plan is returned rather than paying a second round trip
@@ -900,10 +925,15 @@ function buildExplainSql(sql: string, useGenericPlan: boolean): string {
   return `EXPLAIN (${flags.join(", ")}) ${sql}`;
 }
 
-async function explainStatement(run: SharedRunner, sql: string, useGenericPlan: boolean): Promise<ExplainOutcome> {
+async function explainStatement(
+  run: SharedRunner,
+  sql: string,
+  useGenericPlan: boolean,
+  onLost?: OnTransactionLost,
+): Promise<ExplainOutcome> {
   const explainSql = buildExplainSql(sql, useGenericPlan);
 
-  const result = await runIsolated<{ "QUERY PLAN": unknown }>(run, explainSql);
+  const result = await runIsolated<{ "QUERY PLAN": unknown }>(run, explainSql, [], undefined, onLost);
   if (!result.ok) return { ok: false, error: result.error };
 
   const plan = result.data?.[0]?.["QUERY PLAN"];
@@ -919,7 +949,11 @@ async function explainStatement(run: SharedRunner, sql: string, useGenericPlan: 
  * ordering), and that is a normal outcome for a generated candidate, not a tool
  * failure.
  */
-async function createHypotheticalIndex(run: SharedRunner, candidate: IndexCandidate): Promise<number | null> {
+async function createHypotheticalIndex(
+  run: SharedRunner,
+  candidate: IndexCandidate,
+  onLost?: OnTransactionLost,
+): Promise<number | null> {
   const cols = candidate.columns.map(quoteIdent).join(", ");
   const createSql =
     `CREATE INDEX ON ${quoteQualified(candidate.schema, candidate.table)} ` +
@@ -930,6 +964,8 @@ async function createHypotheticalIndex(run: SharedRunner, candidate: IndexCandid
     run,
     "SELECT (hypopg_create_index($1)).indexrelid AS indexrelid",
     [createSql],
+    undefined,
+    onLost,
   );
   if (!res.ok) return null;
   const raw = res.data?.[0]?.indexrelid;
@@ -1261,11 +1297,19 @@ export const indexAdvisorTools = [
         // hypopg_reset() to a server where the first one already failed.
         let teardownSavepointTaken = false;
         let hypopgUsable = false;
-        // Set when a failure has aborted the transaction mid-search. Everything
-        // after it would be refused with 25P02, so the search stops spending
-        // round trips and the call reports the abort instead of a partial
-        // result that looks complete.
-        let searchAborted: string | undefined;
+        // Set when the transaction can no longer be used: a failure outside a
+        // savepoint aborted it, a savepoint statement itself was refused, or the
+        // connection died. Everything after that would be refused, so the search
+        // stops spending round trips and the call reports the loss instead of a
+        // partial result that looks complete. The first cause wins.
+        let transactionLost: string | undefined;
+        const onLost: OnTransactionLost = (error) => {
+          transactionLost ??= error ?? "unknown error";
+        };
+        const lostError = (): ApiResponse => ({
+          ok: false,
+          error: `the search stopped because its transaction could no longer be used: ${transactionLost}`,
+        });
 
         try {
           const outer = await run(`SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
@@ -1318,7 +1362,7 @@ export const indexAdvisorTools = [
             // greedy loop does. A rejected statement gets a null baseline, and
             // every later stage is already gated on that -- `evaluate` skips
             // any index whose baseline is null -- so it is never sent again.
-            const guard = await assertSingleStatement(run, buildExplainSql(statement.sql, parameterized));
+            const guard = await assertSingleStatement(run, buildExplainSql(statement.sql, parameterized), onLost);
             if (!guard.ok) {
               baselineCosts.push(null);
               rawPlans.push(undefined);
@@ -1334,7 +1378,7 @@ export const indexAdvisorTools = [
               continue;
             }
 
-            const outcome = await explainStatement(run, statement.sql, parameterized);
+            const outcome = await explainStatement(run, statement.sql, parameterized, onLost);
             if (!outcome.ok) {
               baselineCosts.push(null);
               rawPlans.push(undefined);
@@ -1344,6 +1388,12 @@ export const indexAdvisorTools = [
             baselineCosts.push(outcome.cost ?? null);
             rawPlans.push(outcome.plan);
           }
+
+          // Checked before the "nothing could be planned" verdict: with the
+          // transaction gone, the reasons above are all the same refusal, and
+          // the next unisolated read would fail with a message about an aborted
+          // transaction rather than about what aborted it.
+          if (transactionLost !== undefined) return lostError();
 
           if (baselineCosts.every((c) => c === null)) {
             return {
@@ -1467,6 +1517,8 @@ export const indexAdvisorTools = [
                 AND n.nspname = ANY($1)
                 AND c.relname = ANY($2)`,
             [schemas, tables],
+            undefined,
+            onLost,
           );
           if (idxRes.ok) {
             for (const row of idxRes.data ?? []) {
@@ -1530,15 +1582,15 @@ export const indexAdvisorTools = [
             // Null reads to greedySearch as "could not be costed", which refunds
             // the budget -- the right accounting for a candidate that was never
             // sent because the transaction is already gone.
-            if (searchAborted !== undefined) return null;
-            const created = await createHypotheticalIndex(run, candidate);
+            if (transactionLost !== undefined) return null;
+            const created = await createHypotheticalIndex(run, candidate, onLost);
             if (created === null) return null;
             try {
               const costs = new Map<number, number>();
               for (const index of statementIndices) {
                 const statement = workload[index];
                 if (!statement || baselineCosts[index] === null) continue;
-                const outcome = await explainStatement(run, statement.sql, needsGenericPlan[index] ?? false);
+                const outcome = await explainStatement(run, statement.sql, needsGenericPlan[index] ?? false, onLost);
                 // A statement that planned at baseline but fails now is not
                 // evidence the index hurt -- it is a transient the search must
                 // not act on, so its baseline cost stands.
@@ -1557,7 +1609,7 @@ export const indexAdvisorTools = [
               // way. The failure has aborted the transaction; recording it is
               // what turns "ok: true with a partial list" into a reported error.
               const dropped = await run("SELECT hypopg_drop_index($1)", [created]);
-              if (!dropped.ok) searchAborted ??= dropped.error;
+              if (!dropped.ok) onLost(`a hypothetical index could not be dropped (${dropped.error})`);
             }
           };
 
@@ -1578,11 +1630,11 @@ export const indexAdvisorTools = [
           const onAccept = async (candidate: IndexCandidate): Promise<void> => {
             // Nothing can be kept in place in an aborted transaction, and the
             // warning below would misattribute that to HypoPG.
-            if (searchAborted !== undefined) {
+            if (transactionLost !== undefined) {
               acceptedOids.push(null);
               return;
             }
-            const oid = await createHypotheticalIndex(run, candidate);
+            const oid = await createHypotheticalIndex(run, candidate, onLost);
             acceptedOids.push(oid);
             if (oid === null) {
               warnings.push(
@@ -1609,14 +1661,10 @@ export const indexAdvisorTools = [
             onAccept,
           });
 
-          if (searchAborted !== undefined) {
-            return {
-              ok: false,
-              error:
-                "the search stopped because a hypothetical index could not be dropped, so any result would " +
-                `have been measured against indexes that should not have been there: ${searchAborted}`,
-            };
-          }
+          // Covers the drop failure and every savepoint statement the search
+          // sent into a transaction that was already gone. Either way the
+          // accepted list is not the search's answer, only where it stopped.
+          if (transactionLost !== undefined) return lostError();
 
           if (search.budgetExhausted) {
             warnings.push(
@@ -1635,7 +1683,10 @@ export const indexAdvisorTools = [
           // here, so the common path issues no redundant CREATE at all.
           const sizes: (string | null)[] = [];
           for (const [i, entry] of search.accepted.entries()) {
-            const oid = acceptedOids[i] ?? (await createHypotheticalIndex(run, entry.candidate));
+            // The search itself is complete by now, so losing the transaction
+            // here costs only the sizes: each later one comes back unknown, and
+            // the warning below says why.
+            const oid = acceptedOids[i] ?? (await createHypotheticalIndex(run, entry.candidate, onLost));
             if (oid === null) {
               sizes.push(null);
               continue;
@@ -1647,8 +1698,16 @@ export const indexAdvisorTools = [
               run,
               "SELECT hypopg_relation_size($1)::text AS bytes",
               [oid],
+              undefined,
+              onLost,
             );
             sizes.push(sizeRes.ok ? (sizeRes.data?.[0]?.bytes ?? null) : null);
+          }
+          if (transactionLost !== undefined) {
+            warnings.push(
+              `the transaction was lost while sizing the recommended indexes (${transactionLost}), so ` +
+                "`estimated_size_bytes` is missing; the recommendations themselves were measured before that",
+            );
           }
 
           const weightedBaseline = baselineCosts.reduce<number>(
