@@ -477,13 +477,18 @@ info "Unit tests passed"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode -- integration matrix is a local-only pre-tag gate, skipping in CI"
 elif command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\0' | grep -q Ubuntu; then
-  # Translate a Git Bash drive-letter prefix (/c/, /d/, ...) into the WSL
-  # equivalent (/mnt/c/, /mnt/d/, ...). Hardcoding /c/ broke contributors
-  # working from any other drive.
-  WSL_REPO="$(echo "$SCRIPT_DIR" | sed -E 's|^/([a-z])/|/mnt/\1/|')"
+  # Translate the repo path into its WSL form (/mnt/<drive>/...). Ask MSYS for
+  # the Windows path (`pwd -W`; `cygpath -m` under Cygwin) rather than
+  # rewriting the POSIX one: Git Bash mounts more than drive letters -- /tmp is
+  # %LOCALAPPDATA%\Temp -- so a repo there came through as /tmp/... untouched,
+  # WSL had no such path, and the release aborted with "No such file or
+  # directory". The /<drive>/ rewrite stays as the fallback for a shell that
+  # offers neither.
+  WIN_REPO="$(cd "$SCRIPT_DIR" && { pwd -W 2>/dev/null || cygpath -m "$SCRIPT_DIR" 2>/dev/null || echo "$SCRIPT_DIR"; })"
+  WSL_REPO="$(echo "$WIN_REPO" | sed -E 's|^([A-Za-z]):/|/mnt/\L\1/|; s|^/([a-z])/|/mnt/\1/|')"
   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root bash "${WSL_REPO}/scripts/wsl-test-matrix.sh" \
-    || fail "Integration matrix failed against PG17/PG18 -- aborting release"
-  info "Integration matrix passed (PG17 + PG18)"
+    || fail "Integration matrix failed (every PostgreSQL cluster in WSL Ubuntu is tested; see its output above) -- aborting release"
+  info "Integration matrix passed on every PostgreSQL cluster in WSL Ubuntu"
 elif [ "${REQUIRE_MATRIX:-}" = "1" ]; then
   # REQUIRE_MATRIX=1 turns the "WSL not detected" warning into a hard fail.
   # Default is still warn-only so contributors without WSL can tag -- the
