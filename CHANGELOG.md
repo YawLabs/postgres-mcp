@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is attached, and the query in flight is rejected either way. Every checkout
   now carries a listener for as long as it is out; a death is logged to stderr,
   the call returns its error, and the dead connection is dropped from the pool.
+  One contract change rides along: when the user's statement succeeded and
+  only the closing `ROLLBACK` failed, `pg_readonly`, `pg_query` and
+  `pg_explain` now return the rows (`ok: true`) and discard the connection,
+  where before they returned `ok: false` and pooled a connection whose
+  transaction state was unknown. Nothing persists either way -- the
+  transaction was read-only or always-rollback -- so the rows are real.
 - **`pg_explain` runs its HypoPG cleanup inside the transaction, and drops the
   connection if that cleanup fails.** `hypopg_reset()` ran after the ROLLBACK,
   in autocommit. Behind a transaction-mode pooler (PgBouncer, which the README
@@ -44,7 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   savepoint taken before the indexes are created, so it works whether or not
   the user's statement aborted the transaction, and before the final
   `ROLLBACK`. A cleanup that still fails destroys the connection instead of
-  returning it to the pool; the plan itself is still returned.
+  returning it to the pool; the plan itself is still returned. (Behind a
+  transaction-mode pooler that destroy ends at the pooler: the backend keeps
+  what the failed cleanup left until its next client, which is why the
+  cleanup now runs inside the transaction in the first place.)
 - **`pg_index_advisor` no longer strands hypothetical indexes on a pooled
   connection when its transaction aborts.** The teardown ran `hypopg_reset()`
   before `ROLLBACK`. Two statements run outside a savepoint while hypothetical

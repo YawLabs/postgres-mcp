@@ -581,7 +581,10 @@ function toQueryResult(
  * A teardown that fails leaves the session in a state the next borrower of
  * this pooled connection would inherit, so the connection is destroyed
  * instead of reused (and stderr says so). The call's own result is never
- * replaced by a teardown failure.
+ * replaced by a teardown failure. What the destroy isolates is THIS process's
+ * connection: behind a transaction-mode pooler it ends at the pooler, and the
+ * backend keeps whatever the failed teardown left until its next client -- the
+ * same limit {@link SharedClientControls.discard} documents.
  *
  * **Reserved savepoint names:** `runUserQueryBounded` opens
  * `SAVEPOINT __pgmcp_sp` around the user SQL and `RELEASE`s it at the end,
@@ -627,8 +630,9 @@ async function acquireClient(): Promise<{ client: pg.PoolClient; release: (disca
     client,
     release: (discard) => {
       if (discard) console.error(`[postgres-mcp] discarding pooled connection: ${discard.message}`);
-      // Removed AFTER release: pg-pool ends a client it is not keeping, and an
-      // `error` that emits during that end still needs a listener.
+      // Removed after release. pg-pool re-attaches its own idle listener as
+      // the first thing release() does, so the order is not load-bearing; it
+      // just keeps the checkout's listener on for the whole checkout.
       client.release(discard);
       client.removeListener("error", onError);
     },
@@ -652,18 +656,63 @@ async function finishTransaction(
     try {
       await fn();
     } catch (err) {
-      failure ??= new Error(
-        `${what} failed, connection discarded: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const message = `${what} failed: ${err instanceof Error ? err.message : String(err)}`;
+      // Every failure is logged; the first one is the discard reason.
+      if (failure) console.error(`[postgres-mcp] ${message}`);
+      failure ??= new Error(message);
     }
   };
-  if (teardown) {
-    if (state.hookSavepoint)
-      await attempt("hook savepoint rollback", () => client.query(`ROLLBACK TO SAVEPOINT ${HOOK_SAVEPOINT}`));
+  // The hook savepoint is taken before setup, so without it setup never ran
+  // and there is nothing for teardown to undo -- sending it into what is now
+  // an aborted transaction would only fail with 25P02 and discard a clean
+  // connection over it.
+  if (teardown && state.hookSavepoint) {
+    await attempt("hook savepoint rollback", () => client.query(`ROLLBACK TO SAVEPOINT ${HOOK_SAVEPOINT}`));
     await attempt("teardown", () => teardown(client));
   }
   await attempt("ROLLBACK", () => client.query("ROLLBACK"));
   return failure;
+}
+
+/**
+ * The shared body of {@link runReadOnly} and {@link runReadWriteRollback}:
+ * open the transaction, run the hooks and the user SQL inside it, end it, and
+ * only THEN resolve type names -- the pg_type read is a catalog query that
+ * needs no transaction, and running it before the ROLLBACK would hold the
+ * user statement's locks (row locks, for an EXPLAIN ANALYZE of DML) across an
+ * extra round trip on a cold cache.
+ */
+async function runUserSqlInTransaction(
+  begin: string,
+  sql: string,
+  params: unknown[],
+  hooks: RunHooks,
+): Promise<ApiResponse<QueryResult>> {
+  const { client, release } = await acquireClient();
+  const maxRows = getMaxRows();
+  const state = { began: false, hookSavepoint: false };
+  let outcome: { result: pg.QueryResult; viaCursor: boolean } | undefined;
+  let failed: ApiResponse<QueryResult> | undefined;
+  try {
+    await client.query(begin);
+    state.began = true;
+    if (hooks.teardown) {
+      await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
+      state.hookSavepoint = true;
+    }
+    if (hooks.setup) await hooks.setup(client);
+    outcome = await runUserQueryAudited(client, sql, params, maxRows);
+  } catch (err) {
+    failed = { ok: false, error: formatPgError(err) };
+  }
+  const discard = await finishTransaction(client, state, hooks.teardown);
+  try {
+    if (failed || !outcome) return failed ?? { ok: false, error: "no result" };
+    const typeNames = await safeResolveTypeNames(client, outcome.result.fields);
+    return { ok: true, data: toQueryResult(outcome.result, maxRows, typeNames, outcome.viaCursor) };
+  } finally {
+    release(discard);
+  }
 }
 
 export async function runReadOnly(
@@ -671,25 +720,7 @@ export async function runReadOnly(
   params: unknown[] = [],
   hooks: RunHooks = {},
 ): Promise<ApiResponse<QueryResult>> {
-  const { client, release } = await acquireClient();
-  const maxRows = getMaxRows();
-  const state = { began: false, hookSavepoint: false };
-  try {
-    await client.query("BEGIN READ ONLY");
-    state.began = true;
-    if (hooks.teardown) {
-      await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
-      state.hookSavepoint = true;
-    }
-    if (hooks.setup) await hooks.setup(client);
-    const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
-    const typeNames = await safeResolveTypeNames(client, result.fields);
-    return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
-  } catch (err) {
-    return { ok: false, error: formatPgError(err) };
-  } finally {
-    release(await finishTransaction(client, state, hooks.teardown));
-  }
+  return runUserSqlInTransaction("BEGIN READ ONLY", sql, params, hooks);
 }
 
 /** Run user-provided SQL in a read-write transaction. Requires ALLOW_WRITES=1. */
@@ -738,25 +769,7 @@ export async function runReadWriteRollback(
       error: "Write blocked: ALLOW_WRITES is not set. Set ALLOW_WRITES=1 in the MCP server env to enable DML/DDL.",
     };
   }
-  const { client, release } = await acquireClient();
-  const maxRows = getMaxRows();
-  const state = { began: false, hookSavepoint: false };
-  try {
-    await client.query("BEGIN");
-    state.began = true;
-    if (hooks.teardown) {
-      await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
-      state.hookSavepoint = true;
-    }
-    if (hooks.setup) await hooks.setup(client);
-    const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
-    const typeNames = await safeResolveTypeNames(client, result.fields);
-    return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
-  } catch (err) {
-    return { ok: false, error: formatPgError(err) };
-  } finally {
-    release(await finishTransaction(client, state, hooks.teardown));
-  }
+  return runUserSqlInTransaction("BEGIN", sql, params, hooks);
 }
 
 /**

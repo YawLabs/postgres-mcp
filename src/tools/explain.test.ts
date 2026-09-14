@@ -399,6 +399,13 @@ interface StubSession {
 interface StubBehavior {
   /** Statements the fake server rejects, with a statement timeout. */
   failWhen?: (sql: string) => boolean;
+  /**
+   * Report a real column type on the FETCH so type-name resolution has an oid
+   * to look up, and answer the pg_type read. Off by default: an empty field
+   * list short-circuits the lookup, which keeps every other test's statement
+   * trace free of it.
+   */
+  typedFields?: boolean;
 }
 
 // runUserQueryBounded wraps the user statement in this, so the EXPLAIN the
@@ -471,7 +478,11 @@ async function withStubbedServer<T>(
         // test below would prove nothing about the real FETCH maxRows+1 path.
         const limit = Number(fetch[1]);
         const rows = planRows.slice(0, limit).map((line) => ({ "QUERY PLAN": line }));
-        return { rows, fields: [], command: "FETCH", rowCount: rows.length };
+        const fields = behavior.typedFields ? [{ name: "QUERY PLAN", dataTypeID: 25 }] : [];
+        return { rows, fields, command: "FETCH", rowCount: rows.length };
+      }
+      if (sql.includes("FROM pg_catalog.pg_type")) {
+        return { rows: [{ oid: 25, typname: "text" }], fields: [], command: "SELECT", rowCount: 1 };
       }
       if (sql.includes("hypopg_create_index")) {
         // A null/absent indexname makes buildHypopgHooks' setup throw, which
@@ -821,5 +832,82 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
       assert.equal(o.reset, -1);
       assert.equal(o.rollback, o.last);
     });
+  });
+
+  it("resolves type names AFTER the transaction has ended, so the pg_type read holds no user locks", async () => {
+    // On a cold cache the lookup is a catalog round trip. Before the teardown
+    // rework it ran after the ROLLBACK; a rework that pulled ROLLBACK into
+    // `finally` briefly moved it inside the still-open transaction, where an
+    // EXPLAIN ANALYZE of DML would hold its row locks across it. Pinned for
+    // both the plain path and the hooks path.
+    for (const input of [{ sql: "SELECT 1", format: "text" }, withIndexes]) {
+      await withStubbedServer(
+        180_000,
+        async (session) => {
+          const result = (await pgExplain.handler(input)) as { ok: boolean };
+          assert.equal(result.ok, true);
+          const sqls = session.statements.map((s) => s.sql);
+          const typeRead = sqls.findIndex((s) => s.includes("FROM pg_catalog.pg_type"));
+          const rollback = sqls.indexOf("ROLLBACK");
+          assert.ok(typeRead >= 0, "precondition: a pg_type read happened (typedFields)");
+          assert.ok(typeRead > rollback, `pg_type read at #${typeRead} ran before ROLLBACK at #${rollback}`);
+          assert.deepEqual(session.releases, [undefined]);
+        },
+        undefined,
+        { typedFields: true },
+      );
+    }
+  });
+
+  it("logs every cleanup failure, not only the one that becomes the discard reason", async () => {
+    // The reset fails AND the ROLLBACK fails. The first is the discard reason;
+    // without its own log line the second would vanish, and an operator
+    // reading stderr would not know the transaction was left open too.
+    const originalError = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    try {
+      await withStubbedServer(
+        180_000,
+        async (session) => {
+          const result = (await pgExplain.handler(withIndexes)) as { ok: boolean };
+          assert.equal(result.ok, true);
+          const released = session.releases[0];
+          assert.ok(released instanceof Error);
+          assert.match(released.message, /^teardown failed/);
+          assert.ok(
+            logged.some((l) => /\[postgres-mcp\] ROLLBACK failed: .*statement timeout/.test(l)),
+            `the ROLLBACK failure never reached stderr: ${JSON.stringify(logged)}`,
+          );
+        },
+        undefined,
+        { failWhen: (sql) => sql.includes("hypopg_reset") || sql === "ROLLBACK" },
+      );
+    } finally {
+      console.error = originalError;
+    }
+  });
+
+  it("does not run teardown when the hook savepoint itself was refused: nothing was set up", async () => {
+    // A cancel landing on SAVEPOINT __pgmcp_hooks aborts the transaction
+    // before setup ran. Sending hypopg_reset() into it would only be refused
+    // with 25P02 and discard a clean connection over its own noise.
+    await withStubbedServer(
+      180_000,
+      async (session) => {
+        const result = (await pgExplain.handler(withIndexes)) as { ok: boolean; error?: string };
+        assert.equal(result.ok, false);
+        assert.match(result.error ?? "", /statement timeout/);
+        const sqls = session.statements.map((s) => s.sql);
+        assert.equal(sqls.filter((s) => s.includes("hypopg_reset")).length, 0, "teardown ran with nothing to undo");
+        assert.equal(sqls.filter((s) => s.startsWith("ROLLBACK TO")).length, 0);
+        assert.equal(sqls.indexOf("ROLLBACK"), sqls.length - 1);
+        assert.deepEqual(session.releases, [undefined], "a clean connection was discarded");
+      },
+      undefined,
+      { failWhen: (sql) => sql === "SAVEPOINT __pgmcp_hooks" },
+    );
   });
 });
