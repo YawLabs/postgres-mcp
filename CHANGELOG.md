@@ -11,8 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and
   server.json title/repository/websiteUrl.
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release --
+  promoting `[Unreleased]` when it has content, otherwise generating one from
+  the commit subjects since the previous tag -- keeps Keep-a-Changelog link
+  references current when a file has them, and takes the GitHub release notes
+  from that entry instead of from `git log` subjects. Before this, a release
+  with nothing under `[Unreleased]` got no entry at all, and every GitHub
+  release page showed raw commit subjects.
 
 ## [0.13.0] - 2026-09-13
+
+No runtime changes.
+
+### Changed
+
+- **`release.sh` waits for npm to serve the version before publishing to the
+  MCP Registry.** `npm publish` returns when the registry accepts the tarball,
+  but the version is not yet readable from npm's CDN-backed read path, and the
+  MCP Registry validates by reading it -- so the registry step could fail with
+  `version 'x.y.z' was not found (status: 404)` and need a re-run. The wait
+  polls the exact URL the registry's validator fetches with `curl` (not
+  `npm view`, whose metadata cache can outlast the condition), warns rather
+  than fails on timeout so `mcp-publisher` still reports its own error, and
+  can be skipped with `SKIP_NPM_WAIT=1` or retuned with `NPM_WAIT_TIMEOUT_S`
+  (#45).
+- README: the X follow badge moved from the top of the page to the bottom, so
+  the description leads on npm and GitHub (#46).
 
 ### Documentation
 
