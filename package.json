@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/postgres-mcp",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "mcpName": "io.github.YawLabs/postgres-mcp",
   "description": "PostgreSQL MCP server, read-only by default: query, schema introspection, EXPLAIN plans, index advisor, and DBA health checks.",
   "license": "MIT",
