@@ -135,10 +135,7 @@ No runtime changes.
   `ALLOW_WRITES=1`, the duplicate `pg_list_roles` entry is gone, and the
   `ALLOW_WRITES` configuration row names `pg_kill`, which it also gates (#34).
 - The `EXPLAIN ANALYZE` rollback is described precisely: the written rows do
-  not persist, but a sequence the statement advanced stays advanced. The
-  `pg_explain` tool description -- the text an agent actually reads -- says the
-  same, and adds that a side effect of a function the statement called
-  (`pg_terminate_backend`, an advisory lock) persists too.
+  not persist, but a sequence the statement advanced stays advanced.
 
 ## [0.12.4] - 2026-09-13
 
