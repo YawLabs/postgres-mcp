@@ -741,6 +741,35 @@ the diff, so it is less detailed than the entries around it.
   repo has no `.github/` directory and why `release.sh` is the only release
   path; several stale comments referring to CI survived until 0.8.0.
 
+## [0.6.21] - 2026-06-11
+
+### Added
+
+- **A single-file binary for every supported platform, attached to the
+  GitHub release.** A new `release.yml` builds a Node SEA binary on each of
+  five runners -- linux-x64, win32-x64, win32-arm64, darwin-arm64 and
+  darwin-x64 -- because SEA cannot cross-compile (the carrier is the host
+  `node`). Each binary is smoke-tested with `--version` so a broken artifact
+  never ships, then uploaded with a `.sha256` sidecar to the release for the
+  tag. Distribution is through the Scoop bucket and the Homebrew tap, whose
+  package-manager fetch sets no quarantine or mark-of-the-web, so the
+  unsigned (on macOS, ad-hoc signed) binaries run without Gatekeeper or
+  SmartScreen friction. The build, staging and manifest-bump scripts
+  (`scripts/build-binary.mjs`, `scripts/stage-release-asset.mjs`,
+  `scripts/update-manifests.mjs`) and `sea-config.json` are the shared
+  `@yawlabs/mcp` pipeline, with everything derived from `package.json`;
+  `postject` joins the devDependencies. The workflow was removed again in
+  0.7.0 (#24).
+
+### Changed
+
+- The entrypoint no longer awaits `server.connect()` at the top level. The
+  binary build bundles it as CJS through esbuild, which cannot emit
+  top-level await, so the connect is a promise chain instead: the startup
+  banner still fires only once the transport is live, and a failed connect
+  is reported on stderr as a one-line message and exits 1. Behaviour is
+  otherwise unchanged.
+
 ## [0.6.20] - 2026-06-04
 
 ### Fixed
@@ -970,6 +999,64 @@ Release-flow hardening; no library behavior changes shipped in this version.
   - `pg_describe_table` on a materialized view -- `kind='materialized_view'`
     branch of the relkind CASE.
 
+## [0.6.9] - 2026-05-16
+
+Tagged but never published to npm: the `pg_top_queries` ordering test still
+failed in CI. The test was removed in 0.6.10, which is the release that
+shipped the other six coverage additions from 0.6.7.
+
+### Tests
+- The `pg_top_queries` `orderBy: 'calls'` test stages its marker queries
+  through `runInternal` as plain SELECTs instead of through the `pg_query`
+  handler. The handler wraps user SQL in `DECLARE ... CURSOR FOR ...`, which
+  made the test depend on `pg_stat_statements.track_utility=on` so the
+  DECLARE itself would be tracked -- a default the CI postgres image does not
+  guarantee, so the markers were tracked locally and invisible in CI. Plain
+  SELECTs are tracked regardless of that setting. The failure message now
+  dumps the tracked queries, so a future local-vs-CI divergence is
+  diagnosable from the assertion error.
+
+## [0.6.8] - 2026-05-16
+
+Tagged but never published to npm: the `pg_top_queries` ordering test still
+failed in CI after the change below. The next attempt is 0.6.9.
+
+### Tests
+- The `pg_top_queries` `orderBy: 'calls'` test calls
+  `pg_stat_statements_reset()` before staging its 12-call and 2-call
+  markers. CI starts with a fresh `pg_stat_statements` that accumulates 100+
+  distinct normalized queries from fixture setup and earlier integration
+  tests, which pushed the 2-call marker out of the handler's top-100 window
+  before the assertion could fire; the long-lived stats on a local WSL
+  cluster happened to keep it visible. When reset is unavailable (no
+  superuser, or no extension) the assertion is skipped rather than failed.
+
+## [0.6.7] - 2026-05-16
+
+Tagged but never published to npm: the integration matrix failed on the
+`pg_top_queries` ordering test added below, a test-stability problem rather
+than a code one. The other six tests shipped in 0.6.10.
+
+### Tests
+- Seven integration tests for branches the suite had exercised on only one
+  side. No behaviour changes.
+  - `pg_inspect_locks` under real ACCESS EXCLUSIVE contention with two side
+    clients, covering the LATERAL `unnest(pg_blocking_pids(...))` and the
+    per-(blocked, blocker) row shape the 0.6.6 description promises.
+  - `pg_top_queries` `orderBy: 'calls'` orders numerically, not lexically:
+    a 12-call query must rank above a 2-call one. Pins the alias-shadowing
+    fix from 0.4.1, where an unqualified `calls` resolved to the text output
+    alias and `"2"` beat `"12"`.
+  - `pg_table_bloat` `minDeadRatio`, as a relative property after ANALYZE
+    (filtered rows are at or above the threshold; baseline rows below it are
+    absent from the filtered set), because other tests mutate tuple counts
+    as a side effect and an absolute ratio cannot be hard-coded. Plus a
+    with-schema filter test for cross-schema leakage.
+  - `pg_seq_scan_tables` and `pg_unused_indexes` with no schema argument:
+    spans user schemas and excludes `pg_*` / `information_schema`.
+  - `pg_describe_table` on a materialized view, the
+    `kind='materialized_view'` branch of the relkind CASE.
+
 ## [0.6.6] - 2026-05-16
 
 ### Docs
@@ -996,6 +1083,25 @@ Release-flow hardening; no library behavior changes shipped in this version.
   signalling a superuser-owned backend; only a superuser can signal another
   superuser's session. The `note` field already disambiguated post-hoc; the
   description now matches.
+
+## [0.6.4] - 2026-05-15
+
+No runtime changes.
+
+### Infrastructure
+- Every release is also published to the Official MCP Registry
+  (registry.modelcontextprotocol.io), so the server is discoverable by
+  registry-aware hosts. A new `server.json` describes it as
+  `io.github.YawLabs/postgres-mcp` with its npm package and stdio
+  transport, `package.json` carries the matching `mcpName`, and
+  `release.yml` gained four steps: download `mcp-publisher`, sync
+  `server.json`'s version to the pushed tag, authenticate with GitHub OIDC
+  -- the `id-token: write` permission already granted for npm provenance
+  covers it, so no registry secret is needed -- and publish.
+
+### Docs
+- Backfilled the `[0.6.3]` heading. `release.sh` bumps `package.json` only;
+  changelog headings moved by hand.
 
 ## [0.6.3] - 2026-05-15
 
@@ -1099,6 +1205,39 @@ Release-flow hardening; no library behavior changes shipped in this version.
   default to read-only via `BEGIN READ ONLY`, and `pg_readonly` is the new
   unconditional read tool. Configuration table and troubleshooting entry
   for `ALLOW_WRITES` updated to point at the Configuring access section.
+
+## [0.5.4] - 2026-05-13
+
+No runtime changes.
+
+### Infrastructure
+- `deprecate.yml`, a `workflow_dispatch` workflow that runs `npm deprecate`
+  from CI with the org `NPM_TOKEN`, so deprecating a version range no longer
+  needs a local WebAuthn session. It mirrors `release.yml` -- inputs passed
+  as env vars, the shared `release-npm` concurrency group -- takes a
+  `versionRange` and a `message`, and its verify step retries the
+  public-registry view to outlast CDN propagation lag (10-30s is typical)
+  so the run log reflects the registry's real state.
+- That verify step checks whether ANY version carries the message as its
+  `deprecated` field, not just the highest one. Sampling the highest
+  non-current version was only right when the range covered it; a narrow
+  range such as `0.5.x` never touches the highest published version, so the
+  sampler timed out and warned "did not propagate" on a deprecate that had
+  landed. The package document is now fetched once per iteration with
+  `npm view --json` and counted locally with `jq`, which also drops the N+1
+  follow-up calls from the per-version state dump.
+
+### Docs
+- `docs/deprecated-postgres-mcp-sqli.md`: a self-contained writeup of the
+  stacked-query injection Datadog documented in the archived
+  `@modelcontextprotocol/server-postgres`, the structural fix here (the
+  extended query protocol, shipped in 0.3.3), a migration diff, and a short
+  tour of what else changes on a swap. A draft, not yet published.
+
+### Changed
+- Every em-dash (U+2014) across source, docs, README, this file, the
+  workflows and `release.sh` is now an ASCII hyphen. Mechanical; no logic
+  changes.
 
 ## [0.5.3] - 2026-05-14
 
@@ -1407,6 +1546,38 @@ Release-flow hardening; no library behavior changes shipped in this version.
   `--follow-tags` only pushes the tag(s) reachable from the commits being
   pushed -- but it ignores lightweight tags, so the tag-creation step had to
   switch to annotated to keep working.
+
+## [0.3.3] - 2026-04-24
+
+### Security
+- **User SQL is sent on the extended query protocol, closing a stacked-query
+  injection.** `client.query(sql, params)` with an empty `params` array fell
+  back to the simple protocol (pg's `requiresPreparation()` is
+  `values.length > 0`), and the simple protocol accepts several statements
+  in one request -- so `SELECT 1; COMMIT; DROP SCHEMA x CASCADE;` passed to
+  `pg_query` ended the `BEGIN READ ONLY` transaction mid-string and ran the
+  DDL in autocommit before the closing `ROLLBACK`. This is the class Datadog
+  Security Labs documented against the archived
+  `@modelcontextprotocol/server-postgres`. `runReadOnly`, `runReadWrite` and
+  `runReadWriteRollback` now send `{ text, values, queryMode: 'extended' }`,
+  and the extended protocol restricts each request to a single statement.
+  The trusted `runInternal` path is unchanged, so multi-statement fixture
+  setup still works. Two integration tests fire the payload at `pg_query`,
+  under the read-only default and with `ALLOW_WRITES=1`, and assert the
+  fixture schema survives. The README's "Why this one?" section states the
+  mechanism and links the writeup, and `@types/pg` is bumped `^8.11.10` ->
+  `^8.20.0` to track the runtime (#1). This entry sat under `[Unreleased]`
+  when the tag was cut and was later filed under the 0.4.0 heading above;
+  it shipped here.
+
+### Removed
+- The GitHub Actions workflows (`ci.yml`, `release.yml`) and Dependabot's
+  `github-actions` block. Releases are cut locally with `release.sh`, which
+  already runs lint, build, test, the version bump, commit, tag, push,
+  `npm publish` and `gh release create` in one idempotent pass. The README
+  drops its CI and Release badges and the "tested against real Postgres in
+  CI" line; the integration suite still runs locally with
+  `npm run test:integration`. 0.4.1 brought CI back.
 
 ## [0.3.2] - 2026-04-24
 
