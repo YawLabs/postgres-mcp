@@ -300,6 +300,54 @@ describe("withSharedClient connect failure propagates as a throw", () => {
   });
 });
 
+describe("withSharedClient discard: a connection with dirty session state is destroyed, not pooled", () => {
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalDbUrl = process.env.DATABASE_URL;
+  let releases: unknown[] = [];
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    releases = [];
+    const client = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      release: (err?: unknown) => {
+        releases.push(err);
+      },
+    };
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(client);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  // pg-pool keeps a client released with no argument and destroys one released
+  // with an Error, so the release argument IS the contract.
+  it("releases with no error when the callback does not discard", async () => {
+    await withSharedClient(async (run) => run("SELECT 1"));
+    assert.deepEqual(releases, [undefined]);
+  });
+
+  it("releases with the first discard reason, even when the callback then throws", async () => {
+    const first = new Error("first");
+    await assert.rejects(
+      withSharedClient(async (_run, { discard }) => {
+        discard(first);
+        discard(new Error("second"));
+        throw new Error("callback failed");
+      }),
+      /callback failed/,
+    );
+    assert.deepEqual(releases, [first]);
+  });
+});
+
 describe("index.ts wrapper shapes a withSharedClient connect throw into an error response", () => {
   const originalConnect = pg.Pool.prototype.connect;
   const originalDbUrl = process.env.DATABASE_URL;

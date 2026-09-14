@@ -749,6 +749,19 @@ export interface RunOnClientOptions {
   extended?: boolean;
 }
 
+/** Second argument to a {@link withSharedClient} callback. */
+export interface SharedClientControls {
+  /**
+   * Destroy the connection when the callback returns instead of handing it back
+   * to the pool. For a caller that created session state a ROLLBACK does not
+   * undo (HypoPG hypothetical indexes are the case in this codebase) and then
+   * failed to clean it up: a pooled connection would pass that state on to
+   * whichever call borrows it next. The first reason wins; later calls are
+   * no-ops.
+   */
+  discard(reason: Error): void;
+}
+
 export async function withSharedClient<T>(
   fn: (
     runOnClient: <R extends pg.QueryResultRow = pg.QueryResultRow>(
@@ -756,9 +769,16 @@ export async function withSharedClient<T>(
       params?: unknown[],
       options?: RunOnClientOptions,
     ) => Promise<ApiResponse<R[]>>,
+    controls: SharedClientControls,
   ) => Promise<T>,
 ): Promise<T> {
   const client = await getPool().connect();
+  let discardReason: Error | undefined;
+  const controls: SharedClientControls = {
+    discard(reason) {
+      discardReason ??= reason;
+    },
+  };
   try {
     const runOnClient = async <R extends pg.QueryResultRow = pg.QueryResultRow>(
       sql: string,
@@ -781,9 +801,11 @@ export async function withSharedClient<T>(
         return { ok: false, error: formatPgError(err) };
       }
     };
-    return await fn(runOnClient);
+    return await fn(runOnClient, controls);
   } finally {
-    client.release();
+    // pg-pool removes and ends a client released WITH an error, rather than
+    // keeping it idle for reuse.
+    client.release(discardReason);
   }
 }
 

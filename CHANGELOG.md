@@ -21,6 +21,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with nothing under `[Unreleased]` got no entry at all, and every GitHub
   release page showed raw commit subjects.
 
+### Fixed
+
+- **The server no longer exits when a connection it has checked out dies.**
+  pg-pool listens for `error` on idle connections but removes that listener
+  while a connection is checked out, and node-pg emits `error` on the client
+  when its socket dies. With no listener, that emit is an uncaught exception,
+  and the process ended -- so a `pg_terminate_backend` aimed at the server's
+  connection, an `idle_in_transaction_session_timeout`, or a network drop
+  during any tool call took the whole MCP server down. Measured on PostgreSQL
+  15: two uncaught exceptions with a checked-out client, none once a listener
+  is attached, and the query in flight is rejected either way. Every checkout
+  now carries a listener for as long as it is out; a death is logged to stderr,
+  the call returns its error, and the dead connection is dropped from the pool.
+- **`pg_explain` runs its HypoPG cleanup inside the transaction, and drops the
+  connection if that cleanup fails.** `hypopg_reset()` ran after the ROLLBACK,
+  in autocommit. Behind a transaction-mode pooler (PgBouncer, which the README
+  lists as supported) a backend is pinned to the connection only until the
+  transaction ends, so the reset could reach a different backend than the one
+  holding the hypothetical indexes -- and report success, leaving them to skew
+  the next plan on that backend. The cleanup now runs after a `ROLLBACK TO` a
+  savepoint taken before the indexes are created, so it works whether or not
+  the user's statement aborted the transaction, and before the final
+  `ROLLBACK`. A cleanup that still fails destroys the connection instead of
+  returning it to the pool; the plan itself is still returned.
+- **`pg_index_advisor` no longer strands hypothetical indexes on a pooled
+  connection when its transaction aborts.** The teardown ran `hypopg_reset()`
+  before `ROLLBACK`. Two statements run outside a savepoint while hypothetical
+  indexes are live -- dropping a costed candidate and sizing the accepted ones --
+  and when either failed (a statement timeout, a cancel), the transaction was
+  already aborted, so Postgres refused the reset with SQLSTATE 25P02 and the
+  indexes outlived the call. HypoPG indexes are session-scoped, so the
+  connection went back to the pool still carrying them, and the next
+  `pg_explain` or `pg_readonly` call to borrow it planned against indexes that
+  do not exist, until the next advisor call or the 60-second idle timeout
+  cleared them. No data was written. The teardown now rolls back to a savepoint
+  taken at the start of the call, which clears the aborted state while keeping
+  the transaction open -- and, behind a transaction-mode pooler such as
+  PgBouncer, keeps the same backend -- so the reset reaches the indexes on every
+  path. If cleanup still fails, the connection is destroyed instead of being
+  reused, and stderr says so.
+- **`pg_index_advisor` reports a search it could not finish instead of
+  returning a partial result as complete.** Once its transaction was lost --
+  a failed `hypopg_drop_index`, a socket death, a statement timeout landing on
+  one of its own savepoint statements -- every later candidate failed to
+  create, each failure read as "HypoPG declined this shape", and the call
+  returned `ok` with whatever had been accepted so far, or with an empty list
+  and no warning at all. A lost transaction is now recognised the moment a
+  savepoint statement is refused, the search stops sending, and the call
+  returns an error naming the first cause. A loss during the final sizing pass
+  keeps the recommendations (the search was complete) and says which sizes are
+  missing. The existing-index read and the sizing query are isolated behind
+  savepoints, so their soft failures (a warning, a null size) no longer take
+  the rest of the call down with them.
+- **`pg_index_advisor` says which candidates HypoPG refused to create, and
+  why.** A candidate whose `hypopg_create_index` failed was skipped without a
+  trace, indistinguishable from one that did not help. They are now listed in
+  one warning with the server's reason (capped at five, with a count).
+- **`pg_index_advisor` error messages say what failed.** The `hypopg_reset()`
+  on entry is checked: a HypoPG installed in a schema off the `search_path`
+  passes the extension probe and failed here with a cascade of "current
+  transaction is aborted"; it now fails with its own error and a hint about
+  `search_path` and EXECUTE. A failed column read names itself instead of
+  returning the bare Postgres error.
+- **`npm test` fails when a test suite throws while being collected.**
+  `node --test` prints such a suite as `not ok` but exits 0 with `# fail 0`
+  (measured on Node 22.22), so a `describe` whose body threw -- a bad import, a
+  fixture that could not be read -- left every test in that file silently
+  unrun and the run green. The runner now also writes TAP to a file and fails
+  on a top-level `not ok`.
+
+### Added
+
+- A unit test reads the README's Auto-allow and Always prompt lists back and
+  checks them against every registered tool's `readOnlyHint`: each tool must
+  appear in exactly one list, and in the one its annotation says. It is what
+  would have caught #34.
+
+### Documentation
+
+- The `pg_explain` tool description -- the text an agent actually reads -- now
+  says what an `EXPLAIN ANALYZE` rollback does not undo: a sequence the
+  statement advanced stays advanced, and a side effect of a function the
+  statement called (`pg_terminate_backend`, an advisory lock) persists.
+
 ## [0.13.0] - 2026-09-13
 
 No runtime changes.

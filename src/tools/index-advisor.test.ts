@@ -854,6 +854,14 @@ interface StubOptions {
   indexedCost?: number;
   /** Make every EXPLAIN throw, to drive the tool down its failure path. */
   failExplain?: boolean;
+  /**
+   * Make hypopg_relation_size throw, as a statement timeout or a cancel would.
+   * It runs outside any savepoint while the accepted indexes are live, so it
+   * ABORTS the transaction with them still in place.
+   */
+  failSizing?: boolean;
+  /** Make every hypopg_reset after the entry one throw, so the teardown itself fails. */
+  failTeardownReset?: boolean;
   /** Columns pg_attribute reports for public.users. */
   columns?: string[];
 }
@@ -863,6 +871,10 @@ interface StubSession {
   /** SQL texts seen, for order-sensitive assertions. */
   texts(): string[];
   count(fragment: string): number;
+  /** Hypothetical indexes still alive on the session -- what the next borrower inherits. */
+  liveHypoIndexes(): number;
+  /** The argument of each client.release() call; an Error there makes pg-pool destroy the client. */
+  releases: unknown[];
 }
 
 /**
@@ -884,6 +896,8 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     baselineCost = 1000,
     indexedCost = 10,
     failExplain = false,
+    failSizing = false,
+    failTeardownReset = false,
     columns = ["id", "status", "created_at"],
   } = options;
 
@@ -892,17 +906,29 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
   const originalDbUrl = process.env.DATABASE_URL;
 
   const statements: StubStatement[] = [];
+  const releases: unknown[] = [];
   const session: StubSession = {
     statements,
     texts: () => statements.map((s) => s.sql),
     count: (fragment) => statements.filter((s) => s.sql.includes(fragment)).length,
+    liveHypoIndexes: () => liveHypoIndexes,
+    releases,
   };
 
   // Hypothetical indexes are session state in the real server too, so the stub
   // models them as a counter rather than a boolean: the advisor creates and
   // drops them around each candidate, and a plan must only get cheaper while at
-  // least one is live.
+  // least one is live. Like the real server, ROLLBACK leaves them alone.
   let liveHypoIndexes = 0;
+  let resetCalls = 0;
+
+  // Transaction state, modelled because the teardown's correctness depends on
+  // it. A statement that fails inside a transaction ABORTS it, and from then on
+  // Postgres refuses everything except ROLLBACK / ROLLBACK TO SAVEPOINT with
+  // SQLSTATE 25P02. Without this, a stub accepts a statement the real server
+  // would refuse, and a teardown that leaks on a live database passes here.
+  let inTransaction = false;
+  let aborted = false;
 
   const planFor = (cost: number) => [
     {
@@ -917,53 +943,83 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     },
   ];
 
+  const pgError = (message: string, code: string) => Object.assign(new Error(message), { code });
+
+  const respond = (sql: string) => {
+    if (sql.startsWith("BEGIN")) {
+      inTransaction = true;
+      return { rows: [], fields: [], command: "BEGIN", rowCount: 0 };
+    }
+    if (sql.startsWith("ROLLBACK TO SAVEPOINT")) {
+      aborted = false;
+      return { rows: [], fields: [], command: "ROLLBACK", rowCount: 0 };
+    }
+    if (sql === "ROLLBACK") {
+      inTransaction = false;
+      aborted = false;
+      return { rows: [], fields: [], command: "ROLLBACK", rowCount: 0 };
+    }
+    if (aborted) {
+      throw pgError("current transaction is aborted, commands ignored until end of transaction block", "25P02");
+    }
+    if (sql.startsWith("EXPLAIN")) {
+      if (failExplain) throw new Error('relation "users" does not exist');
+      const cost = liveHypoIndexes > 0 ? indexedCost : baselineCost;
+      return { rows: [{ "QUERY PLAN": planFor(cost) }], fields: [], command: "EXPLAIN", rowCount: 1 };
+    }
+    if (sql.includes("hypopg_create_index")) {
+      liveHypoIndexes += 1;
+      return { rows: [{ indexrelid: 12_345 }], fields: [], command: "SELECT", rowCount: 1 };
+    }
+    if (sql.includes("hypopg_drop_index")) {
+      liveHypoIndexes = Math.max(0, liveHypoIndexes - 1);
+      return { rows: [{ hypopg_drop_index: true }], fields: [], command: "SELECT", rowCount: 1 };
+    }
+    if (sql.includes("hypopg_reset")) {
+      resetCalls += 1;
+      if (failTeardownReset && resetCalls > 1)
+        throw pgError("terminating connection due to administrator command", "57P01");
+      liveHypoIndexes = 0;
+      return { rows: [], fields: [], command: "SELECT", rowCount: 0 };
+    }
+    if (sql.includes("hypopg_relation_size")) {
+      if (failSizing) throw pgError("canceling statement due to statement timeout", "57014");
+      return { rows: [{ bytes: "16384" }], fields: [], command: "SELECT", rowCount: 1 };
+    }
+    // Matched before the pg_attribute branch: the index query also joins
+    // pg_attribute, so a looser check would swallow it.
+    if (sql.includes("FROM pg_catalog.pg_index")) {
+      return { rows: [], fields: [], command: "SELECT", rowCount: 0 };
+    }
+    if (sql.includes("LEFT JOIN pg_catalog.pg_stats")) {
+      const rows = columns.map((column) => ({
+        schema: "public",
+        table: "users",
+        column,
+        n_distinct: column === "status" ? -0.01 : -1,
+        reltuples: 10_000,
+      }));
+      return { rows, fields: [], command: "SELECT", rowCount: rows.length };
+    }
+    // `fields: []` matters: safeResolveTypeNames short-circuits on an empty
+    // oid list, so the stub never has to fake pg_catalog.pg_type.
+    return { rows: [], fields: [], command: "", rowCount: 0 };
+  };
+
   const client = {
     async query(config: unknown, params: unknown[] = []) {
       const sql = typeof config === "string" ? config : ((config as { text?: string }).text ?? "");
       const values = typeof config === "string" ? params : ((config as { values?: unknown[] }).values ?? params);
       statements.push({ sql, params: values });
-
-      if (sql.startsWith("EXPLAIN")) {
-        if (failExplain) throw new Error('relation "users" does not exist');
-        const cost = liveHypoIndexes > 0 ? indexedCost : baselineCost;
-        return { rows: [{ "QUERY PLAN": planFor(cost) }], fields: [], command: "EXPLAIN", rowCount: 1 };
+      try {
+        return respond(sql);
+      } catch (err) {
+        if (inTransaction) aborted = true;
+        throw err;
       }
-      if (sql.includes("hypopg_create_index")) {
-        liveHypoIndexes += 1;
-        return { rows: [{ indexrelid: 12_345 }], fields: [], command: "SELECT", rowCount: 1 };
-      }
-      if (sql.includes("hypopg_drop_index")) {
-        liveHypoIndexes = Math.max(0, liveHypoIndexes - 1);
-        return { rows: [{ hypopg_drop_index: true }], fields: [], command: "SELECT", rowCount: 1 };
-      }
-      if (sql.includes("hypopg_reset")) {
-        liveHypoIndexes = 0;
-        return { rows: [], fields: [], command: "SELECT", rowCount: 0 };
-      }
-      if (sql.includes("hypopg_relation_size")) {
-        return { rows: [{ bytes: "16384" }], fields: [], command: "SELECT", rowCount: 1 };
-      }
-      // Matched before the pg_attribute branch: the index query also joins
-      // pg_attribute, so a looser check would swallow it.
-      if (sql.includes("FROM pg_catalog.pg_index")) {
-        return { rows: [], fields: [], command: "SELECT", rowCount: 0 };
-      }
-      if (sql.includes("LEFT JOIN pg_catalog.pg_stats")) {
-        const rows = columns.map((column) => ({
-          schema: "public",
-          table: "users",
-          column,
-          n_distinct: column === "status" ? -0.01 : -1,
-          reltuples: 10_000,
-        }));
-        return { rows, fields: [], command: "SELECT", rowCount: rows.length };
-      }
-      // `fields: []` matters: safeResolveTypeNames short-circuits on an empty
-      // oid list, so the stub never has to fake pg_catalog.pg_type.
-      return { rows: [], fields: [], command: "", rowCount: 0 };
     },
-    release() {
-      /* no-op */
+    release(err?: unknown) {
+      releases.push(err);
     },
   };
 
@@ -1049,6 +1105,41 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
       assert.match(result.error ?? "", /could be planned/);
       assert.ok(session.count("hypopg_reset") >= 2, "the teardown reset did not run on the failure path");
       assert.ok(session.count("ROLLBACK") >= 1);
+    });
+  });
+
+  it("rolls back BEFORE resetting, so an aborted transaction cannot strand hypothetical indexes", async () => {
+    // The sizing query runs outside any savepoint while the accepted indexes
+    // are still live. When it fails, the transaction is aborted, and a reset
+    // sent before the ROLLBACK is refused with 25P02 -- measured on PG15 and
+    // PG18 with HypoPG. The indexes would then ride the pooled connection into
+    // the next pg_explain or pg_readonly call.
+    await withStubbedServer({ failSizing: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users WHERE status = 'active'"],
+      })) as { ok: boolean; data?: { recommendations: { estimated_size_bytes: string | null }[] } };
+      // Sizing is best-effort, so the recommendation still comes back, unsized.
+      assert.equal(result.ok, true);
+      assert.equal(result.data?.recommendations[0]?.estimated_size_bytes, null);
+      assert.equal(session.liveHypoIndexes(), 0, "hypothetical indexes survived the teardown");
+      // A clean teardown hands the connection back for reuse. Destroying it
+      // would also contain the leak, so this is what pins the ORDER.
+      assert.deepEqual(session.releases, [undefined]);
+    });
+  });
+
+  it("destroys the connection instead of pooling it when the teardown reset fails", async () => {
+    await withStubbedServer({ failTeardownReset: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users WHERE status = 'active'"],
+      })) as { ok: boolean };
+      // Cleanup never replaces the call's own result.
+      assert.equal(result.ok, true);
+      assert.ok(session.liveHypoIndexes() > 0, "precondition: the failed reset left indexes behind");
+      assert.equal(session.releases.length, 1);
+      const released = session.releases[0];
+      assert.ok(released instanceof Error, "a connection still holding hypothetical indexes went back to the pool");
+      assert.match(released.message, /teardown failed/);
     });
   });
 

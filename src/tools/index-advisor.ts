@@ -1223,7 +1223,7 @@ export const indexAdvisorTools = [
         );
       }
 
-      return withSharedClient(async (run): Promise<ApiResponse> => {
+      return withSharedClient(async (run, { discard }): Promise<ApiResponse> => {
         // BEGIN READ ONLY is defence in depth, not the primary guarantee:
         // EXPLAIN without ANALYZE never executes the statement. But this tool
         // feeds SQL text it did not write (pg_stat_statements entries) back to
@@ -1625,25 +1625,31 @@ export const indexAdvisorTools = [
           };
         } finally {
           // HypoPG indexes are SESSION-scoped, not transaction-scoped, so the
-          // ROLLBACK below does NOT remove them. This connection goes straight
-          // back into the pool, and anything left here would silently alter the
-          // plan of the next query that borrows it. The reset therefore has to
-          // run on every exit -- the success path, an early `return` from any
-          // guard above, and a thrown error alike -- which is exactly what
+          // ROLLBACK does NOT remove them. This connection goes straight back
+          // into the pool, and anything left here would silently alter the plan
+          // of the next query that borrows it -- pg_explain and pg_readonly
+          // included, neither of which resets on the way in. The reset therefore
+          // has to run on every exit -- the success path, an early `return` from
+          // any guard above, and a thrown error alike -- which is exactly what
           // `finally` buys that a trailing statement does not.
           //
-          // Best-effort, as explain.ts's teardown is: a failure here must never
-          // replace the real result or the real error with a cleanup error.
-          try {
-            await run("SELECT hypopg_reset()");
-          } catch {
-            // Connection already broken; the pool discards it, which achieves
-            // the same isolation the reset was for.
-          }
-          try {
-            await run("ROLLBACK");
-          } catch {
-            // Already rolled back, or the connection is gone.
+          // ROLLBACK comes FIRST. A statement that fails outside a savepoint (the
+          // hypopg_drop_index in evaluate, the sizing query) aborts the
+          // transaction, and an aborted transaction refuses everything except
+          // ROLLBACK with SQLSTATE 25P02 -- a reset sent before the ROLLBACK is
+          // refused with it, and every hypothetical index outlives the call.
+          // After the ROLLBACK the reset runs in autocommit.
+          //
+          // The runner reports failure as `ok: false` and never throws, so both
+          // results are checked explicitly. If either statement failed, this
+          // connection's session state is unknown, and it is destroyed rather
+          // than pooled. Best-effort, as explain.ts's teardown is: a failure here
+          // never replaces the real result or the real error.
+          const rolledBack = await run("ROLLBACK");
+          const reset = await run("SELECT hypopg_reset()");
+          if (!rolledBack.ok || !reset.ok) {
+            const cause = rolledBack.ok ? reset.error : rolledBack.error;
+            discard(new Error(`pg_index_advisor teardown failed, connection discarded: ${cause}`));
           }
         }
       });
