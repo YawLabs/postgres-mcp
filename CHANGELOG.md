@@ -53,9 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pins the backend -- any role may end its own session, verified as a
   non-superuser on PostgreSQL 15 and 18 -- and the connection is discarded.
   A cleanup that failed because the socket died is neither retried nor
-  "terminated": there is no backend left to reach. Applies to `pg_explain`
+  "terminated": there is no backend left to reach. A socket error is
+  recognised by its shape -- a SQLSTATE is five characters from `[0-9A-Z]`,
+  while node-pg passes a reset connection through with an errno code such as
+  `ECONNRESET` -- so a reset is not mistaken for a server's refusal. Nothing
+  escalates when nothing was created: HypoPG present in `pg_extension` but not
+  callable by the role fails the first create, and the cleanup is skipped
+  rather than turned into a terminate on every call. A terminate the server
+  refuses (42501, or a transaction that could not be cleared to send it) is
+  reported as "not terminated", the transaction is ended, and the connection
+  is discarded. After a terminate, the result's column type names are resolved
+  through the pool instead of the dead connection. Applies to `pg_explain`
   with `hypothetical_indexes` and to `pg_index_advisor`, and stderr reports
-  each step.
+  each step -- including, as that, the socket closing after a terminate this
+  process asked for.
 - **`pg_index_advisor` no longer strands hypothetical indexes on a pooled
   connection when its transaction aborts.** The teardown ran `hypopg_reset()`
   before `ROLLBACK`. Two statements run outside a savepoint while hypothetical

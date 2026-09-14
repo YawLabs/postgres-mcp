@@ -913,6 +913,14 @@ interface StubOptions {
   failTeardownReset?: "once" | "always";
   /** Make the plain ROLLBACK time out, leaving the transaction open. */
   failTeardownRollback?: boolean;
+  /**
+   * Which `ROLLBACK TO SAVEPOINT __pgmcp_advisor_teardown` statements time out,
+   * by 1-based ordinal. A refusal here leaves the transaction aborted with the
+   * hypothetical indexes still in place, exactly like a refused reset.
+   */
+  failTeardownRollbackToAt?: number[];
+  /** Refuse `pg_terminate_backend(pg_backend_pid())` with 42501, as a role that may not signal the backend would. */
+  refuseTerminate?: boolean;
   /** Columns pg_attribute reports for public.users. */
   columns?: string[];
 }
@@ -984,6 +992,8 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     failSizing = false,
     failTeardownReset,
     failTeardownRollback = false,
+    failTeardownRollbackToAt = [],
+    refuseTerminate = false,
     columns = ["id", "status", "created_at"],
   } = options;
 
@@ -1032,6 +1042,7 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
   let innerSavepoints = 0;
   let innerReleases = 0;
   let innerRollbackTos = 0;
+  let teardownRollbackTos = 0;
   let drops = 0;
   let creates = 0;
   let dead = false;
@@ -1097,10 +1108,12 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     }
     if (sql.includes("pg_terminate_backend(pg_backend_pid())")) {
       // What the server does with it, measured on PG15 and PG18: answers the
-      // statement with 57P01 and closes the socket. Refused like anything
-      // else in an aborted transaction, and outside one it is an error too.
-      if (!inTransaction) throw noTransaction("pg_terminate_backend probe");
+      // statement with 57P01 and closes the socket. It is an ordinary function
+      // call, so it runs in or out of a transaction -- which is why the tests
+      // assert it is sent INSIDE one -- and is refused like anything else in
+      // an aborted transaction.
       if (aborted) throw abortedError();
+      if (refuseTerminate) throw pgError("permission denied to terminate process", "42501");
       killSocket();
       throw pgError("terminating connection due to administrator command", "57P01");
     }
@@ -1125,6 +1138,9 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
       if (!inTransaction) throw noTransaction(verb);
       if (verb === "ROLLBACK TO SAVEPOINT") {
         if (name === "__pgmcp_advisor_sp" && ++innerRollbackTos === failInnerRollbackToAt) throw timeout();
+        if (name === "__pgmcp_advisor_teardown" && failTeardownRollbackToAt.includes(++teardownRollbackTos)) {
+          throw timeout();
+        }
         const at = savepoints.lastIndexOf(name);
         if (at < 0) throw noSavepoint(name);
         savepoints.length = at + 1;
@@ -1852,6 +1868,16 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
       assert.ok(released instanceof Error, "a connection whose backend was ended went back to the pool");
       assert.match(released.message, /^pg_index_advisor teardown failed twice, backend terminated: /);
       assert.match(released.message, new RegExp(TIMEOUT.message));
+      // The socket closing after a termination this process asked for is
+      // reported as that, not as a surprise connection error.
+      assert.ok(
+        session.stderr.some((l) => /connection closed after this process terminated its own backend/.test(l)),
+        JSON.stringify(session.stderr),
+      );
+      assert.ok(
+        !session.stderr.some((l) => /connection error on a checked-out client/.test(l)),
+        JSON.stringify(session.stderr),
+      );
     });
   });
 
@@ -1869,6 +1895,100 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
       );
       assert.equal(session.sent("pg_terminate_backend"), 0, "a dead socket was 'terminated'");
       assert.ok(session.releases[0] instanceof Error);
+    });
+  });
+
+  it("retries when the teardown ROLLBACK TO itself is refused, instead of rolling back over live indexes", async () => {
+    // A timed-out drop leaves an index live; the first ROLLBACK TO the
+    // teardown savepoint is then refused by a live server. Ending the
+    // transaction with a plain ROLLBACK at that point would hand the backend
+    // back -- to a transaction-mode pooler, to its next client -- with the
+    // index still on it. The whole cleanup pass is retried instead.
+    await withStubbedServer({ failDropIndex: true, failTeardownRollbackToAt: [1] }, async (session) => {
+      await pgIndexAdvisor.handler({ statements: ONE_STATEMENT });
+      assert.equal(session.liveHypoIndexes(), 0, "a hypothetical index survived the call");
+      assert.equal(session.sent("ROLLBACK TO SAVEPOINT __pgmcp_advisor_teardown"), 2);
+      assert.equal(session.sent("pg_terminate_backend"), 0, "a backend was terminated over a transient");
+      assert.ok(
+        session.stderr.some((l) => /cleanup failed \(.*statement timeout.*\) and succeeded on retry/.test(l)),
+        JSON.stringify(session.stderr),
+      );
+      assertSessionClean(session);
+    });
+  });
+
+  it("terminates when the teardown ROLLBACK TO is refused on both passes, never rolling back over live indexes", async () => {
+    await withStubbedServer({ failDropIndex: true, failTeardownRollbackToAt: [1, 2] }, async (session) => {
+      await pgIndexAdvisor.handler({ statements: ONE_STATEMENT });
+      const terminate = session.statements.find((s) => s.sql === TERMINATE_OWN_BACKEND_SQL);
+      assert.ok(terminate, "the backend was not terminated");
+      assert.equal(terminate.inTransaction, true);
+      assert.equal(terminate.code, "57P01");
+      assert.equal(
+        session.statements.filter((s) => s.sql === "ROLLBACK" && s.code === undefined).length,
+        0,
+        "a plain ROLLBACK handed the backend back with a live index",
+      );
+      const released = session.releases[0];
+      assert.ok(released instanceof Error);
+      assert.match(released.message, /^pg_index_advisor teardown failed twice, backend terminated: /);
+    });
+  });
+
+  it("says the backend was NOT terminated when the transaction could not be cleared first, and does not send it", async () => {
+    // The third ROLLBACK TO -- the one that clears the retry's abort so the
+    // terminate can run -- is refused too. A terminate sent now would only be
+    // refused with 25P02; it is not sent, and nothing claims it happened.
+    await withStubbedServer({ failTeardownReset: "always", failTeardownRollbackToAt: [3] }, async (session) => {
+      await pgIndexAdvisor.handler({ statements: ONE_STATEMENT });
+      assert.equal(session.sent("pg_terminate_backend"), 0, "a terminate was sent into an aborted transaction");
+      const released = session.releases[0];
+      assert.ok(released instanceof Error);
+      assert.doesNotMatch(released.message, /backend terminated/);
+      assert.match(
+        released.message,
+        /the backend could not be terminated \(the transaction could not be cleared first/,
+      );
+      assert.ok(
+        session.stderr.some((l) => /own backend NOT terminated/.test(l)),
+        JSON.stringify(session.stderr),
+      );
+      assert.ok(!session.stderr.some((l) => /terminated own backend after/.test(l)), JSON.stringify(session.stderr));
+    });
+  });
+
+  it("does not escalate when HypoPG was never usable, even if the teardown ROLLBACK TO is refused", async () => {
+    // The entry reset failed (HypoPG not callable), so no index was created
+    // and none can leak. A refused ROLLBACK TO in the teardown is then just a
+    // failure to discard over: no retry, no terminate.
+    await withStubbedServer({ failEntryReset: "missing", failTeardownRollbackToAt: [1] }, async (session) => {
+      await pgIndexAdvisor.handler({ statements: ONE_STATEMENT });
+      assert.equal(
+        session.sent("ROLLBACK TO SAVEPOINT __pgmcp_advisor_teardown"),
+        1,
+        "a cleanup with nothing to clean was retried",
+      );
+      assert.equal(session.sent("pg_terminate_backend"), 0, "a clean backend was terminated");
+      const released = session.releases[0];
+      assert.ok(released instanceof Error);
+      assert.match(released.message, /^pg_index_advisor teardown failed, connection discarded: /);
+    });
+  });
+
+  it("says the backend was NOT terminated when the server refuses the terminate, and ends the transaction", async () => {
+    await withStubbedServer({ failTeardownReset: "always", refuseTerminate: true }, async (session) => {
+      await pgIndexAdvisor.handler({ statements: ONE_STATEMENT });
+      const terminate = session.statements.find((s) => s.sql === TERMINATE_OWN_BACKEND_SQL);
+      assert.equal(terminate?.code, "42501", "precondition: the terminate was sent and refused");
+      assert.equal(session.statements.at(-1)?.sql, "ROLLBACK", "the transaction was left open on a live backend");
+      const released = session.releases[0];
+      assert.ok(released instanceof Error);
+      assert.match(released.message, /the backend could not be terminated \(permission denied/);
+      assert.doesNotMatch(released.message, /backend terminated/);
+      assert.ok(
+        session.stderr.some((l) => /own backend NOT terminated -- permission denied/.test(l)),
+        JSON.stringify(session.stderr),
+      );
     });
   });
 

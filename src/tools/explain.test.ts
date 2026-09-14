@@ -394,6 +394,8 @@ interface StubSession {
   hypoCreateSql(): string;
   /** The argument of each client.release() call; an Error there makes pg-pool destroy the client. */
   releases: unknown[];
+  /** SQL sent through the pool itself rather than the checked-out client. */
+  poolQueries: string[];
 }
 
 interface StubBehavior {
@@ -405,12 +407,24 @@ interface StubBehavior {
    */
   dieWhen?: (sql: string) => boolean;
   /**
+   * Statements the fake server refuses with the SQLSTATE returned, when it is
+   * not a plain timeout: 42883 for a function this role cannot see, 42501 for
+   * one it may not run, and so on. Checked before `failWhen`.
+   */
+  refuseWith?: (sql: string) => string | undefined;
+  /**
    * Report a real column type on the FETCH so type-name resolution has an oid
    * to look up, and answer the pg_type read. Off by default: an empty field
    * list short-circuits the lookup, which keeps every other test's statement
    * trace free of it.
    */
   typedFields?: boolean;
+  /**
+   * The `code` the socket death carries. node-pg hands a socket error to the
+   * query in flight as the raw Node error (ECONNRESET, EPIPE); a clean close
+   * carries none. Only read when `dieWhen` fires.
+   */
+  dieWithCode?: string;
 }
 
 // runUserQueryBounded wraps the user statement in this, so the EXPLAIN the
@@ -460,9 +474,12 @@ async function withStubbedServer<T>(
   // PG15 and PG18; the advisor's stub models the same.
   let inTransaction = false;
   let aborted = false;
+  const poolQueries: string[] = [];
+  const errorListeners: ((err: Error) => void)[] = [];
   const session: StubSession = {
     statements,
     releases,
+    poolQueries,
     connects: 0,
     explainSql() {
       return statements.find((s) => s.sql.startsWith(DECLARE_PREFIX))?.sql.slice(DECLARE_PREFIX.length) ?? "";
@@ -473,28 +490,41 @@ async function withStubbedServer<T>(
     },
   };
 
+  const refuse = (sql: string): void => {
+    const code = behavior.refuseWith?.(sql);
+    if (code !== undefined) {
+      const message =
+        code === "42883"
+          ? "function hypopg_reset() does not exist"
+          : code === "42501"
+            ? "permission denied for function"
+            : `refused with ${code}`;
+      throw Object.assign(new Error(message), { code });
+    }
+    if (behavior.failWhen?.(sql)) {
+      throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+    }
+  };
+
   const respond = (sql: string) => {
     if (dead) throw new Error("Client has encountered a connection error and is not queryable");
     if (behavior.dieWhen?.(sql)) {
       dead = true;
+      if (behavior.dieWithCode) {
+        throw Object.assign(new Error(`read ${behavior.dieWithCode}`), { code: behavior.dieWithCode });
+      }
       throw new Error("Connection terminated unexpectedly");
     }
-    if (sql.startsWith("BEGIN")) {
-      inTransaction = true;
-      return { rows: [], fields: [], command: "BEGIN", rowCount: 0 };
-    }
+    // ROLLBACK and ROLLBACK TO are the only statements an aborted transaction
+    // accepts; BEGIN is refused like everything else.
     if (sql === "ROLLBACK") {
-      if (behavior.failWhen?.(sql)) {
-        throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
-      }
+      refuse(sql);
       inTransaction = false;
       aborted = false;
       return { rows: [], fields: [], command: "ROLLBACK", rowCount: 0 };
     }
     if (sql.startsWith("ROLLBACK TO SAVEPOINT")) {
-      if (behavior.failWhen?.(sql)) {
-        throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
-      }
+      refuse(sql);
       aborted = false;
       return { rows: [], fields: [], command: "ROLLBACK", rowCount: 0 };
     }
@@ -504,13 +534,20 @@ async function withStubbedServer<T>(
         { code: "25P02" },
       );
     }
-    if (behavior.failWhen?.(sql)) {
-      throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+    if (sql.startsWith("BEGIN")) {
+      inTransaction = true;
+      return { rows: [], fields: [], command: "BEGIN", rowCount: 0 };
     }
+    refuse(sql);
     if (sql.includes("pg_terminate_backend(pg_backend_pid())")) {
       // What the server does with it, measured on PG15 and PG18: answers the
-      // statement with 57P01 and closes the socket.
+      // statement with 57P01 and closes the socket -- in or out of a
+      // transaction; it is an ordinary function call. node-pg then emits
+      // 'error' on the client when the socket closes.
       dead = true;
+      queueMicrotask(() => {
+        for (const l of errorListeners) l(new Error("Connection terminated unexpectedly"));
+      });
       throw Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
     }
     return undefined;
@@ -556,10 +593,12 @@ async function withStubbedServer<T>(
       releases.push(err);
     },
     // acquireClient() attaches an 'error' listener for the checked-out lifetime.
-    on() {
+    on(event: string, fn: (err: Error) => void) {
+      if (event === "error") errorListeners.push(fn);
       return this;
     },
-    removeListener() {
+    removeListener(event: string, fn: (err: Error) => void) {
+      if (event === "error") errorListeners.splice(errorListeners.indexOf(fn), 1);
       return this;
     },
   };
@@ -568,7 +607,11 @@ async function withStubbedServer<T>(
   process.env.DATABASE_URL = "postgres://stub-host/stubdb";
   pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
     const text = typeof sql === "string" ? sql : "";
+    poolQueries.push(text);
     if (text.includes("server_version_num")) return Promise.resolve({ rows: [{ v: String(versionNum) }] });
+    if (text.includes("FROM pg_catalog.pg_type")) {
+      return Promise.resolve({ rows: [{ oid: 25, typname: "text" }], fields: [], command: "SELECT", rowCount: 1 });
+    }
     // The HypoPG presence probe runs through runInternal -> pool.query. Report
     // it installed so the `using` cases reach the CREATE INDEX text.
     if (text.includes("hypopg")) return Promise.resolve({ rows: [{ installed: true }] });
@@ -892,8 +935,14 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
           );
           assert.equal(sqls.indexOf("ROLLBACK"), sqls.length - 1);
           assert.deepEqual(session.releases, [undefined], "a clean connection was discarded");
+          // The line names what failed the first time, or an operator cannot
+          // tell a cancel from a permission problem that happened to pass.
           assert.ok(
-            logged.some((l) => /teardown succeeded on retry; the connection is kept/.test(l)),
+            logged.some((l) =>
+              /teardown failed \(teardown failed: .*statement timeout\) and succeeded on retry; the connection is kept/.test(
+                l,
+              ),
+            ),
             JSON.stringify(logged),
           );
         },
@@ -954,7 +1003,14 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
             JSON.stringify(logged),
           );
           // 57P01 is the server's answer to the terminate, not a failure.
-          assert.ok(!logged.some((l) => /terminate own backend failed/.test(l)), JSON.stringify(logged));
+          assert.ok(!logged.some((l) => /terminate own backend failed|NOT terminated/.test(l)), JSON.stringify(logged));
+          // The socket closing afterwards was asked for; it is logged as that.
+          await new Promise((r) => setImmediate(r));
+          assert.ok(
+            logged.some((l) => /connection closed after this process terminated its own backend/.test(l)),
+            JSON.stringify(logged),
+          );
+          assert.ok(!logged.some((l) => /connection error on a checked-out client/.test(l)), JSON.stringify(logged));
         },
         undefined,
         { failWhen: (sql) => sql.includes("hypopg_reset") },
@@ -1014,10 +1070,13 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
             0,
             "a dead socket was 'terminated'",
           );
-          assert.ok(!logged.some((l) => /terminated own backend/.test(l)), JSON.stringify(logged));
+          assert.ok(
+            !logged.some((l) => /terminated own backend|backend NOT terminated/.test(l)),
+            JSON.stringify(logged),
+          );
           const released = session.releases[0];
           assert.ok(released instanceof Error);
-          assert.doesNotMatch(released.message, /backend terminated/);
+          assert.doesNotMatch(released.message, /terminat/);
         },
         undefined,
         {
@@ -1067,12 +1126,13 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
     }
   });
 
-  it("logs every cleanup failure, not only the one that becomes the discard reason", async () => {
-    // The hook savepoint rollback fails, and so does its retry. The first is
-    // the discard reason; without its own log line the second would vanish,
-    // and an operator reading stderr would see one failure where there were
-    // two. Setup ran, so the indexes may exist and cannot be cleared: this
-    // path ends in a terminate too.
+  it("says the backend was NOT terminated when the transaction could not be cleared to send the terminate", async () => {
+    // Every ROLLBACK TO the hook savepoint is refused, including the one that
+    // has to clear the abort before the terminate. A terminate sent into the
+    // still-aborted transaction would only be refused with 25P02, so it is not
+    // sent at all -- and the discard reason and stderr say what actually
+    // happened instead of claiming a termination. Each failure is logged, not
+    // only the first.
     const originalError = console.error;
     const logged: string[] = [];
     console.error = (...args: unknown[]) => {
@@ -1084,16 +1144,27 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
         async (session) => {
           const result = (await pgExplain.handler(withIndexes)) as { ok: boolean };
           assert.equal(result.ok, true);
+          const sqls = session.statements.map((s) => s.sql);
+          assert.equal(
+            sqls.filter((s) => s.includes("pg_terminate_backend")).length,
+            0,
+            "a terminate was sent into an aborted transaction",
+          );
           const released = session.releases[0];
           assert.ok(released instanceof Error);
-          assert.match(released.message, /^teardown failed twice, backend terminated: hook savepoint rollback failed/);
+          assert.match(released.message, /^teardown failed twice and the backend could not be terminated/);
+          assert.doesNotMatch(released.message, /backend terminated/);
+          assert.ok(
+            logged.some((l) => /own backend NOT terminated -- the transaction could not be cleared first/.test(l)),
+            JSON.stringify(logged),
+          );
+          assert.ok(!logged.some((l) => /terminated own backend after/.test(l)), JSON.stringify(logged));
           assert.ok(
             logged.some((l) =>
               /\[postgres-mcp\] hook savepoint rollback \(retry\) failed: .*statement timeout/.test(l),
             ),
             `the retry's failure never reached stderr: ${JSON.stringify(logged)}`,
           );
-          assert.equal(session.statements.filter((s) => s.sql.includes("pg_terminate_backend")).length, 1);
         },
         undefined,
         { failWhen: (sql) => sql === "ROLLBACK TO SAVEPOINT __pgmcp_hooks" },
@@ -1101,6 +1172,144 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
     } finally {
       console.error = originalError;
     }
+  });
+
+  it("says the backend was NOT terminated when the server refuses the terminate itself", async () => {
+    // 42501: the session's current role may not signal the backend's role (a
+    // SET ROLE to a role without membership in the login role). 57P01 is the
+    // only answer that means the backend is gone.
+    const originalError = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    try {
+      await withStubbedServer(
+        180_000,
+        async (session) => {
+          const result = (await pgExplain.handler(withIndexes)) as { ok: boolean };
+          assert.equal(result.ok, true);
+          const sqls = session.statements.map((s) => s.sql);
+          assert.equal(sqls.filter((s) => s.includes("pg_terminate_backend")).length, 1);
+          // Still in a live transaction on a live backend: end it.
+          assert.equal(sqls.at(-1), "ROLLBACK", "the transaction was left open after a refused terminate");
+          const released = session.releases[0];
+          assert.ok(released instanceof Error);
+          assert.match(released.message, /could not be terminated \(permission denied/);
+          assert.ok(
+            logged.some((l) => /own backend NOT terminated -- permission denied/.test(l)),
+            JSON.stringify(logged),
+          );
+        },
+        undefined,
+        {
+          failWhen: (sql) => sql.includes("hypopg_reset"),
+          refuseWith: (sql) => (sql.includes("pg_terminate_backend") ? "42501" : undefined),
+        },
+      );
+    } finally {
+      console.error = originalError;
+    }
+  });
+
+  it("does not escalate when HypoPG is present but not callable: nothing was created, so nothing can leak", async () => {
+    // pg_extension lists HypoPG, so the pre-flight passes, but this role cannot
+    // see its functions (schema off the search_path): the first create fails
+    // with 42883 and no index exists. The teardown is skipped outright -- a
+    // reset would fail the same way, and treating that as a leak would
+    // terminate a clean backend on every call.
+    await withStubbedServer(
+      180_000,
+      async (session) => {
+        const result = (await pgExplain.handler(withIndexes)) as { ok: boolean; error?: string };
+        assert.equal(result.ok, false);
+        assert.match(result.error ?? "", /does not exist/);
+        const sqls = session.statements.map((s) => s.sql);
+        assert.equal(
+          sqls.filter((s) => s.includes("hypopg_reset")).length,
+          0,
+          "a reset was sent with nothing to reset",
+        );
+        assert.equal(
+          sqls.filter((s) => s.includes("pg_terminate_backend")).length,
+          0,
+          "a clean backend was terminated",
+        );
+        assert.equal(sqls.at(-1), "ROLLBACK");
+        assert.deepEqual(session.releases, [undefined], "a clean connection was discarded");
+      },
+      undefined,
+      { refuseWith: (sql) => (/hypopg_(create_index|reset)/.test(sql) ? "42883" : undefined) },
+    );
+  });
+
+  it("treats a socket error that carries an errno code as a dead connection, not a server answer", async () => {
+    // node-pg hands a socket failure to the query in flight as the raw Node
+    // error, and its `code` is a string too (ECONNRESET). That is not a
+    // SQLSTATE, and nothing answered: no terminate, and no claim of one.
+    let resets = 0;
+    const originalError = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    try {
+      await withStubbedServer(
+        180_000,
+        async (session) => {
+          const result = (await pgExplain.handler(withIndexes)) as { ok: boolean };
+          assert.equal(result.ok, true);
+          const sqls = session.statements.map((s) => s.sql);
+          assert.equal(
+            sqls.filter((s) => s.includes("pg_terminate_backend")).length,
+            0,
+            "a dead socket was 'terminated'",
+          );
+          assert.ok(
+            !logged.some((l) => /terminated own backend|backend NOT terminated/.test(l)),
+            JSON.stringify(logged),
+          );
+          const released = session.releases[0];
+          assert.ok(released instanceof Error);
+          assert.doesNotMatch(released.message, /terminat/);
+        },
+        undefined,
+        {
+          failWhen: (sql) => sql.includes("hypopg_reset") && ++resets === 1,
+          dieWhen: (sql) => sql === "ROLLBACK TO SAVEPOINT __pgmcp_hooks" && resets === 1,
+          dieWithCode: "ECONNRESET",
+        },
+      );
+    } finally {
+      console.error = originalError;
+    }
+  });
+
+  it("resolves type names through the pool after its own backend was terminated", async () => {
+    // The checkout's connection is gone; a catalog read queued on it would
+    // only fail and lose the column type names. Any pooled connection can
+    // answer it instead.
+    await withStubbedServer(
+      180_000,
+      async (session) => {
+        const result = (await pgExplain.handler(withIndexes)) as { ok: boolean };
+        assert.equal(result.ok, true);
+        const sqls = session.statements.map((s) => s.sql);
+        const terminate = sqls.findIndex((s) => s.includes("pg_terminate_backend"));
+        assert.ok(terminate >= 0, "precondition: the backend was terminated");
+        assert.equal(
+          terminate,
+          sqls.length - 1,
+          `sent on the dead checkout after the terminate: ${sqls.slice(terminate + 1).join(" | ")}`,
+        );
+        assert.ok(
+          session.poolQueries.some((q) => q.includes("FROM pg_catalog.pg_type")),
+          "the type read did not go through the pool",
+        );
+      },
+      undefined,
+      { failWhen: (sql) => sql.includes("hypopg_reset"), typedFields: true },
+    );
   });
 
   it("does not run teardown when the hook savepoint itself was refused: nothing was set up", async () => {

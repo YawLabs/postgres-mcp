@@ -330,7 +330,15 @@ export interface QueryResult {
 // merge entries into the same shared Map.
 let typeNameCache: Map<number, string> | null = null;
 
-async function resolveTypeNames(client: pg.PoolClient, oids: number[]): Promise<Record<number, string>> {
+/**
+ * Anything that can run the two catalog reads below: a checked-out client, or
+ * the pool itself when the checkout's connection is already gone.
+ */
+interface TypeNameRunner {
+  query<R extends pg.QueryResultRow>(sql: string, params?: unknown[]): Promise<pg.QueryResult<R>>;
+}
+
+async function resolveTypeNames(client: TypeNameRunner, oids: number[]): Promise<Record<number, string>> {
   if (oids.length === 0) return {};
   // Bind the map to a local BEFORE the first await. `shutdown()` sets the
   // module-scoped `typeNameCache` back to null, and it can land while we're
@@ -500,7 +508,7 @@ async function runUserQueryAudited(
 // rejects. Not part of the public API; do not rely on this from outside
 // the package.
 export async function safeResolveTypeNames(
-  client: pg.PoolClient,
+  client: TypeNameRunner,
   fields: { dataTypeID: number }[],
 ): Promise<Record<number, string>> {
   try {
@@ -597,6 +605,14 @@ function toQueryResult(
 export interface RunHooks {
   setup?: (client: pg.PoolClient) => Promise<void>;
   teardown?: (client: pg.PoolClient) => Promise<void>;
+  /**
+   * Whether `setup` left session state that `teardown` has to remove. Read
+   * when the transaction is finished: `false` skips the teardown -- there is
+   * nothing to undo, and a cleanup that cannot run (HypoPG present but not
+   * callable by this role) must not escalate to terminating a backend that
+   * holds nothing. Absent means "assume it did".
+   */
+  sessionStateCreated?: () => boolean;
 }
 
 /** See {@link RunHooks}: taken before `setup`, rolled back to before `teardown`. */
@@ -622,14 +638,33 @@ const HOOK_SAVEPOINT = "__pgmcp_hooks";
  * release, so there is nothing else for it to do. `release(err)` destroys the
  * client instead of pooling it, for a caller that left session state behind.
  */
-async function acquireClient(): Promise<{ client: pg.PoolClient; release: (discard?: Error) => void }> {
+interface Checkout {
+  client: pg.PoolClient;
+  /** Hand the connection back, or destroy it when a reason is given. */
+  release: (discard?: Error) => void;
+  /**
+   * Tell the listener this process is about to end the backend itself, so the
+   * socket closing afterwards is reported as that and not as a surprise.
+   */
+  expectClose: () => void;
+}
+
+async function acquireClient(): Promise<Checkout> {
   const client = await getPool().connect();
+  let closeExpected = false;
   const onError = (err: Error): void => {
+    if (closeExpected) {
+      console.error(`[postgres-mcp] connection closed after this process terminated its own backend: ${err.message}`);
+      return;
+    }
     console.error(`[postgres-mcp] connection error on a checked-out client: ${err.message}`);
   };
   client.on("error", onError);
   return {
     client,
+    expectClose: () => {
+      closeExpected = true;
+    },
     release: (discard) => {
       if (discard) console.error(`[postgres-mcp] discarding pooled connection: ${discard.message}`);
       // Removed after release. pg-pool re-attaches its own idle listener as
@@ -667,41 +702,69 @@ export const TERMINATE_OWN_BACKEND_SQL = "SELECT pg_terminate_backend(pg_backend
 
 /**
  * Whether an error came back from a live server -- a SQLSTATE means Postgres
- * answered -- rather than from a socket that is gone. node-pg reports a dead
- * connection with a plain Error and no `code`.
+ * answered -- rather than from a socket that is gone. A SQLSTATE is exactly
+ * five characters from `[0-9A-Z]`. That shape matters: node-pg hands a socket
+ * failure to the query in flight as the raw Node error, whose `code` is a
+ * string too (`ECONNRESET`, `EPIPE`, `ETIMEDOUT`), and a plain "Connection
+ * terminated unexpectedly" or "not queryable" error carries no code at all.
  */
 export function isServerError(err: unknown): boolean {
-  return typeof (err as { code?: unknown } | null)?.code === "string";
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code);
+}
+
+/** SQLSTATE of a server error, or undefined for anything else. */
+export function sqlState(err: unknown): string | undefined {
+  return isServerError(err) ? (err as { code: string }).code : undefined;
 }
 
 /**
- * Send {@link TERMINATE_OWN_BACKEND_SQL}. The server's answer to it IS a
- * rejection -- SQLSTATE 57P01 "terminating connection due to administrator
- * command", then the socket closes -- so that, or a connection error in its
- * place, means it worked. Any other SQLSTATE is a real failure and is thrown.
+ * Send {@link TERMINATE_OWN_BACKEND_SQL} and say whether the backend is gone.
+ *
+ * The server's answer to it IS a rejection -- SQLSTATE 57P01 "terminating
+ * connection due to administrator command", then the socket closes -- so that
+ * means it worked. A connection error in its place means the socket closed
+ * after the statement went out, which is also the backend ending. Any other
+ * SQLSTATE is a refusal: the statement was refused (an aborted transaction,
+ * 25P02) or the role may not (42501), and the backend is still there.
  */
-async function terminateOwnBackend(client: pg.PoolClient): Promise<void> {
+async function terminateOwnBackend(
+  client: pg.PoolClient,
+): Promise<{ terminated: true } | { terminated: false; error: string }> {
   try {
     await client.query(TERMINATE_OWN_BACKEND_SQL);
+    return { terminated: true };
   } catch (err) {
-    const code = (err as { code?: unknown }).code;
-    if (code === "57P01" || !isServerError(err)) return;
-    throw err;
+    const code = sqlState(err);
+    if (code === "57P01" || code === undefined) return { terminated: true };
+    return { terminated: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/** What {@link finishTransaction} leaves the checkout in. */
+interface FinishOutcome {
+  /** Why the connection must be destroyed rather than pooled, if it must. */
+  discard?: Error;
+  /**
+   * The connection can no longer run anything: the backend was terminated, or
+   * the socket died during cleanup. Whatever still has to run after this
+   * (type-name resolution) goes through the pool instead.
+   */
+  connectionEnded: boolean;
 }
 
 /**
  * End a transaction one of the user-SQL runners opened: ROLLBACK TO the hook
  * savepoint, run `teardown` inside the still-open transaction, then ROLLBACK.
- * Returns the error to discard the connection over, if cleanup failed. See
- * {@link RunHooks} for why this order and what happens when teardown fails.
+ * See {@link RunHooks} for why this order and what happens when teardown fails.
  */
 async function finishTransaction(
-  client: pg.PoolClient,
+  checkout: Checkout,
   state: { began: boolean; hookSavepoint: boolean },
-  teardown: RunHooks["teardown"],
-): Promise<Error | undefined> {
-  if (!state.began) return undefined;
+  hooks: RunHooks,
+): Promise<FinishOutcome> {
+  const { client } = checkout;
+  if (!state.began) return { connectionEnded: false };
   let failure: Error | undefined;
   let lastError: unknown;
   const attempt = async (what: string, fn: () => Promise<unknown>): Promise<boolean> => {
@@ -717,45 +780,67 @@ async function finishTransaction(
       return false;
     }
   };
-  // The hook savepoint is taken before setup, so without it setup never ran
-  // and there is nothing for teardown to undo -- sending it into what is now
-  // an aborted transaction would only fail with 25P02 and discard a clean
-  // connection over it.
-  if (teardown && state.hookSavepoint) {
-    const restored = await attempt("hook savepoint rollback", () =>
-      client.query(`ROLLBACK TO SAVEPOINT ${HOOK_SAVEPOINT}`),
-    );
-    const cleaned = restored && (await attempt("teardown", () => teardown(client)));
+  const rollbackTo = (what: string) => attempt(what, () => client.query(`ROLLBACK TO SAVEPOINT ${HOOK_SAVEPOINT}`));
+  // A dead socket answers nothing; the failure's shape says which it was.
+  const connectionEnded = () => failure !== undefined && !isServerError(lastError);
+
+  // The hook savepoint is taken before setup, so without it setup never ran.
+  // And setup may have run and created nothing -- HypoPG present but not
+  // callable by this role fails the first create with 42883. In both cases
+  // there is nothing for teardown to undo; sending it anyway would only fail
+  // (25P02, or the same 42883) and, worse, escalate over a clean backend.
+  const teardown = hooks.teardown;
+  const dirty = teardown !== undefined && state.hookSavepoint && (hooks.sessionStateCreated?.() ?? true);
+  if (teardown && dirty) {
+    const cleaned =
+      (await rollbackTo("hook savepoint rollback")) && (await attempt("teardown", () => teardown(client)));
     if (!cleaned && isServerError(lastError)) {
       // A live server refused the cleanup. The failure aborted the
       // transaction; the hook savepoint survived the earlier ROLLBACK TO, so
-      // it can clear the abort again for one retry. If that fails too, the
-      // backend is ended rather than handed on.
+      // it can clear the abort again for one retry.
+      const firstFailure = failure?.message ?? "unknown";
       const retried =
-        (await attempt("hook savepoint rollback (retry)", () =>
-          client.query(`ROLLBACK TO SAVEPOINT ${HOOK_SAVEPOINT}`),
-        )) && (await attempt("teardown (retry)", () => teardown(client)));
+        (await rollbackTo("hook savepoint rollback (retry)")) &&
+        (await attempt("teardown (retry)", () => teardown(client)));
       if (retried) {
-        console.error("[postgres-mcp] teardown succeeded on retry; the connection is kept");
+        console.error(
+          `[postgres-mcp] teardown failed (${firstFailure}) and succeeded on retry; the connection is kept`,
+        );
         failure = undefined;
       } else if (isServerError(lastError)) {
-        const cause = failure?.message ?? "unknown";
-        // The retry's failure aborted the transaction again, and an aborted
-        // transaction refuses the terminate like any other statement.
-        await attempt("hook savepoint rollback (before terminate)", () =>
-          client.query(`ROLLBACK TO SAVEPOINT ${HOOK_SAVEPOINT}`),
-        );
-        if (await attempt("terminate own backend", () => terminateOwnBackend(client))) {
-          console.error("[postgres-mcp] terminated own backend after a cleanup that failed twice");
+        // Refused twice by a live server. Discarding the connection is not
+        // enough behind a pooler (see TERMINATE_OWN_BACKEND_SQL), so the
+        // backend itself is ended -- from inside the transaction, which the
+        // retry's failure aborted again, so one more ROLLBACK TO first.
+        checkout.expectClose();
+        let refusal: string | undefined;
+        if (await rollbackTo("hook savepoint rollback (before terminate)")) {
+          const outcome = await terminateOwnBackend(client);
+          if (outcome.terminated) {
+            console.error("[postgres-mcp] terminated own backend after a cleanup that failed twice");
+            // No ROLLBACK: the backend, and with it the transaction, is gone.
+            return {
+              discard: new Error(`teardown failed twice, backend terminated: ${firstFailure}`),
+              connectionEnded: true,
+            };
+          }
+          refusal = outcome.error;
+        } else {
+          refusal = `the transaction could not be cleared first: ${lastError instanceof Error ? lastError.message : String(lastError)}`;
         }
-        // No ROLLBACK: the backend, and with it the transaction, is gone by
-        // design. The discard reason names the cleanup that would not run.
-        return new Error(`teardown failed twice, backend terminated: ${cause}`);
+        console.error(`[postgres-mcp] own backend NOT terminated -- ${refusal}`);
+        await attempt("ROLLBACK", () => client.query("ROLLBACK"));
+        return {
+          discard: new Error(
+            `teardown failed twice and the backend could not be terminated (${refusal}); connection discarded: ${firstFailure}`,
+          ),
+          connectionEnded: connectionEnded(),
+        };
       }
     }
   }
   await attempt("ROLLBACK", () => client.query("ROLLBACK"));
-  return failure;
+  return { discard: failure, connectionEnded: connectionEnded() };
 }
 
 /**
@@ -772,7 +857,8 @@ async function runUserSqlInTransaction(
   params: unknown[],
   hooks: RunHooks,
 ): Promise<ApiResponse<QueryResult>> {
-  const { client, release } = await acquireClient();
+  const checkout = await acquireClient();
+  const { client, release } = checkout;
   const maxRows = getMaxRows();
   const state = { began: false, hookSavepoint: false };
   let outcome: { result: pg.QueryResult; viaCursor: boolean } | undefined;
@@ -789,13 +875,15 @@ async function runUserSqlInTransaction(
   } catch (err) {
     failed = { ok: false, error: formatPgError(err) };
   }
-  const discard = await finishTransaction(client, state, hooks.teardown);
+  const finished = await finishTransaction(checkout, state, hooks);
   try {
     if (failed || !outcome) return failed ?? { ok: false, error: "no result" };
-    const typeNames = await safeResolveTypeNames(client, outcome.result.fields);
+    // A checkout whose connection is gone cannot answer the catalog read; any
+    // pooled connection can.
+    const typeNames = await safeResolveTypeNames(finished.connectionEnded ? getPool() : client, outcome.result.fields);
     return { ok: true, data: toQueryResult(outcome.result, maxRows, typeNames, outcome.viaCursor) };
   } finally {
-    release(discard);
+    release(finished.discard);
   }
 }
 
@@ -932,15 +1020,21 @@ export interface SharedClientControls {
    * and then discard.
    */
   discard(reason: Error): void;
+  /**
+   * Say that this process is about to end its own backend, so the socket
+   * closing afterwards is logged as that and not as a connection error.
+   */
+  expectClose(): void;
 }
 
 /**
- * A failed statement on the shared runner says whether a live server refused
- * it (`serverError: true`, a SQLSTATE came back) or the socket is gone. A
- * caller deciding whether a cleanup is worth retrying, or whether there is a
- * backend left to terminate, needs the difference; see {@link isServerError}.
+ * A failed statement on the shared runner carries the SQLSTATE a live server
+ * answered with (`code`, and `serverError: true`), or neither when the socket
+ * is gone. A caller deciding whether a cleanup is worth retrying, whether
+ * there is a backend left to terminate, or whether a terminate worked (57P01
+ * is the server's answer to one) needs the difference; see {@link isServerError}.
  */
-export type SharedRunnerResult<R> = ApiResponse<R[]> & { serverError?: boolean };
+export type SharedRunnerResult<R> = ApiResponse<R[]> & { serverError?: boolean; code?: string };
 
 export async function withSharedClient<T>(
   fn: (
@@ -952,12 +1046,13 @@ export async function withSharedClient<T>(
     controls: SharedClientControls,
   ) => Promise<T>,
 ): Promise<T> {
-  const { client, release } = await acquireClient();
+  const { client, release, expectClose } = await acquireClient();
   let discardReason: Error | undefined;
   const controls: SharedClientControls = {
     discard(reason) {
       discardReason ??= reason;
     },
+    expectClose,
   };
   try {
     const runOnClient = async <R extends pg.QueryResultRow = pg.QueryResultRow>(
@@ -978,7 +1073,8 @@ export async function withSharedClient<T>(
         );
         return { ok: true, data: result.rows };
       } catch (err) {
-        return { ok: false, error: formatPgError(err), serverError: isServerError(err) };
+        const code = sqlState(err);
+        return { ok: false, error: formatPgError(err), serverError: code !== undefined, code };
       }
     };
     return await fn(runOnClient, controls);
