@@ -35,11 +35,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the next plan on that backend. The cleanup now runs after a `ROLLBACK TO` a
   savepoint taken before the indexes are created, so it works whether or not
   the user's statement aborted the transaction, and before the final
-  `ROLLBACK`. A cleanup that still fails destroys the connection instead of
-  returning it to the pool; the plan itself is still returned. (Behind a
-  transaction-mode pooler that destroy ends at the pooler: the backend keeps
-  what the failed cleanup left until its next client, which is why the
-  cleanup now runs inside the transaction in the first place.)
+  `ROLLBACK`. A cleanup that still fails is handled as described in the next
+  entry; the plan itself is always returned.
+- **A HypoPG cleanup that fails is retried, and if it fails again the
+  session's own backend is terminated -- so the failure cannot reach the next
+  client even through a connection pooler.** Discarding the connection after
+  a failed cleanup was the previous answer, and it is only half of one: behind
+  a transaction-mode pooler such as PgBouncer that closes the link to the
+  pooler, while the server backend goes back into the pooler's pool with the
+  hypothetical indexes still on it, and the pooler's next client plans against
+  them. Nothing sent after the transaction ends can help, because the pooler
+  may route it to a different backend. Now, when a live server refuses the
+  cleanup (a cancel or statement timeout landing on `hypopg_reset()`), it is
+  retried once inside the same transaction, after a `ROLLBACK TO` clears the
+  abort; a retry that succeeds keeps the connection. If the retry fails too,
+  `pg_terminate_backend(pg_backend_pid())` is sent while the transaction still
+  pins the backend -- any role may end its own session, verified as a
+  non-superuser on PostgreSQL 15 and 18 -- and the connection is discarded.
+  A cleanup that failed because the socket died is neither retried nor
+  "terminated": there is no backend left to reach. A socket error is
+  recognised by its shape -- a SQLSTATE is five characters from `[0-9A-Z]`,
+  while node-pg passes a reset connection through with an errno code such as
+  `ECONNRESET` -- so a reset is not mistaken for a server's refusal. Nothing
+  escalates when nothing was created: HypoPG present in `pg_extension` but not
+  callable by the role fails the first create, and the cleanup is skipped
+  rather than turned into a terminate on every call. A terminate the server
+  refuses (42501, or a transaction that could not be cleared to send it) is
+  reported as "not terminated", the transaction is ended, and the connection
+  is discarded. After a terminate, the result's column type names are resolved
+  through the pool instead of the dead connection. Applies to `pg_explain`
+  with `hypothetical_indexes` and to `pg_index_advisor`, and stderr reports
+  each step -- including, as that, the socket closing after a terminate this
+  process asked for.
 - **`pg_index_advisor` no longer strands hypothetical indexes on a pooled
   connection when its transaction aborts.** The teardown ran `hypopg_reset()`
   before `ROLLBACK`. Two statements run outside a savepoint while hypothetical
@@ -54,8 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   taken at the start of the call, which clears the aborted state while keeping
   the transaction open -- and, behind a transaction-mode pooler such as
   PgBouncer, keeps the same backend -- so the reset reaches the indexes on every
-  path. If cleanup still fails, the connection is destroyed instead of being
-  reused, and stderr says so.
+  path. If cleanup still fails, the retry-then-terminate sequence in the
+  `pg_explain` entry above applies.
 - **`pg_index_advisor` reports a search it could not finish instead of
   returning a partial result as complete.** Once its transaction was lost --
   a failed `hypopg_drop_index`, a socket death, a statement timeout landing on

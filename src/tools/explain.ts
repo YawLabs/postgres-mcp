@@ -134,8 +134,15 @@ function validateHypoIndex(idx: { table: string; columns: string[]; using?: stri
 function buildHypopgHooks(indexes: { table: string; columns: string[]; using?: string }[]): {
   setup: (client: import("pg").PoolClient) => Promise<void>;
   teardown: (c: import("pg").PoolClient) => Promise<void>;
+  sessionStateCreated: () => boolean;
 } {
+  // Counted so the runner knows whether there is anything to tear down. A
+  // setup that failed on its first create -- HypoPG present in pg_extension
+  // but not callable by this role, say -- left nothing behind, and a teardown
+  // that then fails the same way must not be mistaken for a leak.
+  let created = 0;
   return {
+    sessionStateCreated: () => created > 0,
     setup: async (client) => {
       for (const idx of indexes) {
         const cols = idx.columns.map(quoteIdent).join(", ");
@@ -158,12 +165,13 @@ function buildHypopgHooks(indexes: { table: string; columns: string[]; using?: s
         if (!r.rows[0]?.indexname) {
           throw new Error(`hypopg_create_index returned no index for: ${createSql}`);
         }
+        created += 1;
       }
     },
     teardown: async (client) => {
       // hypopg_reset() drops every hypothetical index for the session, so a
-      // single call covers however many we created above. Safe even if no
-      // indexes were created (early failure in setup).
+      // single call covers however many we created above. The runner skips
+      // it when `created` is still 0.
       await client.query("SELECT hypopg_reset()");
     },
   };

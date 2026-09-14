@@ -1,5 +1,13 @@
 import { z } from "zod";
-import { type ApiResponse, getServerVersionNum, PG16, PG18, runInternal, withSharedClient } from "../api.js";
+import {
+  type ApiResponse,
+  getServerVersionNum,
+  PG16,
+  PG18,
+  runInternal,
+  TERMINATE_OWN_BACKEND_SQL,
+  withSharedClient,
+} from "../api.js";
 import { warningsField } from "./output.js";
 import { identSchema } from "./params.js";
 import { compareVersions } from "./stats.js";
@@ -1302,7 +1310,7 @@ export const indexAdvisorTools = [
         );
       }
 
-      return withSharedClient(async (run, { discard }): Promise<ApiResponse> => {
+      return withSharedClient(async (run, { discard, expectClose }): Promise<ApiResponse> => {
         // BEGIN READ ONLY is defence in depth, not the primary guarantee:
         // EXPLAIN without ANALYZE never executes the statement. But this tool
         // feeds SQL text it did not write (pg_stat_statements entries) back to
@@ -1853,23 +1861,83 @@ export const indexAdvisorTools = [
           //   3. ROLLBACK.
           //
           // The runner reports failure as `ok: false` and never throws, so each
-          // result is checked explicitly. If any of the three failed, this
-          // connection's session state is unknown, and it is destroyed rather
-          // than pooled. Best-effort, as explain.ts's teardown is: a failure
-          // here never replaces the real result or the real error.
-          let failure: string | undefined;
-          if (teardownSavepointTaken) {
-            const restored = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
-            if (!restored.ok) failure ??= restored.error;
+          // result is checked explicitly. A reset a LIVE server refused is
+          // retried once after another ROLLBACK TO (the savepoint survives one,
+          // and the retry clears the abort the failure caused). If the retry
+          // fails too, the session's own backend is terminated from inside the
+          // transaction: discarding the connection alone ends at a pooler, and
+          // the backend would hand the indexes to its next client -- see
+          // TERMINATE_OWN_BACKEND_SQL in api.ts. Either way the connection is
+          // then destroyed rather than pooled. Best-effort, as explain.ts's
+          // teardown is: a failure here never replaces the real result or the
+          // real error.
+          // One cleanup pass: ROLLBACK TO, then the reset. Either statement
+          // can be the one a live server refuses, and either refusal leaves
+          // the indexes in place, so the pass is retried and escalated as a
+          // whole -- a refused ROLLBACK TO followed by a plain ROLLBACK would
+          // hand the backend back with the indexes still on it.
+          const cleanup = async (): Promise<{ ok: true } | { ok: false; error: string; serverError: boolean }> => {
+            if (teardownSavepointTaken) {
+              const r = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
+              if (!r.ok) return { ok: false, error: r.error ?? "unknown error", serverError: r.serverError === true };
+            }
+            if (hypopgUsable) {
+              const r = await run("SELECT hypopg_reset()");
+              if (!r.ok) return { ok: false, error: r.error ?? "unknown error", serverError: r.serverError === true };
+            }
+            return { ok: true };
+          };
+          const first = await cleanup();
+          let failure = first.ok ? undefined : first.error;
+          let terminated = false;
+          // Escalation only makes sense when indexes can exist: hypopgUsable
+          // is set once the entry reset succeeded, and nothing is created
+          // before that.
+          if (!first.ok && first.serverError && hypopgUsable) {
+            const second = await cleanup();
+            if (second.ok) {
+              console.error(
+                `[postgres-mcp] pg_index_advisor: cleanup failed (${first.error}) and succeeded on retry; the connection is kept`,
+              );
+              failure = undefined;
+            } else if (second.serverError) {
+              console.error(`[postgres-mcp] pg_index_advisor: cleanup failed again (${second.error})`);
+              // Refused twice by a live server. Discarding the connection is
+              // not enough behind a pooler (see TERMINATE_OWN_BACKEND_SQL), so
+              // the backend itself is ended -- from inside the transaction,
+              // which the retry's failure aborted again, so one more ROLLBACK
+              // TO first. Only a 57P01, or the socket closing, means it worked.
+              expectClose();
+              const cleared = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
+              let refusal: string | undefined;
+              if (cleared.ok) {
+                const t = await run(TERMINATE_OWN_BACKEND_SQL);
+                if (t.ok || t.code === "57P01" || !t.serverError) terminated = true;
+                else refusal = t.error;
+              } else {
+                refusal = `the transaction could not be cleared first: ${cleared.error}`;
+              }
+              if (terminated) {
+                console.error(
+                  "[postgres-mcp] pg_index_advisor: terminated own backend after a cleanup that failed twice",
+                );
+              } else {
+                console.error(`[postgres-mcp] pg_index_advisor: own backend NOT terminated -- ${refusal}`);
+                failure = `${first.error}; the backend could not be terminated (${refusal})`;
+              }
+            }
           }
-          if (hypopgUsable) {
-            const reset = await run("SELECT hypopg_reset()");
-            if (!reset.ok) failure ??= reset.error;
-          }
-          const rolledBack = await run("ROLLBACK");
-          if (!rolledBack.ok) failure ??= rolledBack.error;
-          if (failure !== undefined) {
-            discard(new Error(`pg_index_advisor teardown failed, connection discarded: ${failure}`));
+          if (terminated) {
+            // No ROLLBACK: the backend, and with it the transaction, is gone.
+            discard(
+              new Error(`pg_index_advisor teardown failed twice, backend terminated: ${first.ok ? "" : first.error}`),
+            );
+          } else {
+            const rolledBack = await run("ROLLBACK");
+            if (!rolledBack.ok) failure ??= rolledBack.error;
+            if (failure !== undefined) {
+              discard(new Error(`pg_index_advisor teardown failed, connection discarded: ${failure}`));
+            }
           }
         }
       });
