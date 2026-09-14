@@ -46,7 +46,7 @@ None of them position themselves as a general-purpose daily driver you'd hand to
 - **Parameterized queries** - `pg_query` takes a `params` array for `$1`, `$2`, etc. No string-interpolated SQL in our code path.
 - **Written from scratch, actively maintained** - not a fork of the deprecated code. Unit + integration tests (`npm test`, `npm run test:integration`) run against a real Postgres; releases cut via `release.sh`.
 - **Schema introspection built in** - `pg_list_schemas`, `pg_list_tables`, `pg_describe_table` return columns, primary keys, foreign keys, and indexes without the agent having to remember `pg_catalog` joins.
-- **`EXPLAIN` as a first-class tool** - text or JSON format, with optional `ANALYZE`. ANALYZE for non-SELECT statements requires `ALLOW_WRITES=1` and always rolls back, so the plan is real but the write doesn't persist.
+- **`EXPLAIN` as a first-class tool** - text or JSON format, with optional `ANALYZE`. ANALYZE for non-SELECT statements requires `ALLOW_WRITES=1` and always rolls back, so the plan is real but the written rows don't persist. (What Postgres never rolls back still sticks: a sequence the statement advanced stays advanced.)
 - **Perf diagnostics the deprecated server never had** - `pg_top_queries` (from `pg_stat_statements`), `pg_seq_scan_tables`, `pg_unused_indexes`, `pg_table_bloat`, `pg_inspect_locks`, `pg_replication_status`. Answer "why is this slow?" in one tool call.
 - **Health snapshot** - `pg_health` returns version, db size, connection counts, and the 10 longest-running active queries in one call.
 - **Role and privilege awareness** - `pg_list_roles` and `pg_table_privileges` for the common "who can touch what?" questions.
@@ -140,10 +140,10 @@ Set `ALLOW_WRITES=1` so `pg_query` will issue writes, and rely on the role to ke
 
 Tools split cleanly across two authority classes:
 
-- **Auto-allow:** `pg_readonly` (server-side `BEGIN READ ONLY`, unconditional), plus the introspection tools (`pg_list_*`, `pg_describe_table`, `pg_search_columns`, `pg_explain` without ANALYZE-of-write, `pg_health`, `pg_inspect_locks`, `pg_table_bloat`, `pg_unused_indexes`, `pg_top_queries`, `pg_replication_status`, `pg_advisor`, `pg_table_privileges`, `pg_list_roles`).
-- **Always prompt:** `pg_query` (can write when the role allows it), `pg_kill` (changes session state).
+- **Auto-allow:** `pg_readonly` (server-side `BEGIN READ ONLY`, unconditional), `pg_index_advisor` (only ever EXPLAINs the statements it is given, never with ANALYZE, inside `BEGIN READ ONLY`), plus the introspection and diagnostics tools (`pg_list_*`, `pg_describe_table`, `pg_search_columns`, `pg_health`, `pg_inspect_locks`, `pg_table_bloat`, `pg_unused_indexes`, `pg_seq_scan_tables`, `pg_top_queries`, `pg_io_stats`, `pg_replication_status`, `pg_advisor`, `pg_table_privileges`).
+- **Always prompt:** `pg_query` (writes when `ALLOW_WRITES=1` is set and the role allows it), `pg_explain` (`analyze: true` executes the statement; with `ALLOW_WRITES=1` that includes writes, which are rolled back, and without it the tool has the same reach as `pg_readonly`), `pg_kill` (changes session state; requires `ALLOW_WRITES=1`).
 
-Claude Code's `permissions` block and mcp.hosting's per-tool toggle both honor this split.
+The split follows each tool's `readOnlyHint` annotation, and Claude Code's `permissions` block and mcp.hosting's per-tool toggle both honor it.
 
 > **What `READ ONLY` does and does not cover.** A `BEGIN READ ONLY` transaction blocks writes to the *database* -- INSERT/UPDATE/DELETE, DDL, `nextval`/`setval`. It does not block functions whose effect lands outside the table data. `SELECT pg_terminate_backend(...)`, `pg_cancel_backend`, `pg_read_file`, `lo_export`, and `COPY ... TO PROGRAM` all run to completion inside `pg_readonly`, which means auto-allowing `pg_readonly` reaches the same capability that `pg_kill` puts behind `ALLOW_WRITES=1`. Every one of them still requires a privilege the `DATABASE_URL` role must actually hold (`pg_signal_backend`, `pg_read_server_files`, superuser), so **the role is the control that bounds this tool, not the transaction mode.** If you auto-allow `pg_readonly`, use a least-privileged role -- see [Configuring access](#configuring-access).
 
@@ -176,7 +176,7 @@ The bigger leverage is multi-tool reasoning. A few real workflows:
 
 | Tool | Description |
 |------|-------------|
-| `pg_readonly` | Run a SQL statement with no persistent data changes - always inside `BEGIN READ ONLY`, regardless of `ALLOW_WRITES`. The recommended tool for read access, and the one to auto-allow; pair it with a least-privileged role ([why](#per-tool-gating-in-the-host)). |
+| `pg_readonly` | Run a SQL statement with no persistent data changes - always inside `BEGIN READ ONLY`, regardless of `ALLOW_WRITES`. The recommended tool for read access, and the one to auto-allow for ad-hoc SQL; pair it with a least-privileged role ([why](#per-tool-gating-in-the-host)). |
 | `pg_query` | Run a SQL query. Writes gated by the role in `DATABASE_URL` first, `ALLOW_WRITES` second. Supports parameterized queries via `params`. Result fields include `dataTypeName` (e.g. `int4`, `jsonb`) alongside `dataTypeID`. |
 | `pg_list_schemas` | List non-system schemas. |
 | `pg_list_tables` | List tables (and optionally views) in a schema with estimated row counts. Paginated via `limit`/`offset`. |
@@ -207,7 +207,7 @@ All env vars are read from the MCP server's environment:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DATABASE_URL` | (required) | PostgreSQL connection string. |
-| `ALLOW_WRITES` | unset | Secondary write gate for `pg_query` and `pg_explain` ANALYZE-of-writes. Set to `1` or `true` to lift the `BEGIN READ ONLY` wrapper. The role in `DATABASE_URL` is the primary control - see [Configuring access](#configuring-access). Does not affect `pg_readonly`, which is unconditional. |
+| `ALLOW_WRITES` | unset | Secondary write gate for `pg_query`, `pg_explain` ANALYZE-of-writes, and `pg_kill`. Set to `1` or `true` to lift the `BEGIN READ ONLY` wrapper on the first two and let `pg_kill` run. The role in `DATABASE_URL` is the primary control - see [Configuring access](#configuring-access). Does not affect `pg_readonly`, which is unconditional. |
 | `POSTGRES_STATEMENT_TIMEOUT_MS` | `30000` | Per-statement timeout. |
 | `POSTGRES_CONNECTION_TIMEOUT_MS` | `10000` | TCP connect timeout. Without this, a dead host hangs until the OS gives up (~2 minutes). |
 | `POSTGRES_MAX_ROWS` | `1000` | Cap on rows returned by `pg_query`. |
