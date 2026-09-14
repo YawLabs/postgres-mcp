@@ -120,6 +120,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   appear in exactly one list, and in the one its annotation says. It is what
   would have caught #34.
 
+### Changed
+
+- **`release.sh` finds the integration matrix from any checkout path.** It
+  converted the repo path for WSL by rewriting a `/<drive>/` prefix, but Git
+  Bash mounts more than drive letters -- `/tmp` is `%LOCALAPPDATA%\Temp` -- so
+  a release run from a checkout there aborted at step 2 with "No such file or
+  directory". It now asks MSYS for the Windows path (`pwd -W`) and converts
+  that. The failure message no longer claims the matrix covers only PG17 and
+  PG18; it runs every cluster WSL Ubuntu has.
+
 ### Documentation
 
 - The `pg_explain` tool description -- the text an agent actually reads -- now
