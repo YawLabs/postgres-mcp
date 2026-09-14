@@ -757,7 +757,12 @@ export interface SharedClientControls {
    * undo (HypoPG hypothetical indexes are the case in this codebase) and then
    * failed to clean it up: a pooled connection would pass that state on to
    * whichever call borrows it next. The first reason wins; later calls are
-   * no-ops.
+   * no-ops, and the reason is logged to stderr when the connection is dropped.
+   *
+   * What it isolates is THIS process's connection. Behind a transaction-mode
+   * pooler (PgBouncer) that connection ends at the pooler, and the server
+   * backend behind it lives on with whatever state was left there -- a caller
+   * that needs the backend clean has to clean it inside its transaction.
    */
   discard(reason: Error): void;
 }
@@ -804,7 +809,10 @@ export async function withSharedClient<T>(
     return await fn(runOnClient, controls);
   } finally {
     // pg-pool removes and ends a client released WITH an error, rather than
-    // keeping it idle for reuse.
+    // keeping it idle for reuse. It emits no log of its own for that, so the
+    // reason is written here, or a teardown that keeps failing would churn
+    // connections with no trace on stderr.
+    if (discardReason) console.error(`[postgres-mcp] discarding pooled connection: ${discardReason.message}`);
     client.release(discardReason);
   }
 }

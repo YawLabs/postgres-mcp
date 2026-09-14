@@ -843,7 +843,14 @@ describe("greedySearch bounded search", () => {
 interface StubStatement {
   sql: string;
   params: unknown[];
+  /** SQLSTATE the stub refused or failed the statement with; absent when it ran. */
+  code?: string;
+  /** Whether a transaction was open when the statement was sent. */
+  inTransaction: boolean;
 }
+
+/** A statement-timeout failure: the connection survives it, only the statement dies. */
+const TIMEOUT = { message: "canceling statement due to statement timeout", code: "57014" };
 
 interface StubOptions {
   versionNum?: number;
@@ -854,14 +861,22 @@ interface StubOptions {
   indexedCost?: number;
   /** Make every EXPLAIN throw, to drive the tool down its failure path. */
   failExplain?: boolean;
-  /**
-   * Make hypopg_relation_size throw, as a statement timeout or a cancel would.
-   * It runs outside any savepoint while the accepted indexes are live, so it
-   * ABORTS the transaction with them still in place.
-   */
+  /** Make only the EXPLAINs whose statement contains this text throw. */
+  failExplainContaining?: string;
+  /** Make BEGIN throw, as a connection already in an aborted transaction would. */
+  failBegin?: boolean;
+  /** Make the FIRST hypopg_reset throw, as a HypoPG installed off the search_path would. */
+  failEntryReset?: boolean;
+  /** Make the existing-index catalog read time out. */
+  failIndexCatalog?: boolean;
+  /** Make hypopg_drop_index time out, aborting the transaction with the candidate's index live. */
+  failDropIndex?: boolean;
+  /** Make hypopg_relation_size time out. */
   failSizing?: boolean;
-  /** Make every hypopg_reset after the entry one throw, so the teardown itself fails. */
+  /** Make every hypopg_reset after the entry one time out, so the teardown itself fails. */
   failTeardownReset?: boolean;
+  /** Make the plain ROLLBACK time out, leaving the transaction open. */
+  failTeardownRollback?: boolean;
   /** Columns pg_attribute reports for public.users. */
   columns?: string[];
 }
@@ -870,9 +885,27 @@ interface StubSession {
   statements: StubStatement[];
   /** SQL texts seen, for order-sensitive assertions. */
   texts(): string[];
+  /** Statements containing `fragment` that the server RAN. A refused statement (25P02 and friends) does not count. */
   count(fragment: string): number;
+  /** Statements containing `fragment` that were sent, whether or not the server ran them. */
+  sent(fragment: string): number;
   /** Hypothetical indexes still alive on the session -- what the next borrower inherits. */
   liveHypoIndexes(): number;
+  /** Savepoints still standing; anything above 0 at the end of a call is a leak. */
+  savepointDepth(): number;
+  /**
+   * The most savepoints standing at once. The advisor takes one for the
+   * teardown and one around each isolated statement, so anything above 2 means
+   * a per-statement savepoint outlived its statement.
+   */
+  maxSavepointDepth(): number;
+  /**
+   * Statement failures with no per-statement savepoint standing above the
+   * teardown one. Each of these aborted the WHOLE transaction rather than one
+   * isolated statement.
+   */
+  unisolatedFailures(): number;
+  inTransaction(): boolean;
   /** The argument of each client.release() call; an Error there makes pg-pool destroy the client. */
   releases: unknown[];
 }
@@ -896,8 +929,14 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     baselineCost = 1000,
     indexedCost = 10,
     failExplain = false,
+    failExplainContaining,
+    failBegin = false,
+    failEntryReset = false,
+    failIndexCatalog = false,
+    failDropIndex = false,
     failSizing = false,
     failTeardownReset = false,
+    failTeardownRollback = false,
     columns = ["id", "status", "created_at"],
   } = options;
 
@@ -910,10 +949,17 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
   const session: StubSession = {
     statements,
     texts: () => statements.map((s) => s.sql),
-    count: (fragment) => statements.filter((s) => s.sql.includes(fragment)).length,
+    count: (fragment) => statements.filter((s) => s.code === undefined && s.sql.includes(fragment)).length,
+    sent: (fragment) => statements.filter((s) => s.sql.includes(fragment)).length,
     liveHypoIndexes: () => liveHypoIndexes,
+    savepointDepth: () => savepoints.length,
+    maxSavepointDepth: () => maxSavepointDepth,
+    unisolatedFailures: () => unisolatedFailures,
+    inTransaction: () => inTransaction,
     releases,
   };
+  let maxSavepointDepth = 0;
+  let unisolatedFailures = 0;
 
   // Hypothetical indexes are session state in the real server too, so the stub
   // models them as a counter rather than a boolean: the advisor creates and
@@ -925,10 +971,15 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
   // Transaction state, modelled because the teardown's correctness depends on
   // it. A statement that fails inside a transaction ABORTS it, and from then on
   // Postgres refuses everything except ROLLBACK / ROLLBACK TO SAVEPOINT with
-  // SQLSTATE 25P02. Without this, a stub accepts a statement the real server
-  // would refuse, and a teardown that leaks on a live database passes here.
+  // SQLSTATE 25P02. Savepoints are a named stack: ROLLBACK TO keeps the named
+  // one and drops everything above it, RELEASE drops it and everything above
+  // it, and a name that is not on the stack is 3B001. All of this was checked
+  // against PostgreSQL 15 and 18 before it was written down here. Without it,
+  // a stub accepts statements the real server would refuse, and a teardown
+  // that leaks on a live database passes here.
   let inTransaction = false;
   let aborted = false;
+  const savepoints: string[] = [];
 
   const planFor = (cost: number) => [
     {
@@ -944,52 +995,90 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
   ];
 
   const pgError = (message: string, code: string) => Object.assign(new Error(message), { code });
+  const timeout = () => pgError(TIMEOUT.message, TIMEOUT.code);
+  const abortedError = () =>
+    pgError("current transaction is aborted, commands ignored until end of transaction block", "25P02");
+  const noTransaction = (verb: string) => pgError(`${verb} can only be used in transaction blocks`, "25P01");
+  const noSavepoint = (name: string) => pgError(`savepoint "${name}" does not exist`, "3B001");
+  const ok = (command: string, rows: Record<string, unknown>[] = []) => ({
+    rows,
+    fields: [],
+    command,
+    rowCount: rows.length,
+  });
 
   const respond = (sql: string) => {
     if (sql.startsWith("BEGIN")) {
+      if (failBegin) throw abortedError();
+      if (aborted) throw abortedError();
+      // Inside a healthy transaction BEGIN is only a WARNING (25001).
       inTransaction = true;
-      return { rows: [], fields: [], command: "BEGIN", rowCount: 0 };
-    }
-    if (sql.startsWith("ROLLBACK TO SAVEPOINT")) {
-      aborted = false;
-      return { rows: [], fields: [], command: "ROLLBACK", rowCount: 0 };
+      return ok("BEGIN");
     }
     if (sql === "ROLLBACK") {
+      // Outside a transaction this is only a WARNING (25P01), never an error.
+      if (failTeardownRollback) throw timeout();
       inTransaction = false;
       aborted = false;
-      return { rows: [], fields: [], command: "ROLLBACK", rowCount: 0 };
+      savepoints.length = 0;
+      return ok("ROLLBACK");
     }
-    if (aborted) {
-      throw pgError("current transaction is aborted, commands ignored until end of transaction block", "25P02");
+    const savepointVerb = sql.match(/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) (\S+)$/);
+    if (savepointVerb) {
+      const [, verb, name] = savepointVerb as [string, string, string];
+      if (!inTransaction) throw noTransaction(verb);
+      if (verb === "ROLLBACK TO SAVEPOINT") {
+        const at = savepoints.lastIndexOf(name);
+        if (at < 0) throw noSavepoint(name);
+        savepoints.length = at + 1;
+        aborted = false;
+        return ok("ROLLBACK");
+      }
+      if (aborted) throw abortedError();
+      if (verb === "SAVEPOINT") {
+        savepoints.push(name);
+        maxSavepointDepth = Math.max(maxSavepointDepth, savepoints.length);
+        return ok("SAVEPOINT");
+      }
+      const at = savepoints.lastIndexOf(name);
+      if (at < 0) throw noSavepoint(name);
+      savepoints.length = at;
+      return ok("RELEASE");
     }
+    if (aborted) throw abortedError();
     if (sql.startsWith("EXPLAIN")) {
       if (failExplain) throw new Error('relation "users" does not exist');
+      if (failExplainContaining !== undefined && sql.includes(failExplainContaining)) {
+        throw new Error('relation "users" does not exist');
+      }
       const cost = liveHypoIndexes > 0 ? indexedCost : baselineCost;
-      return { rows: [{ "QUERY PLAN": planFor(cost) }], fields: [], command: "EXPLAIN", rowCount: 1 };
+      return ok("EXPLAIN", [{ "QUERY PLAN": planFor(cost) }]);
     }
     if (sql.includes("hypopg_create_index")) {
       liveHypoIndexes += 1;
-      return { rows: [{ indexrelid: 12_345 }], fields: [], command: "SELECT", rowCount: 1 };
+      return ok("SELECT", [{ indexrelid: 12_345 }]);
     }
     if (sql.includes("hypopg_drop_index")) {
+      if (failDropIndex) throw timeout();
       liveHypoIndexes = Math.max(0, liveHypoIndexes - 1);
-      return { rows: [{ hypopg_drop_index: true }], fields: [], command: "SELECT", rowCount: 1 };
+      return ok("SELECT", [{ hypopg_drop_index: true }]);
     }
     if (sql.includes("hypopg_reset")) {
       resetCalls += 1;
-      if (failTeardownReset && resetCalls > 1)
-        throw pgError("terminating connection due to administrator command", "57P01");
+      if (failEntryReset && resetCalls === 1) throw pgError("function hypopg_reset() does not exist", "42883");
+      if (failTeardownReset && resetCalls > 1) throw timeout();
       liveHypoIndexes = 0;
-      return { rows: [], fields: [], command: "SELECT", rowCount: 0 };
+      return ok("SELECT");
     }
     if (sql.includes("hypopg_relation_size")) {
-      if (failSizing) throw pgError("canceling statement due to statement timeout", "57014");
-      return { rows: [{ bytes: "16384" }], fields: [], command: "SELECT", rowCount: 1 };
+      if (failSizing) throw timeout();
+      return ok("SELECT", [{ bytes: "16384" }]);
     }
     // Matched before the pg_attribute branch: the index query also joins
     // pg_attribute, so a looser check would swallow it.
     if (sql.includes("FROM pg_catalog.pg_index")) {
-      return { rows: [], fields: [], command: "SELECT", rowCount: 0 };
+      if (failIndexCatalog) throw timeout();
+      return ok("SELECT");
     }
     if (sql.includes("LEFT JOIN pg_catalog.pg_stats")) {
       const rows = columns.map((column) => ({
@@ -1010,10 +1099,16 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     async query(config: unknown, params: unknown[] = []) {
       const sql = typeof config === "string" ? config : ((config as { text?: string }).text ?? "");
       const values = typeof config === "string" ? params : ((config as { values?: unknown[] }).values ?? params);
-      statements.push({ sql, params: values });
+      const record: StubStatement = { sql, params: values, inTransaction };
+      statements.push(record);
       try {
         return respond(sql);
       } catch (err) {
+        record.code = (err as { code?: string }).code ?? "XX000";
+        // Any error inside a transaction block aborts it -- a statement that
+        // fails outside one (25P01) aborts nothing. A statement refused BECAUSE
+        // the transaction is already aborted is not a new failure.
+        if (inTransaction && !aborted && savepoints.length <= 1) unisolatedFailures += 1;
         if (inTransaction) aborted = true;
         throw err;
       }
@@ -1027,7 +1122,7 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
   process.env.DATABASE_URL = "postgres://stub-host/stubdb";
   pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown, params: unknown[] = []) {
     const text = typeof sql === "string" ? sql : "";
-    statements.push({ sql: text, params });
+    statements.push({ sql: text, params, inTransaction: false });
     if (text.includes("server_version_num")) return Promise.resolve({ rows: [{ v: String(versionNum) }] });
     if (text.includes("extname = 'hypopg'")) return Promise.resolve({ rows: [{ installed: hypopgInstalled }] });
     if (text.includes("extname = 'pg_stat_statements'")) return Promise.resolve({ rows: [{ version: "1.10" }] });
@@ -1075,64 +1170,148 @@ describe("pg_index_advisor HypoPG requirement", () => {
   });
 });
 
+const ONE_STATEMENT = ["SELECT * FROM users WHERE status = 'active'"];
+
+/** What every call must leave behind when the teardown succeeded: nothing. */
+function assertSessionClean(session: StubSession): void {
+  assert.equal(session.liveHypoIndexes(), 0, "hypothetical indexes survived the teardown");
+  assert.equal(session.savepointDepth(), 0, "a savepoint leaked");
+  // The teardown savepoint plus one per isolated statement. The final ROLLBACK
+  // discards a leaked savepoint too, so the depth at the END cannot see a
+  // per-statement savepoint that was never released; the peak can.
+  assert.ok(session.maxSavepointDepth() <= 2, `savepoints stacked ${session.maxSavepointDepth()} deep`);
+  assert.equal(session.inTransaction(), false, "the transaction was left open");
+  // Exactly one plain ROLLBACK ran. Matched exactly: a `ROLLBACK TO SAVEPOINT`
+  // contains the word too and must not satisfy this.
+  assert.equal(session.statements.filter((s) => s.sql === "ROLLBACK" && s.code === undefined).length, 1);
+  // A clean teardown hands the connection back for reuse. Destroying it would
+  // also contain a leak, so this is what tells a fix from a cover-up.
+  assert.deepEqual(session.releases, [undefined]);
+}
+
 describe("pg_index_advisor HypoPG session hygiene", () => {
-  it("resets hypothetical indexes on the way in AND out of a successful call", async () => {
+  it("resets hypothetical indexes on the way in AND out of a successful call, inside the transaction", async () => {
     await withStubbedServer({}, async (session) => {
-      const result = (await pgIndexAdvisor.handler({
-        statements: ["SELECT * FROM users WHERE status = 'active'"],
-      })) as { ok: boolean };
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as { ok: boolean };
       assert.equal(result.ok, true);
       // Once on entry (a previous call's teardown may have failed) and once in
       // the finally. HypoPG indexes are SESSION-scoped, so the transaction's
       // ROLLBACK does not remove them and this connection goes back to the pool.
       assert.ok(session.count("hypopg_reset") >= 2, `saw ${session.count("hypopg_reset")} resets`);
-      assert.ok(session.count("ROLLBACK") >= 1);
       // The reset must be the LAST hypopg statement, or an index outlives the call.
-      const hypoCalls = session.texts().filter((s) => s.includes("hypopg"));
-      assert.match(hypoCalls.at(-1) ?? "", /hypopg_reset/);
+      const hypoCalls = session.statements.filter((s) => s.sql.includes("hypopg"));
+      const last = hypoCalls.at(-1);
+      assert.match(last?.sql ?? "", /hypopg_reset/);
+      // ... and it must run INSIDE the transaction. Behind a transaction-mode
+      // pooler the backend is pinned only until the transaction ends, so a reset
+      // sent after the ROLLBACK can reach a different backend than the one
+      // holding the indexes, and report success.
+      assert.equal(last?.inTransaction, true, "the teardown reset ran after the ROLLBACK");
+      assertSessionClean(session);
     });
   });
 
-  it("still resets when the run fails, so a hypothetical index cannot leak into the next call", async () => {
-    // The error path is the one that matters: an early `return` from a guard
-    // inside the try would skip a trailing cleanup statement, which is exactly
-    // why the reset lives in a `finally`.
+  it("still tears down when no statement could be planned", async () => {
+    // The early `return` path: a guard inside the try would skip a trailing
+    // cleanup statement, which is exactly why the teardown lives in a `finally`.
     await withStubbedServer({ failExplain: true }, async (session) => {
-      const result = (await pgIndexAdvisor.handler({
-        statements: ["SELECT * FROM users WHERE status = 'active'"],
-      })) as { ok: boolean; error?: string };
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as {
+        ok: boolean;
+        error?: string;
+      };
       assert.equal(result.ok, false);
       assert.match(result.error ?? "", /could be planned/);
       assert.ok(session.count("hypopg_reset") >= 2, "the teardown reset did not run on the failure path");
-      assert.ok(session.count("ROLLBACK") >= 1);
+      assertSessionClean(session);
     });
   });
 
-  it("rolls back BEFORE resetting, so an aborted transaction cannot strand hypothetical indexes", async () => {
-    // The sizing query runs outside any savepoint while the accepted indexes
-    // are still live. When it fails, the transaction is aborted, and a reset
-    // sent before the ROLLBACK is refused with 25P02 -- measured on PG15 and
-    // PG18 with HypoPG. The indexes would then ride the pooled connection into
-    // the next pg_explain or pg_readonly call.
+  it("recovers an aborted transaction before resetting, so stranded indexes are still cleared", async () => {
+    // hypopg_drop_index runs outside any savepoint with the candidate's index
+    // live. When it fails the transaction is aborted, and a reset sent into an
+    // aborted transaction is refused with 25P02 -- measured on PG15 and PG18
+    // with HypoPG. The indexes would then ride the pooled connection into the
+    // next pg_explain or pg_readonly call.
+    await withStubbedServer({ failDropIndex: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as {
+        ok: boolean;
+        error?: string;
+      };
+      assert.equal(result.ok, false);
+      assert.equal(session.count("ROLLBACK TO SAVEPOINT __pgmcp_advisor_teardown"), 1);
+      assertSessionClean(session);
+    });
+  });
+
+  it("reports a search that stopped because a candidate could not be dropped, instead of a partial result", async () => {
+    await withStubbedServer({ failDropIndex: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as {
+        ok: boolean;
+        error?: string;
+      };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /could not be dropped/);
+      assert.match(result.error ?? "", new RegExp(TIMEOUT.message));
+      // Once the transaction is gone, nothing more is sent into it: no further
+      // candidate is created and nothing is kept in place.
+      assert.equal(session.sent("hypopg_create_index"), 1);
+    });
+  });
+
+  it("isolates a failed sizing query so the rest of the call and the teardown are unaffected", async () => {
     await withStubbedServer({ failSizing: true }, async (session) => {
-      const result = (await pgIndexAdvisor.handler({
-        statements: ["SELECT * FROM users WHERE status = 'active'"],
-      })) as { ok: boolean; data?: { recommendations: { estimated_size_bytes: string | null }[] } };
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as {
+        ok: boolean;
+        data?: { recommendations: { estimated_size_bytes: string | null }[] };
+      };
       // Sizing is best-effort, so the recommendation still comes back, unsized.
       assert.equal(result.ok, true);
+      assert.equal(result.data?.recommendations.length, 1);
       assert.equal(result.data?.recommendations[0]?.estimated_size_bytes, null);
-      assert.equal(session.liveHypoIndexes(), 0, "hypothetical indexes survived the teardown");
-      // A clean teardown hands the connection back for reuse. Destroying it
-      // would also contain the leak, so this is what pins the ORDER.
-      assert.deepEqual(session.releases, [undefined]);
+      // A null size is only an honest "unknown" if the failure did not abort
+      // the transaction the remaining sizes are read in.
+      assert.equal(session.unisolatedFailures(), 0, "the sizing failure aborted the whole transaction");
+      assertSessionClean(session);
+    });
+  });
+
+  it("isolates a failed existing-index read: the search still runs, with the warning", async () => {
+    await withStubbedServer({ failIndexCatalog: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as {
+        ok: boolean;
+        data?: { recommendations: unknown[]; _warnings?: string[] };
+      };
+      assert.equal(result.ok, true);
+      assert.ok(result.data?._warnings?.some((w) => /existing indexes could not be read/.test(w)));
+      // Without the savepoint the failure aborts the transaction, every
+      // candidate then fails to create, and the call returns ok with NO
+      // recommendations and only that warning -- a silent empty search.
+      assert.equal(result.data?.recommendations.length, 1);
+      assert.equal(session.unisolatedFailures(), 0, "the catalog read failure aborted the whole transaction");
+      assertSessionClean(session);
+    });
+  });
+
+  it("returns the entry reset's own error and keeps the connection", async () => {
+    // The extension probe only reads pg_extension; a HypoPG installed in a
+    // schema off the search_path passes it and fails here. Nothing could have
+    // been created, so the connection is clean and the teardown does not try
+    // the reset again.
+    await withStubbedServer({ failEntryReset: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as {
+        ok: boolean;
+        error?: string;
+      };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /hypopg_reset\(\) does not exist/);
+      assert.equal(session.sent("hypopg_reset"), 1);
+      assertSessionClean(session);
     });
   });
 
   it("destroys the connection instead of pooling it when the teardown reset fails", async () => {
     await withStubbedServer({ failTeardownReset: true }, async (session) => {
-      const result = (await pgIndexAdvisor.handler({
-        statements: ["SELECT * FROM users WHERE status = 'active'"],
-      })) as { ok: boolean };
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as { ok: boolean };
       // Cleanup never replaces the call's own result.
       assert.equal(result.ok, true);
       assert.ok(session.liveHypoIndexes() > 0, "precondition: the failed reset left indexes behind");
@@ -1140,12 +1319,40 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
       const released = session.releases[0];
       assert.ok(released instanceof Error, "a connection still holding hypothetical indexes went back to the pool");
       assert.match(released.message, /teardown failed/);
+      assert.match(released.message, new RegExp(TIMEOUT.message));
+    });
+  });
+
+  it("destroys the connection when the teardown ROLLBACK fails, naming that failure", async () => {
+    await withStubbedServer({ failTeardownRollback: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as { ok: boolean };
+      assert.equal(result.ok, true);
+      assert.equal(session.inTransaction(), true, "precondition: the failed ROLLBACK left the transaction open");
+      assert.equal(session.releases.length, 1);
+      const released = session.releases[0];
+      assert.ok(released instanceof Error, "a connection left mid-transaction went back to the pool");
+      assert.match(released.message, /teardown failed/);
+      assert.match(released.message, new RegExp(TIMEOUT.message));
+    });
+  });
+
+  it("destroys the connection when BEGIN is refused", async () => {
+    // A live connection refuses BEGIN only from a state no pooled connection
+    // should be in, such as an inherited aborted transaction.
+    await withStubbedServer({ failBegin: true }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: ONE_STATEMENT })) as {
+        ok: boolean;
+        error?: string;
+      };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /transaction is aborted/);
+      assert.ok(session.releases[0] instanceof Error);
     });
   });
 
   it("drops only the candidate under test, never resetting mid-search", async () => {
     await withStubbedServer({}, async (session) => {
-      await pgIndexAdvisor.handler({ statements: ["SELECT * FROM users WHERE status = 'active'"] });
+      await pgIndexAdvisor.handler({ statements: ONE_STATEMENT });
       // A hypopg_reset() inside the search would wipe previously accepted
       // indexes and silently degrade the greedy search to an independent
       // per-candidate ranking, so each candidate is retired with a targeted drop.
@@ -1153,15 +1360,30 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
     });
   });
 
-  it("isolates a failing statement behind a savepoint so later work still runs", async () => {
-    await withStubbedServer({ failExplain: true }, async (session) => {
-      await pgIndexAdvisor.handler({ statements: ["SELECT 1"] });
+  it("isolates a failing statement behind a savepoint so the next statement is still planned", async () => {
+    const failing = "SELECT * FROM users WHERE status = 'gone'";
+    await withStubbedServer({ failExplainContaining: "'gone'" }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({ statements: [failing, ...ONE_STATEMENT] })) as {
+        ok: boolean;
+        data?: { statements: { planned: boolean }[]; recommendations: unknown[] };
+      };
       // Without ROLLBACK TO, the aborted transaction takes every subsequent
-      // statement down with SQLSTATE 25P02.
-      assert.ok(session.count("ROLLBACK TO SAVEPOINT __pgmcp_advisor_sp") >= 1);
+      // statement down with SQLSTATE 25P02, and the second statement here would
+      // never be planned.
+      assert.equal(result.ok, true);
+      assert.deepEqual(
+        result.data?.statements.map((s) => s.planned),
+        [false, true],
+      );
+      assert.equal(result.data?.recommendations.length, 1);
       // ROLLBACK TO leaves the savepoint in place, so the RELEASE is still
-      // required or one savepoint leaks per failed statement.
+      // required or one savepoint leaks per failed statement. `count` only
+      // counts statements the server RAN, so a RELEASE refused with 25P02
+      // because it was sent before the ROLLBACK TO does not satisfy this.
+      assert.ok(session.count("ROLLBACK TO SAVEPOINT __pgmcp_advisor_sp") >= 1);
       assert.ok(session.count("RELEASE SAVEPOINT __pgmcp_advisor_sp") >= 1);
+      assert.equal(session.unisolatedFailures(), 0, "a statement failure aborted the whole transaction");
+      assertSessionClean(session);
     });
   });
 });

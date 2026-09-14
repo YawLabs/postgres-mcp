@@ -334,17 +334,29 @@ describe("withSharedClient discard: a connection with dirty session state is des
     assert.deepEqual(releases, [undefined]);
   });
 
-  it("releases with the first discard reason, even when the callback then throws", async () => {
+  it("releases with the first discard reason, even when the callback then throws, and logs it", async () => {
     const first = new Error("first");
-    await assert.rejects(
-      withSharedClient(async (_run, { discard }) => {
-        discard(first);
-        discard(new Error("second"));
-        throw new Error("callback failed");
-      }),
-      /callback failed/,
-    );
+    const logged: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    try {
+      await assert.rejects(
+        withSharedClient(async (_run, { discard }) => {
+          discard(first);
+          discard(new Error("second"));
+          throw new Error("callback failed");
+        }),
+        /callback failed/,
+      );
+    } finally {
+      console.error = originalError;
+    }
     assert.deepEqual(releases, [first]);
+    // pg-pool drops the client silently; without this line a teardown that
+    // keeps failing churns connections with no trace on stderr.
+    assert.deepEqual(logged, ["[postgres-mcp] discarding pooled connection: first"]);
   });
 });
 
