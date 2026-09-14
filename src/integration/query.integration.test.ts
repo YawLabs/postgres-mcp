@@ -628,6 +628,49 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         assert.equal(single.data?.[0]?.n, 1);
       });
     });
+
+    it("survives its own backend being terminated mid-callback", async () => {
+      // pg-pool removes its idle 'error' listener from a checked-out client,
+      // and node-pg emits 'error' on the client when the socket dies. With no
+      // listener that emit was an uncaught exception, and the process ended.
+      // Terminating the backend from inside the callback is the real thing:
+      // postgres answers the statement with FATAL 57P01 and closes the socket.
+      // This test's only job is to still be running afterwards, with the
+      // failure reported through the normal channel.
+      const originalError = console.error;
+      const logged: string[] = [];
+      console.error = (...args: unknown[]) => {
+        logged.push(args.map(String).join(" "));
+      };
+      let uncaught: Error | undefined;
+      const onUncaught = (err: Error) => {
+        uncaught = err;
+      };
+      process.on("uncaughtException", onUncaught);
+      try {
+        const outcome = await withSharedClient(async (run) => {
+          const killed = await run("SELECT pg_terminate_backend(pg_backend_pid())");
+          const after = await run("SELECT 1 AS n");
+          return { killed, after };
+        });
+        assert.equal(outcome.killed.ok, false, "terminating the backend must fail the statement in flight");
+        assert.equal(outcome.after.ok, false, "a statement after the death must fail, not hang or succeed");
+        // Give the socket's close and node-pg's 'error' emit time to land.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(uncaught, undefined, `the socket death escaped as an uncaught exception: ${uncaught?.message}`);
+        assert.ok(
+          logged.some((l) => l.includes("[postgres-mcp] connection error on a checked-out client")),
+          `the death was not logged; stderr saw: ${JSON.stringify(logged)}`,
+        );
+        // The pool must have dropped the dead connection: a fresh call works.
+        const again = await withSharedClient(async (run) => run<{ n: number }>("SELECT 2 AS n"));
+        assert.equal(again.ok, true, `the pool handed out the dead connection again: ${again.error}`);
+        assert.equal(again.data?.[0]?.n, 2);
+      } finally {
+        process.removeListener("uncaughtException", onUncaught);
+        console.error = originalError;
+      }
+    });
   });
 
   describe("pg_explain", () => {

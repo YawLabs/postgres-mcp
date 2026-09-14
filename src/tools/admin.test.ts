@@ -73,6 +73,11 @@ function makeFakeClient(opts: FakeClientOptions) {
     release() {
       /* no-op */
     },
+    // acquireClient() attaches an 'error' listener for the checked-out lifetime
+    // through `on` above (any non-notice event is ignored) and removes it here.
+    removeListener() {
+      return this;
+    },
   };
 }
 
@@ -86,7 +91,7 @@ describe("pg_kill note construction (stubbed connect, no live DB)", () => {
     fakeClient = makeFakeClient(opts);
     pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
       return Promise.resolve(fakeClient);
-    } as typeof pg.Pool.prototype.connect;
+    } as unknown as typeof pg.Pool.prototype.connect;
   }
 
   beforeEach(async () => {
@@ -263,6 +268,13 @@ describe("pg_advisor wraparound_risk (stubbed connect, no live DB)", () => {
       },
       release() {
         /* no-op */
+      },
+      // acquireClient() attaches an 'error' listener for the checked-out lifetime.
+      on() {
+        return this;
+      },
+      removeListener() {
+        return this;
       },
     };
     pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {

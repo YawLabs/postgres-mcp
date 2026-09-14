@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import pg from "pg";
-import { shutdown, withSharedClient } from "./api.js";
+import { runReadOnly, shutdown, withSharedClient } from "./api.js";
 import { type McpToolResponse, wrapToolHandler } from "./mcp-wrapper.js";
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -297,6 +298,151 @@ describe("withSharedClient connect failure propagates as a throw", () => {
       }),
     );
     assert.equal(callbackRan, false, "fn must not run when getPool().connect() rejects");
+  });
+});
+
+describe("withSharedClient discard: a connection with dirty session state is destroyed, not pooled", () => {
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalDbUrl = process.env.DATABASE_URL;
+  let releases: unknown[] = [];
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    releases = [];
+    const client = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      release: (err?: unknown) => {
+        releases.push(err);
+      },
+      on() {
+        return this;
+      },
+      removeListener() {
+        return this;
+      },
+    };
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(client);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  // pg-pool keeps a client released with no argument and destroys one released
+  // with an Error, so the release argument IS the contract.
+  it("releases with no error when the callback does not discard", async () => {
+    await withSharedClient(async (run) => run("SELECT 1"));
+    assert.deepEqual(releases, [undefined]);
+  });
+
+  it("releases with the first discard reason, even when the callback then throws, and logs it", async () => {
+    const first = new Error("first");
+    const logged: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    try {
+      await assert.rejects(
+        withSharedClient(async (_run, { discard }) => {
+          discard(first);
+          discard(new Error("second"));
+          throw new Error("callback failed");
+        }),
+        /callback failed/,
+      );
+    } finally {
+      console.error = originalError;
+    }
+    assert.deepEqual(releases, [first]);
+    // pg-pool drops the client silently; without this line a teardown that
+    // keeps failing churns connections with no trace on stderr.
+    assert.deepEqual(logged, ["[postgres-mcp] discarding pooled connection: first"]);
+  });
+});
+
+describe("a checked-out client has an 'error' listener for as long as it is checked out", () => {
+  // pg-pool removes its idle-error listener when a client is checked out and
+  // re-adds it on release, and node-pg emits 'error' on the client when its
+  // socket dies. A real EventEmitter stands in for the client because it does
+  // what pg's does with no listener: throws from the emit. Measured on
+  // PostgreSQL 15: pg_terminate_backend on a checked-out client raised two
+  // uncaught exceptions with no listener and none with one.
+  class FakeClient extends EventEmitter {
+    releases: unknown[] = [];
+    async query(sql: unknown) {
+      const text = typeof sql === "string" ? sql : ((sql as { text?: string }).text ?? "");
+      if (text.startsWith("FETCH")) return { rows: [{ n: 1 }], fields: [], command: "FETCH", rowCount: 1 };
+      return { rows: [], fields: [], command: "", rowCount: 0 };
+    }
+    release(err?: unknown) {
+      this.releases.push(err);
+    }
+  }
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalDbUrl = process.env.DATABASE_URL;
+  const originalError = console.error;
+  let client: FakeClient;
+  let logged: string[];
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    client = new FakeClient();
+    logged = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(client);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  });
+
+  afterEach(async () => {
+    console.error = originalError;
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("withSharedClient: attached while the callback runs, removed after release", async () => {
+    assert.equal(client.listenerCount("error"), 0);
+    await withSharedClient(async () => {
+      assert.equal(client.listenerCount("error"), 1, "no error listener while checked out");
+      return undefined;
+    });
+    assert.equal(client.listenerCount("error"), 0, "the listener outlived the checkout");
+    assert.deepEqual(client.releases, [undefined]);
+  });
+
+  it("withSharedClient: a socket death while checked out is logged, not thrown", async () => {
+    await withSharedClient(async () => {
+      // Exactly what node-pg does from the socket callback.
+      client.emit("error", new Error("Connection terminated unexpectedly"));
+      return undefined;
+    });
+    assert.deepEqual(logged, [
+      "[postgres-mcp] connection error on a checked-out client: Connection terminated unexpectedly",
+    ]);
+  });
+
+  it("runReadOnly: attached while the transaction runs, removed after release", async () => {
+    let during = -1;
+    const result = await runReadOnly("SELECT 1", [], {
+      setup: async () => {
+        during = client.listenerCount("error");
+      },
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(during, 1, "no error listener while checked out");
+    assert.equal(client.listenerCount("error"), 0, "the listener outlived the checkout");
   });
 });
 

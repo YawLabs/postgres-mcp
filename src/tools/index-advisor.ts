@@ -29,6 +29,80 @@ export type SharedRunner = Parameters<Parameters<typeof withSharedClient>[0]>[0]
 const ADVISOR_SAVEPOINT = "__pgmcp_advisor_sp";
 
 /**
+ * Savepoint taken once, right after BEGIN, as the teardown's rollback target.
+ *
+ * `ROLLBACK TO` it clears an aborted transaction WITHOUT ending it, which is
+ * what lets the teardown's `hypopg_reset()` run inside the transaction on every
+ * path. Inside matters: behind a transaction-mode pooler (PgBouncer, which the
+ * README lists as a supported setup) a server backend is pinned only until the
+ * transaction ends, and a reset sent after `ROLLBACK` could reach a different
+ * backend than the one holding the indexes -- and report success.
+ */
+const ADVISOR_TEARDOWN_SAVEPOINT = "__pgmcp_advisor_teardown";
+
+/**
+ * Called when the advisor's transaction can no longer be used: a savepoint
+ * statement itself failed, which means the transaction is already aborted or
+ * the connection is gone. Everything sent after that is refused, so the search
+ * has to stop and say so rather than read every refusal as a soft "skip".
+ */
+type OnTransactionLost = (error: string | undefined) => void;
+
+/**
+ * Run one statement behind {@link ADVISOR_SAVEPOINT}, so its failure cannot
+ * abort the advisor's transaction and take every later statement down with
+ * SQLSTATE 25P02.
+ *
+ * `ROLLBACK TO` clears the aborted state but LEAVES the savepoint in place, so
+ * the `RELEASE` after it is still required -- skipping it leaks one savepoint
+ * per failed statement for the life of the transaction.
+ *
+ * Two kinds of failure come out of here, and the caller must not confuse them.
+ * The STATEMENT failing is the isolated, soft case the savepoint exists for.
+ * The SAVEPOINT, ROLLBACK TO or RELEASE failing is not: those can only fail
+ * when the transaction is aborted or the connection is dead, and after that
+ * every later statement fails the same way. Each is reported through `onLost`
+ * with its own error, at the moment it happens. "The next SAVEPOINT will be
+ * refused and report it" is NOT a substitute: when the statement that died
+ * was the last one the search sends, the next savepoint is on the far side of
+ * the check that turns a loss into an error, and the call would report a
+ * search that converged on nothing (measured: a socket death during the only
+ * candidate's hypopg_create_index). A statement that already ran keeps its
+ * result even when the RELEASE after it fails.
+ */
+async function runIsolated<R extends Record<string, unknown>>(
+  run: SharedRunner,
+  sql: string,
+  params: unknown[] = [],
+  options?: Parameters<SharedRunner>[2],
+  onLost?: OnTransactionLost,
+): Promise<ApiResponse<R[]>> {
+  const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  if (!sp.ok) {
+    onLost?.(sp.error);
+    return { ok: false, error: sp.error };
+  }
+  const res = await run<R>(sql, params, options);
+  if (!res.ok) {
+    const restored = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    if (!restored.ok) {
+      // Both errors, in order: the ROLLBACK TO's is what lost the transaction
+      // (a cancel, a dead socket), the statement's is what it was recovering
+      // from -- which may be the same socket death, or a benign refusal that
+      // would be misleading on its own.
+      onLost?.(`${restored.error} (while recovering from: ${res.error})`);
+      return res;
+    }
+    const released = await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    if (!released.ok) onLost?.(released.error);
+    return res;
+  }
+  const released = await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  if (!released.ok) onLost?.(released.error);
+  return res;
+}
+
+/**
  * Only btree candidates are generated. hash/gin/gist/brin all need knowledge
  * this tool does not have (operator class fit, the query's containment vs.
  * equality semantics, whether the column is a tsvector), and a wrong access
@@ -818,13 +892,13 @@ const BIND_COUNT_MISMATCH = /\(code: 08P01\)/;
  * defended by the default suite instead of only by a run someone remembers to
  * opt into.
  */
-export async function assertSingleStatement(run: SharedRunner, explainSql: string): Promise<ExplainOutcome> {
-  const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-  if (!sp.ok) return { ok: false, error: sp.error };
-
-  const probe = await run<{ "QUERY PLAN": unknown }>(explainSql, [], { extended: true });
+export async function assertSingleStatement(
+  run: SharedRunner,
+  explainSql: string,
+  onLost?: OnTransactionLost,
+): Promise<ExplainOutcome> {
+  const probe = await runIsolated<{ "QUERY PLAN": unknown }>(run, explainSql, [], { extended: true }, onLost);
   if (probe.ok) {
-    await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
     // No placeholders: the validating call WAS a complete, protocol-guarded
     // EXPLAIN, so its plan is returned rather than paying a second round trip
     // to re-run the identical statement.
@@ -834,10 +908,6 @@ export async function assertSingleStatement(run: SharedRunner, explainSql: strin
     return { ok: true, cost, plan };
   }
 
-  // ROLLBACK TO clears the aborted state but LEAVES the savepoint, so the
-  // RELEASE is still required -- see explainStatement.
-  await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-  await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
   if (BIND_COUNT_MISMATCH.test(probe.error ?? "")) {
     // Single statement, placeholders unbound. Safe to plan on the simple
     // protocol, which is the only one GENERIC_PLAN can use.
@@ -867,21 +937,16 @@ function buildExplainSql(sql: string, useGenericPlan: boolean): string {
   return `EXPLAIN (${flags.join(", ")}) ${sql}`;
 }
 
-async function explainStatement(run: SharedRunner, sql: string, useGenericPlan: boolean): Promise<ExplainOutcome> {
+async function explainStatement(
+  run: SharedRunner,
+  sql: string,
+  useGenericPlan: boolean,
+  onLost?: OnTransactionLost,
+): Promise<ExplainOutcome> {
   const explainSql = buildExplainSql(sql, useGenericPlan);
 
-  const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-  if (!sp.ok) return { ok: false, error: sp.error };
-  const result = await run<{ "QUERY PLAN": unknown }>(explainSql);
-  if (!result.ok) {
-    // ROLLBACK TO clears the aborted state but LEAVES the savepoint in place, so
-    // the RELEASE is still required -- skipping it leaks one savepoint per
-    // failed statement for the life of the transaction.
-    await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-    await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-    return { ok: false, error: result.error };
-  }
-  await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+  const result = await runIsolated<{ "QUERY PLAN": unknown }>(run, explainSql, [], undefined, onLost);
+  if (!result.ok) return { ok: false, error: result.error };
 
   const plan = result.data?.[0]?.["QUERY PLAN"];
   const cost = planTotalCost(plan);
@@ -894,30 +959,44 @@ async function explainStatement(run: SharedRunner, sql: string, useGenericPlan: 
  * declined. Null is a "skip this candidate" signal: HypoPG refuses index shapes
  * it cannot model (an unsupported opclass, a column type with no btree
  * ordering), and that is a normal outcome for a generated candidate, not a tool
- * failure.
+ * failure. It is still reported through `onDeclined`, with the server's own
+ * words, because a candidate that vanishes without a trace reads as "no index
+ * helps" -- and a statement timeout on the create looks exactly like a refusal
+ * from here.
  */
-async function createHypotheticalIndex(run: SharedRunner, candidate: IndexCandidate): Promise<number | null> {
+async function createHypotheticalIndex(
+  run: SharedRunner,
+  candidate: IndexCandidate,
+  onLost?: OnTransactionLost,
+  onDeclined?: (error: string) => void,
+): Promise<number | null> {
   const cols = candidate.columns.map(quoteIdent).join(", ");
   const createSql =
     `CREATE INDEX ON ${quoteQualified(candidate.schema, candidate.table)} ` +
     `USING ${CANDIDATE_ACCESS_METHOD} (${cols})`;
-  // Savepoint-wrapped for the same reason every EXPLAIN is: a rejected shape
-  // raises, and an aborted transaction would take every later candidate with it.
-  const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-  if (!sp.ok) return null;
-  const res = await run<{ indexrelid: string | number | null }>(
+  // Isolated for the same reason every EXPLAIN is: a rejected shape raises, and
+  // an aborted transaction would take every later candidate with it.
+  const res = await runIsolated<{ indexrelid: string | number | null }>(
+    run,
     "SELECT (hypopg_create_index($1)).indexrelid AS indexrelid",
     [createSql],
+    undefined,
+    onLost,
   );
   if (!res.ok) {
-    await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_SAVEPOINT}`);
-    await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
+    // Also reached when the transaction was lost, which onLost has already
+    // reported; the caller then returns that error and never shows the
+    // declined list, so no second filter is needed here.
+    onDeclined?.(res.error ?? "unknown error");
     return null;
   }
-  await run(`RELEASE SAVEPOINT ${ADVISOR_SAVEPOINT}`);
   const raw = res.data?.[0]?.indexrelid;
   const oid = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN;
-  return Number.isFinite(oid) ? oid : null;
+  if (!Number.isFinite(oid)) {
+    onDeclined?.("hypopg_create_index returned no index oid");
+    return null;
+  }
+  return oid;
 }
 
 /** Shorten a statement for echoing back, so one huge query cannot dominate the response. */
@@ -1223,22 +1302,66 @@ export const indexAdvisorTools = [
         );
       }
 
-      return withSharedClient(async (run): Promise<ApiResponse> => {
+      return withSharedClient(async (run, { discard }): Promise<ApiResponse> => {
         // BEGIN READ ONLY is defence in depth, not the primary guarantee:
         // EXPLAIN without ANALYZE never executes the statement. But this tool
         // feeds SQL text it did not write (pg_stat_statements entries) back to
         // the server, and the read-only guard is the posture every other tool
         // here takes with caller-influenced SQL.
         const begun = await run("BEGIN READ ONLY");
-        if (!begun.ok) return { ok: false, error: begun.error };
+        if (!begun.ok) {
+          // A live connection refuses BEGIN only from a state no pooled
+          // connection should be in (an inherited open or aborted transaction),
+          // so it is not handed back for reuse.
+          discard(new Error(`pg_index_advisor could not begin its transaction, connection discarded: ${begun.error}`));
+          return { ok: false, error: begun.error };
+        }
+
+        // What the teardown below has to work with. Both false until the
+        // statement that establishes them succeeds, so an early failure does not
+        // send the teardown a ROLLBACK TO a savepoint that was never taken, or a
+        // hypopg_reset() to a server where the first one already failed.
+        let teardownSavepointTaken = false;
+        let hypopgUsable = false;
+        // Set when the transaction can no longer be used: a failure outside a
+        // savepoint aborted it, a savepoint statement itself was refused, or the
+        // connection died. Everything after that would be refused, so the search
+        // stops spending round trips and the call reports the loss instead of a
+        // partial result that looks complete. The first cause wins.
+        let transactionLost: string | undefined;
+        const onLost: OnTransactionLost = (error) => {
+          transactionLost ??= error ?? "unknown error";
+        };
+        const lostError = (): ApiResponse => ({
+          ok: false,
+          error: `the search stopped because its transaction could no longer be used: ${transactionLost}`,
+        });
 
         try {
+          const outer = await run(`SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
+          if (!outer.ok) return { ok: false, error: outer.error };
+          teardownSavepointTaken = true;
+
           // A pooled connection can carry hypothetical indexes from an earlier
-          // call whose teardown failed (the teardown below is best-effort, and a
-          // killed backend never runs it at all). Resetting on the way IN means
-          // a leaked index from a previous call cannot silently lower this
-          // call's baseline and make every candidate look worthless.
-          await run("SELECT hypopg_reset()");
+          // call whose teardown failed (a killed backend never runs it at all).
+          // Resetting on the way IN means a leaked index from a previous call
+          // cannot silently lower this call's baseline and make every candidate
+          // look worthless. The result is checked: the extension probe above
+          // only looked in pg_extension, and a HypoPG installed in a schema off
+          // the search_path fails HERE, with an error worth showing verbatim.
+          const entryReset = await run("SELECT hypopg_reset()");
+          if (!entryReset.ok) {
+            // 42883 is "function does not exist": pg_extension lists HypoPG, so
+            // the role cannot see its functions -- the schema is off the
+            // search_path or EXECUTE was revoked. Anything else (a cancel, a
+            // dead socket) is reported as what it is.
+            const hint = /\(code: 42883\)/.test(entryReset.error ?? "")
+              ? " HypoPG is installed, but this role cannot call it: check that the schema it was created in " +
+                "is on the DATABASE_URL role's search_path and that EXECUTE on its functions is granted."
+              : "";
+            return { ok: false, error: `hypopg_reset() failed before the search started: ${entryReset.error}.${hint}` };
+          }
+          hypopgUsable = true;
 
           // ─── Baseline plans ───
 
@@ -1247,6 +1370,9 @@ export const indexAdvisorTools = [
           const needsGenericPlan: boolean[] = [];
 
           for (const statement of workload) {
+            // Every statement after a loss would only send a savepoint that is
+            // refused and add a "could not plan" line the error below discards.
+            if (transactionLost !== undefined) break;
             // A `$n` placeholder means the statement cannot be planned without
             // GENERIC_PLAN. Testing the raw text is a heuristic, but it is safe
             // in BOTH directions: a false positive (a `$1` inside a string
@@ -1273,7 +1399,7 @@ export const indexAdvisorTools = [
             // greedy loop does. A rejected statement gets a null baseline, and
             // every later stage is already gated on that -- `evaluate` skips
             // any index whose baseline is null -- so it is never sent again.
-            const guard = await assertSingleStatement(run, buildExplainSql(statement.sql, parameterized));
+            const guard = await assertSingleStatement(run, buildExplainSql(statement.sql, parameterized), onLost);
             if (!guard.ok) {
               baselineCosts.push(null);
               rawPlans.push(undefined);
@@ -1289,7 +1415,7 @@ export const indexAdvisorTools = [
               continue;
             }
 
-            const outcome = await explainStatement(run, statement.sql, parameterized);
+            const outcome = await explainStatement(run, statement.sql, parameterized, onLost);
             if (!outcome.ok) {
               baselineCosts.push(null);
               rawPlans.push(undefined);
@@ -1299,6 +1425,12 @@ export const indexAdvisorTools = [
             baselineCosts.push(outcome.cost ?? null);
             rawPlans.push(outcome.plan);
           }
+
+          // Checked before the "nothing could be planned" verdict: with the
+          // transaction gone, the reasons above are all the same refusal, and
+          // the next unisolated read would fail with a message about an aborted
+          // transaction rather than about what aborted it.
+          if (transactionLost !== undefined) return lostError();
 
           if (baselineCosts.every((c) => c === null)) {
             return {
@@ -1370,7 +1502,12 @@ export const indexAdvisorTools = [
                 AND c.relname = ANY($2)`,
             [schemas, tables],
           );
-          if (!colsRes.ok) return { ok: false, error: colsRes.error };
+          if (!colsRes.ok) {
+            return {
+              ok: false,
+              error: `could not read the columns of the tables the workload scans: ${colsRes.error}`,
+            };
+          }
 
           const knownColumns = new Map<string, Set<string>>();
           const columnStats = new Map<string, Map<string, ColumnStats>>();
@@ -1398,7 +1535,11 @@ export const indexAdvisorTools = [
           // ─── Existing indexes, so we never recommend one that exists ───
 
           const existingIndexPrefixes = new Set<string>();
-          const idxRes = await run<{ schema: string; table: string; columns: (string | null)[] }>(
+          // Isolated because its failure is treated as soft below: the search
+          // goes on with a warning, which is only safe if the failure has not
+          // aborted the transaction the search runs in.
+          const idxRes = await runIsolated<{ schema: string; table: string; columns: (string | null)[] }>(
+            run,
             `SELECT n.nspname AS schema,
                     c.relname  AS "table",
                     ARRAY(
@@ -1418,6 +1559,8 @@ export const indexAdvisorTools = [
                 AND n.nspname = ANY($1)
                 AND c.relname = ANY($2)`,
             [schemas, tables],
+            undefined,
+            onLost,
           );
           if (idxRes.ok) {
             for (const row of idxRes.data ?? []) {
@@ -1474,18 +1617,29 @@ export const indexAdvisorTools = [
 
           // ─── Greedy search over HypoPG ───
 
+          // Candidates HypoPG would not create, with its reason. Collected
+          // rather than warned one by one so a wide search cannot bury the
+          // result under a warning per shape.
+          const declined: string[] = [];
+
           const evaluate = async (
             candidate: IndexCandidate,
             statementIndices: number[],
           ): Promise<Map<number, number> | null> => {
-            const created = await createHypotheticalIndex(run, candidate);
+            // Null reads to greedySearch as "could not be costed", which refunds
+            // the budget -- the right accounting for a candidate that was never
+            // sent because the transaction is already gone.
+            if (transactionLost !== undefined) return null;
+            const created = await createHypotheticalIndex(run, candidate, onLost, (error) => {
+              declined.push(`${candidate.schema}.${candidate.table} (${candidate.columns.join(", ")}): ${error}`);
+            });
             if (created === null) return null;
             try {
               const costs = new Map<number, number>();
               for (const index of statementIndices) {
                 const statement = workload[index];
                 if (!statement || baselineCosts[index] === null) continue;
-                const outcome = await explainStatement(run, statement.sql, needsGenericPlan[index] ?? false);
+                const outcome = await explainStatement(run, statement.sql, needsGenericPlan[index] ?? false, onLost);
                 // A statement that planned at baseline but fails now is not
                 // evidence the index hurt -- it is a transient the search must
                 // not act on, so its baseline cost stands.
@@ -1497,7 +1651,14 @@ export const indexAdvisorTools = [
               // every previously ACCEPTED index (recreated by onAccept below)
               // and turn the greedy search into an independent per-candidate
               // ranking -- the exact bug onAccept exists to prevent.
-              await run("SELECT hypopg_drop_index($1)", [created]);
+              //
+              // Deliberately NOT isolated behind a savepoint: if the drop fails,
+              // the candidate's index is still live and would be counted into
+              // every later measurement, so the search cannot continue either
+              // way. The failure has aborted the transaction; recording it is
+              // what turns "ok: true with a partial list" into a reported error.
+              const dropped = await run("SELECT hypopg_drop_index($1)", [created]);
+              if (!dropped.ok) onLost(`a hypothetical index could not be dropped (${dropped.error})`);
             }
           };
 
@@ -1516,7 +1677,13 @@ export const indexAdvisorTools = [
           // creating a second copy of an index that is already in place.
           const acceptedOids: (number | null)[] = [];
           const onAccept = async (candidate: IndexCandidate): Promise<void> => {
-            const oid = await createHypotheticalIndex(run, candidate);
+            // Nothing can be kept in place in an aborted transaction, and the
+            // warning below would misattribute that to HypoPG.
+            if (transactionLost !== undefined) {
+              acceptedOids.push(null);
+              return;
+            }
+            const oid = await createHypotheticalIndex(run, candidate, onLost);
             acceptedOids.push(oid);
             if (oid === null) {
               warnings.push(
@@ -1543,6 +1710,21 @@ export const indexAdvisorTools = [
             onAccept,
           });
 
+          // Covers the drop failure and every savepoint statement the search
+          // sent into a transaction that was already gone. Either way the
+          // accepted list is not the search's answer, only where it stopped.
+          if (transactionLost !== undefined) return lostError();
+
+          if (declined.length > 0) {
+            const shown = declined.slice(0, 5);
+            const more = declined.length - shown.length;
+            warnings.push(
+              `${declined.length} candidate index(es) could not be costed because hypopg_create_index refused ` +
+                `them, so they were skipped rather than rejected: ${shown.join("; ")}` +
+                (more > 0 ? `; and ${more} more` : ""),
+            );
+          }
+
           if (search.budgetExhausted) {
             warnings.push(
               `the search stopped at the \`max_explains\` budget of ${max_explains} EXPLAIN round trips, ` +
@@ -1560,13 +1742,32 @@ export const indexAdvisorTools = [
           // here, so the common path issues no redundant CREATE at all.
           const sizes: (string | null)[] = [];
           for (const [i, entry] of search.accepted.entries()) {
-            const oid = acceptedOids[i] ?? (await createHypotheticalIndex(run, entry.candidate));
+            // The search itself is complete by now, so losing the transaction
+            // here costs only the sizes: each later one comes back unknown, and
+            // the warning below says why.
+            const oid = acceptedOids[i] ?? (await createHypotheticalIndex(run, entry.candidate, onLost));
             if (oid === null) {
               sizes.push(null);
               continue;
             }
-            const sizeRes = await run<{ bytes: string }>("SELECT hypopg_relation_size($1)::text AS bytes", [oid]);
+            // Isolated: a size is reported as null on failure, and that is only
+            // an honest "unknown" if the failure did not abort the transaction
+            // the remaining sizes are read in.
+            const sizeRes = await runIsolated<{ bytes: string }>(
+              run,
+              "SELECT hypopg_relation_size($1)::text AS bytes",
+              [oid],
+              undefined,
+              onLost,
+            );
             sizes.push(sizeRes.ok ? (sizeRes.data?.[0]?.bytes ?? null) : null);
+          }
+          if (transactionLost !== undefined) {
+            warnings.push(
+              `the transaction was lost while sizing the recommended indexes (${transactionLost}); every ` +
+                "`estimated_size_bytes` not read by then is null. The recommendations themselves were measured " +
+                "before that and stand",
+            );
           }
 
           const weightedBaseline = baselineCosts.reduce<number>(
@@ -1625,25 +1826,50 @@ export const indexAdvisorTools = [
           };
         } finally {
           // HypoPG indexes are SESSION-scoped, not transaction-scoped, so the
-          // ROLLBACK below does NOT remove them. This connection goes straight
-          // back into the pool, and anything left here would silently alter the
-          // plan of the next query that borrows it. The reset therefore has to
-          // run on every exit -- the success path, an early `return` from any
-          // guard above, and a thrown error alike -- which is exactly what
+          // ROLLBACK does NOT remove them. This connection goes straight back
+          // into the pool, and anything left here would silently alter the plan
+          // of the next query that borrows it -- pg_explain and pg_readonly
+          // included, neither of which resets on the way in. The reset therefore
+          // has to run on every exit -- the success path, an early `return` from
+          // any guard above, and a thrown error alike -- which is exactly what
           // `finally` buys that a trailing statement does not.
           //
-          // Best-effort, as explain.ts's teardown is: a failure here must never
-          // replace the real result or the real error with a cleanup error.
-          try {
-            await run("SELECT hypopg_reset()");
-          } catch {
-            // Connection already broken; the pool discards it, which achieves
-            // the same isolation the reset was for.
+          // Three statements, in this order:
+          //
+          //   1. ROLLBACK TO the teardown savepoint. A statement that fails
+          //      outside a savepoint (the entry reset, the hypopg_drop_index in
+          //      evaluate) aborts the transaction, and an aborted transaction
+          //      refuses everything except ROLLBACK / ROLLBACK TO with SQLSTATE
+          //      25P02 -- a reset sent into it is refused, and every hypothetical
+          //      index outlives the call. ROLLBACK TO clears that state while
+          //      keeping the transaction open. It also discards any inner
+          //      savepoint still standing above it.
+          //   2. hypopg_reset(), INSIDE the transaction, on the connection that
+          //      created the indexes -- see ADVISOR_TEARDOWN_SAVEPOINT for why a
+          //      reset after the ROLLBACK is not the same thing behind a pooler.
+          //      Skipped when the entry reset already failed: nothing could
+          //      have been created since, and repeating a failure that has
+          //      already been reported would only cost a good connection.
+          //   3. ROLLBACK.
+          //
+          // The runner reports failure as `ok: false` and never throws, so each
+          // result is checked explicitly. If any of the three failed, this
+          // connection's session state is unknown, and it is destroyed rather
+          // than pooled. Best-effort, as explain.ts's teardown is: a failure
+          // here never replaces the real result or the real error.
+          let failure: string | undefined;
+          if (teardownSavepointTaken) {
+            const restored = await run(`ROLLBACK TO SAVEPOINT ${ADVISOR_TEARDOWN_SAVEPOINT}`);
+            if (!restored.ok) failure ??= restored.error;
           }
-          try {
-            await run("ROLLBACK");
-          } catch {
-            // Already rolled back, or the connection is gone.
+          if (hypopgUsable) {
+            const reset = await run("SELECT hypopg_reset()");
+            if (!reset.ok) failure ??= reset.error;
+          }
+          const rolledBack = await run("ROLLBACK");
+          if (!rolledBack.ok) failure ??= rolledBack.error;
+          if (failure !== undefined) {
+            discard(new Error(`pg_index_advisor teardown failed, connection discarded: ${failure}`));
           }
         }
       });
