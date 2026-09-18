@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import pg from "pg";
 import { shutdown } from "../api.js";
@@ -170,8 +172,9 @@ describe("pg_kill note construction (stubbed connect, no live DB)", () => {
 // statement runs inside that wrapper's async context: asserting on the bare
 // handler would prove a line is written and say nothing about attribution.
 // Delete the auditQuery wrapper in admin.ts and every test here that expects a
-// line goes red on the line count (checked: five fail; the ALLOW_WRITES one
-// asserts NO line and holds either way).
+// line goes red on the line count (checked: six fail). Two hold either way, by
+// design: the ALLOW_WRITES one asserts NO line, and the README one checks what
+// is SENT, not what is logged.
 // ─────────────────────────────────────────────────────────────────────────
 
 const AUDIT_ENV = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
@@ -277,6 +280,49 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
     installStub({ rows: [{ signaled: true }] });
     await killViaWrapper({ pid: PID, mode: "terminate" });
     assert.equal(onlyLine().entry.sql, "SELECT pg_terminate_backend($1) AS signaled");
+  });
+
+  // The README quotes both statement texts verbatim. Under
+  // POSTGRES_AUDIT_REDACT the two modes log the same sqlKeyword (SELECT) and
+  // differ only in sqlSha256, so those texts are what an operator hashes to
+  // tell a cancel line from a terminate line -- one character of drift and the
+  // hash they compute matches nothing. The text is taken from what the handler
+  // SENDS, not from a literal here, so a change to the statement in admin.ts
+  // fails this until the README follows.
+  it("README quotes the exact statement text of both modes", async () => {
+    // Runs from dist/tools/, two levels below the repo root.
+    const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
+    for (const mode of ["cancel", "terminate"] as const) {
+      installStub({ rows: [{ signaled: true }] });
+      await killViaWrapper({ pid: PID, mode });
+      const sent = fakeClient.calls[0]!.sql;
+      assert.ok(readme.includes(`\`${sent}\``), `README.md does not quote pg_kill's ${mode} statement: ${sent}`);
+    }
+  });
+
+  // The README says a redacted pg_kill line reads sqlKeyword SELECT in both
+  // modes. resetAuditForTests() + a fresh initAudit() is what makes
+  // POSTGRES_AUDIT_REDACT take effect here; the suite's beforeEach cleared it.
+  it("under POSTGRES_AUDIT_REDACT both modes log SELECT and differ only in the hash", async () => {
+    resetAuditForTests();
+    process.env.POSTGRES_AUDIT_REDACT = "1";
+    initAudit();
+    setAuditSinkForTests((line) => {
+      lines.push(line);
+    });
+
+    const hashes: string[] = [];
+    for (const mode of ["cancel", "terminate"] as const) {
+      lines.length = 0;
+      installStub({ rows: [{ signaled: true }] });
+      await killViaWrapper({ pid: PID, mode });
+      const { entry } = onlyLine();
+      assert.equal("sql" in entry, false, "redaction must drop the statement text");
+      assert.equal(entry.sqlKeyword, "SELECT");
+      assert.equal(entry.sqlSha256, createHash("sha256").update(fakeClient.calls[0]!.sql).digest("hex"));
+      hashes.push(entry.sqlSha256 as string);
+    }
+    assert.notEqual(hashes[0], hashes[1], "cancel and terminate must stay distinguishable under redaction");
   });
 
   it("still captures the NOTICE with auditing on, and signaled=false is an ok:true line", async () => {

@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   17 and 18: exactly one line for each cancel, terminate and unknown-pid call,
   with the NOTICE still in the tool's `note` and absent from the log. The
   README's "What the trail does not show" list is updated to match (#39).
+  It also says what `ok` cannot tell you, and how to find the target's own
+  line, the latter from 600 cancel and terminate calls measured over loopback
+  TCP on PostgreSQL 15, 17 and 18. With the pid unlogged, `ts` is all that
+  pairs the two lines: 81% of target lines carried the `pg_kill` line's
+  millisecond or the next, but terminating a CPU-bound target took up to
+  271 ms, a statement timeout writes the same `57014` a cancel does, and a
+  terminated target's line can carry no `sqlstate` at all. `ok: true` does
+  not show that the target stopped: postgres answers `true` once the signal
+  is sent, and on all three versions a session idle in a transaction ignored
+  the cancel and carried on. And when the pid names the connection `pg_kill`
+  itself runs on, its own line reads `ok: false` with `57014` or `57P01` --
+  after a terminate, with that backend gone.
 
 ## [0.13.2] - 2026-09-14
 
