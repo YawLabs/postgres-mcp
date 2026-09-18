@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pg_kill` now writes an audit line.** The other tools audit their SQL
+  through `runUserQueryAudited`, `runInternal` or `withSharedClient`.
+  `pg_kill` uses none of them -- it needs the raw client, to capture the NOTICE
+  that explains a `false` answer -- and queried that client directly, so with
+  `POSTGRES_AUDIT_LOG` on, cancelling a query or terminating a backend left no
+  line at all. Measured on PostgreSQL 17: one statement sent, zero lines
+  written, and the cancelled statement's own `57014` line tied to nothing. It
+  was the one tool whose whole purpose is to affect sessions other than its
+  own. The signal call is now wrapped in place, on the same client, so NOTICE
+  capture is unchanged. The line carries `tool: "pg_kill"` and
+  `source: "internal"` (the server composes the statement; the agent supplies
+  only the pid), and `params: 1` -- the pid is a bound parameter, and the
+  trail logs parameter counts, never values, with no exception carved out for
+  a harmless one. `ok` reports whether the statement ran, so a
+  `signaled: false` answer still reads `ok: true`. Checked on PostgreSQL 15,
+  17 and 18: exactly one line for each cancel, terminate and unknown-pid call,
+  with the NOTICE still in the tool's `note` and absent from the log. The
+  README's "What the trail does not show" list is updated to match (#39).
+
 ## [0.13.2] - 2026-09-14
 
 ### Fixed

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import pg from "pg";
 import { shutdown } from "../api.js";
+import { initAudit, resetAuditForTests, setAuditSinkForTests } from "../audit.js";
+import { wrapToolHandler } from "../mcp-wrapper.js";
 import { adminTools } from "./admin.js";
 
 const pgKill = adminTools.find((t) => t.name === "pg_kill")!;
@@ -49,11 +51,18 @@ interface FakeClientOptions {
   // Notice messages to emit synchronously during the query call, simulating
   // postgres firing a NOTICE while pg_cancel_backend / pg_terminate_backend run.
   emitNotices?: string[];
+  // Reject the query with this instead of resolving `rows`, for the path where
+  // postgres RAISES (as opposed to returning signaled=false).
+  rejectWith?: Error;
 }
 
 function makeFakeClient(opts: FakeClientOptions) {
   const noticeListeners = new Set<NoticeListener>();
+  // Every statement the handler sent, so a test can assert the pid still went
+  // out as a bound parameter and not interpolated into the text.
+  const calls: { sql: string; params: unknown[] }[] = [];
   return {
+    calls,
     on(event: string, fn: NoticeListener) {
       if (event === "notice") noticeListeners.add(fn);
       return this;
@@ -62,12 +71,14 @@ function makeFakeClient(opts: FakeClientOptions) {
       if (event === "notice") noticeListeners.delete(fn);
       return this;
     },
-    async query(_sql: string, _params: unknown[]) {
+    async query(sql: string, params: unknown[]) {
+      calls.push({ sql, params });
       // Fire any configured NOTICEs to every registered listener before the
       // result resolves, the same ordering the real pg client uses.
       for (const message of opts.emitNotices ?? []) {
         for (const fn of noticeListeners) fn({ message });
       }
+      if (opts.rejectWith) throw opts.rejectWith;
       return { rows: opts.rows };
     },
     release() {
@@ -143,6 +154,172 @@ describe("pg_kill note construction (stubbed connect, no live DB)", () => {
     assert.equal(res.ok, true);
     assert.equal(res.data.signaled, false);
     assert.match(res.data.note, new RegExp(noticeText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// pg_kill audit line (#39).
+//
+// pg_kill cannot go through runInternal / withSharedClient -- it needs the raw
+// client for the NOTICE listener -- so it queried that client directly and the
+// statement never reached auditQuery. Cancelling or terminating ANOTHER session
+// was the one action the trail could not show.
+//
+// Driven through wrapToolHandler with `pgKill.name`, the exact pairing
+// index.ts registers, because the `tool` field only exists if the handler's
+// statement runs inside that wrapper's async context: asserting on the bare
+// handler would prove a line is written and say nothing about attribution.
+// Delete the auditQuery wrapper in admin.ts and every test here that expects a
+// line goes red on the line count (checked: five fail; the ALLOW_WRITES one
+// asserts NO line and holds either way).
+// ─────────────────────────────────────────────────────────────────────────
+
+const AUDIT_ENV = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
+
+describe("pg_kill audit line (stubbed connect, no live DB)", () => {
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalAllowWrites = process.env.ALLOW_WRITES;
+  const originalDbUrl = process.env.DATABASE_URL;
+  let auditEnvSnapshot: Record<string, string | undefined> = {};
+  let fakeClient: ReturnType<typeof makeFakeClient>;
+  let lines: string[];
+
+  // Seven digits on purpose: no `ts` or `ms` value can contain the run by
+  // accident, so its absence from the raw line is a real statement about the
+  // pid and not luck.
+  const PID = 4191234;
+
+  const killViaWrapper = wrapToolHandler(pgKill.handler as (input: unknown) => Promise<unknown>, pgKill.name);
+
+  function installStub(opts: FakeClientOptions) {
+    fakeClient = makeFakeClient(opts);
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(fakeClient);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  }
+
+  function onlyLine(): { raw: string; entry: Record<string, unknown> } {
+    assert.equal(lines.length, 1, `expected exactly one audit line per signal call, got ${JSON.stringify(lines)}`);
+    const raw = lines[0]!;
+    return { raw, entry: JSON.parse(raw) as Record<string, unknown> };
+  }
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    process.env.ALLOW_WRITES = "1";
+    // Cleared first, then set. The capture sink installed below replaces
+    // whatever initAudit() opens, so an ambient POSTGRES_AUDIT_LOG_FILE cannot
+    // take the lines -- but initAudit() would still open (and create) that
+    // file, or throw in this hook on an unopenable path. The one that fails
+    // assertions is an ambient POSTGRES_AUDIT_REDACT=1: it swaps `sql` for
+    // sqlKeyword/sqlSha256, and the `entry.sql` checks go red for a reason
+    // that has nothing to do with pg_kill.
+    auditEnvSnapshot = {};
+    for (const name of AUDIT_ENV) {
+      auditEnvSnapshot[name] = process.env[name];
+      delete process.env[name];
+    }
+    // api.ts ran initAudit() at import with auditing off; reset so this env is
+    // the one that gets read.
+    resetAuditForTests();
+    process.env.POSTGRES_AUDIT_LOG = "1";
+    initAudit();
+    lines = [];
+    setAuditSinkForTests((line) => {
+      lines.push(line);
+    });
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    resetAuditForTests();
+    for (const name of AUDIT_ENV) {
+      const original = auditEnvSnapshot[name];
+      if (original === undefined) delete process.env[name];
+      else process.env[name] = original;
+    }
+    if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
+    else process.env.ALLOW_WRITES = originalAllowWrites;
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("writes exactly one line per signal call, attributed to pg_kill", async () => {
+    installStub({ rows: [{ signaled: true }] });
+    const res = await killViaWrapper({ pid: PID, mode: "cancel" });
+    assert.notEqual(res.isError, true, `pg_kill itself failed: ${JSON.stringify(res)}`);
+
+    const { entry } = onlyLine();
+    assert.equal(entry.tool, "pg_kill");
+    assert.equal(entry.sql, "SELECT pg_cancel_backend($1) AS signaled");
+    assert.equal(entry.ok, true);
+    assert.equal(entry.rows, 1);
+    // "internal": the server composes this statement and the agent supplies
+    // only a bound value. See the comment at the auditQuery call in admin.ts.
+    assert.equal(entry.source, "internal");
+  });
+
+  it("logs the parameter COUNT and never the pid value", async () => {
+    installStub({ rows: [{ signaled: true }] });
+    await killViaWrapper({ pid: PID, mode: "cancel" });
+
+    const { raw, entry } = onlyLine();
+    assert.equal(entry.params, 1);
+    assert.equal(raw.includes(String(PID)), false, `the pid value reached the audit line: ${raw}`);
+    // The audit wrap must not have changed what is SENT: still one statement,
+    // with the pid bound rather than interpolated into the text.
+    assert.deepEqual(fakeClient.calls, [{ sql: "SELECT pg_cancel_backend($1) AS signaled", params: [PID] }]);
+  });
+
+  it("names pg_terminate_backend on a terminate, so the two modes read differently in the trail", async () => {
+    installStub({ rows: [{ signaled: true }] });
+    await killViaWrapper({ pid: PID, mode: "terminate" });
+    assert.equal(onlyLine().entry.sql, "SELECT pg_terminate_backend($1) AS signaled");
+  });
+
+  it("still captures the NOTICE with auditing on, and signaled=false is an ok:true line", async () => {
+    const noticeText = "PID 4191234 is not a PostgreSQL backend process";
+    installStub({ rows: [{ signaled: false }], emitNotices: [noticeText] });
+    const res = await killViaWrapper({ pid: PID, mode: "cancel" });
+
+    const data = res.structuredContent as { signaled: boolean; note: string };
+    assert.equal(data.signaled, false);
+    assert.ok(data.note.includes(noticeText), `the NOTICE was lost from the note: ${data.note}`);
+
+    // postgres answered `false` rather than raising, so the STATEMENT ran. The
+    // line says that and no more -- and the NOTICE text, which quotes the pid,
+    // stays out of it like every other server message.
+    const { raw, entry } = onlyLine();
+    assert.equal(entry.ok, true);
+    assert.equal("sqlstate" in entry, false);
+    assert.equal(raw.includes("PostgreSQL backend process"), false, `NOTICE text reached the audit line: ${raw}`);
+  });
+
+  it("records ok:false with the SQLSTATE when postgres raises, and still returns the error", async () => {
+    const message = "permission denied to terminate process 4191234";
+    installStub({ rows: [], rejectWith: Object.assign(new Error(message), { code: "42501" }) });
+    const res = await killViaWrapper({ pid: PID, mode: "terminate" });
+
+    assert.equal(res.isError, true);
+    assert.ok(res.content[0]!.text.includes("permission denied"), `error text was lost: ${res.content[0]!.text}`);
+
+    const { raw, entry } = onlyLine();
+    assert.equal(entry.tool, "pg_kill");
+    assert.equal(entry.ok, false);
+    assert.equal(entry.sqlstate, "42501");
+    assert.equal(entry.rows, null);
+    assert.equal(raw.includes("permission denied"), false, `the error message reached the audit line: ${raw}`);
+  });
+
+  it("writes no line when the ALLOW_WRITES gate refuses, because no statement is sent", async () => {
+    process.env.ALLOW_WRITES = "0";
+    installStub({ rows: [{ signaled: true }] });
+    const res = await killViaWrapper({ pid: PID, mode: "cancel" });
+    assert.equal(res.isError, true);
+    assert.deepEqual(lines, []);
+    assert.deepEqual(fakeClient.calls, []);
   });
 });
 

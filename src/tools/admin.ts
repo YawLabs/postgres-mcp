@@ -10,6 +10,7 @@ import {
   userSchemaFilter,
   withSharedClient,
 } from "../api.js";
+import { auditQuery } from "../audit.js";
 import { rowsOutput, warningsField } from "./output.js";
 import { identSchema } from "./params.js";
 
@@ -509,7 +510,30 @@ export const adminTools = [
       };
       client.on("notice", onNotice);
       try {
-        const result = await client.query<{ signaled: boolean }>(`SELECT ${fn}($1) AS signaled`, [pid]);
+        const sql = `SELECT ${fn}($1) AS signaled`;
+        const params = [pid];
+        // Audited in place, not through runInternal / withSharedClient: neither
+        // hands back the client, and the NOTICE listener above has to sit on
+        // the connection the signal runs on. Without this the one tool whose
+        // whole purpose is to affect OTHER sessions left no line at all.
+        //
+        // source: "internal", deliberately. The field keeps one promise and it
+        // runs one way: a `user` line is SQL an agent passed to pg_query /
+        // pg_readonly / pg_explain. This text is composed here -- the agent
+        // supplies only the pid, as a bound parameter -- so "user" would break
+        // it. The converse was never promised: `internal` is neither "no agent
+        // input" nor a severity grade -- the workload SQL an agent hands
+        // pg_index_advisor is "internal" too. An operator looking for pg_kill
+        // calls filters on `tool: "pg_kill"`, which is exact for this tool; a
+        // kill an agent wrote as SQL is a `user` line under the tool it went
+        // through. The pid goes in as a COUNT like every other parameter --
+        // the trail logs no values, and a harmless one is not a reason to
+        // start.
+        const result = await auditQuery(
+          { source: "internal", sql, paramCount: params.length },
+          () => client.query<{ signaled: boolean }>(sql, params),
+          (r) => r.rowCount ?? r.rows.length,
+        );
         const signaled = result.rows[0]?.signaled === true;
         const noticeText = notices.join(" ").trim();
         return {
