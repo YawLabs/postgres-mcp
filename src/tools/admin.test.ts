@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { readdirSync, readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import pg from "pg";
 import { shutdown } from "../api.js";
@@ -366,6 +367,180 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
     assert.equal(res.isError, true);
     assert.deepEqual(lines, []);
     assert.deepEqual(fakeClient.calls, []);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// pg_kill's checkout carries an 'error' listener (#57).
+//
+// pg-pool removes its idle 'error' listener while a client is checked out, and
+// node-pg emits 'error' on the client when its socket dies -- from a socket
+// callback, outside the handler's stack. With no listener that emit is an
+// uncaught exception. 0.13.2 fixed it for every checkout that went through
+// acquireClient(); pg_kill called getPool().connect() itself and was missed.
+// Measured: a connection dropped while pg_kill's query was in flight ended the
+// process 7 of 7, where the same drop under pg_readonly kept serving.
+//
+// A real EventEmitter stands in for the client (as in mcp-wrapper.test.ts)
+// because the makeFakeClient above cannot see this: its `on` ignores every
+// event but `notice`. The assertions are on the LISTENER, not on the tool
+// result: an emit made inside `query` would throw into pg_kill's own catch and
+// come back as the same { ok: false } with or without the fix.
+// ─────────────────────────────────────────────────────────────────────────
+describe("pg_kill's checkout carries an 'error' listener (stubbed connect, no live DB)", () => {
+  class EmitterClient extends EventEmitter {
+    errorListenersDuringQuery = -1;
+    releases = 0;
+    dieMidQuery = false;
+    async query(_sql: string, _params: unknown[]) {
+      this.errorListenersDuringQuery = this.listenerCount("error");
+      if (this.dieMidQuery) {
+        const dead = new Error("Connection terminated unexpectedly");
+        // What node-pg does: fail the query in flight, then emit on the client
+        // from the socket callback -- NOT from inside this call's stack.
+        await new Promise<void>((resolve) => {
+          setImmediate(() => {
+            this.emit("error", dead);
+            resolve();
+          });
+        });
+        throw dead;
+      }
+      return { rows: [{ signaled: true }], rowCount: 1 };
+    }
+    release() {
+      this.releases += 1;
+    }
+  }
+
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalAllowWrites = process.env.ALLOW_WRITES;
+  const originalDbUrl = process.env.DATABASE_URL;
+  const originalError = console.error;
+  let client: EmitterClient;
+  let logged: string[];
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    process.env.ALLOW_WRITES = "1";
+    client = new EmitterClient();
+    logged = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(client);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  });
+
+  afterEach(async () => {
+    console.error = originalError;
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
+    else process.env.ALLOW_WRITES = originalAllowWrites;
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("attached while the signal runs, removed after release, and the NOTICE listener with it", async () => {
+    assert.equal(client.listenerCount("error"), 0);
+    const res = (await pgKill.handler({ pid: 4242, mode: "cancel" })) as { ok: boolean };
+    assert.equal(res.ok, true);
+    assert.equal(client.errorListenersDuringQuery, 1, "no 'error' listener while pg_kill had the client checked out");
+    assert.equal(client.listenerCount("error"), 0, "the 'error' listener outlived the checkout");
+    assert.equal(client.listenerCount("notice"), 0, "the 'notice' listener outlived the checkout");
+    assert.equal(client.releases, 1);
+  });
+
+  it("a socket death mid-signal is logged and returned as an error, not thrown out of the process", async () => {
+    client.dieMidQuery = true;
+    const res = (await pgKill.handler({ pid: 4242, mode: "terminate" })) as { ok: boolean; error?: string };
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /Connection terminated unexpectedly/);
+    assert.deepEqual(logged, [
+      "[postgres-mcp] connection error on a checked-out client: Connection terminated unexpectedly",
+    ]);
+    assert.equal(client.releases, 1, "the dead client must still be handed back so the pool can drop it");
+    assert.equal(client.listenerCount("error"), 0);
+  });
+});
+
+// The structural half of #57: acquireClient() is the only place a client may be
+// checked out, because it is the only place the 'error' listener is attached.
+// pg_kill was the one raw checkout, found by grep after the fact; this makes the
+// next one fail here instead. Comment lines are skipped -- several explain the
+// rule by naming the call.
+//
+// Runs from dist/tools/, two levels below the repo root.
+describe("getPool().connect() appears only inside acquireClient", () => {
+  it("no non-test source file checks a client out of the pool on its own", () => {
+    const srcRoot = new URL("../../src/", import.meta.url);
+    const offenders: string[] = [];
+    let inApi = 0;
+    for (const entry of readdirSync(srcRoot, { recursive: true, encoding: "utf8" })) {
+      const rel = entry.replaceAll("\\", "/");
+      if (!rel.endsWith(".ts") || rel.endsWith(".test.ts") || rel.startsWith("integration/")) continue;
+      const lines = readFileSync(new URL(rel, srcRoot), "utf8").split("\n");
+      lines.forEach((line, i) => {
+        const code = line.trim();
+        if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) return;
+        if (!/\bgetPool\(\)\s*\.connect\(/.test(code)) return;
+        if (rel === "api.ts") inApi += 1;
+        else offenders.push(`${rel}:${i + 1}`);
+      });
+    }
+    assert.deepEqual(offenders, [], "a raw pool checkout has no 'error' listener -- go through acquireClient()");
+    assert.equal(inApi, 1, "expected exactly one checkout in api.ts (acquireClient); the scan may be broken");
+  });
+});
+
+// pg_kill's agent-facing contract (#56). The description is what an agent plans
+// from, and it promised a shape the tool never returns: a permission denial as
+// `signaled: false` plus a NOTICE. Postgres raises 42501 for that, on every
+// version this server supports.
+describe("pg_kill says what a permission denial and a `false` really are", () => {
+  it("the description names 42501 as an error and no longer quotes the ERROR text as a NOTICE", () => {
+    assert.match(pgKill.description, /42501/);
+    assert.doesNotMatch(pgKill.description, /must be a member/);
+    assert.doesNotMatch(pgKill.description, /three-way/);
+    // `true` is "sent", not "stopped": measured -- a session idle in a
+    // transaction ignored the cancel on 15, 17 and 18.
+    assert.match(pgKill.description, /SENT/);
+  });
+});
+
+describe("pg_kill fallback note (stubbed connect, no live DB)", () => {
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalAllowWrites = process.env.ALLOW_WRITES;
+  const originalDbUrl = process.env.DATABASE_URL;
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    process.env.ALLOW_WRITES = "1";
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
+    else process.env.ALLOW_WRITES = originalAllowWrites;
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("a `false` with no warning captured does not send the agent looking for a grant", async () => {
+    const fake = makeFakeClient({ rows: [{ signaled: false }] });
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(fake);
+    } as unknown as typeof pg.Pool.prototype.connect;
+    const res = (await pgKill.handler({ pid: 9999, mode: "cancel" })) as { ok: boolean; data: { note: string } };
+    assert.equal(res.ok, true);
+    assert.match(res.data.note, /found no backend with PID 9999/);
+    // Missing permission can never be why postgres answered `false`.
+    assert.doesNotMatch(res.data.note, /permission/i);
   });
 });
 

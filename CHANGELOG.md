@@ -32,13 +32,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TCP on PostgreSQL 15, 17 and 18. With the pid unlogged, `ts` is all that
   pairs the two lines: 81% of target lines carried the `pg_kill` line's
   millisecond or the next, but terminating a CPU-bound target took up to
-  271 ms, a statement timeout writes the same `57014` a cancel does, and a
-  terminated target's line can carry no `sqlstate` at all. `ok: true` does
-  not show that the target stopped: postgres answers `true` once the signal
-  is sent, and on all three versions a session idle in a transaction ignored
-  the cancel and carried on. And when the pid names the connection `pg_kill`
-  itself runs on, its own line reads `ok: false` with `57014` or `57P01` --
-  after a terminate, with that backend gone.
+  271 ms, and a statement timeout writes the same `57014` a cancel does.
+  `ok: true` does not show that the target stopped: postgres answers `true`
+  once the signal is sent, and on all three versions a session idle in a
+  transaction ignored the cancel and carried on. And when the pid names the
+  connection `pg_kill` itself runs on, its own line reads `ok: false` with
+  `57014` or `57P01` -- after a terminate, with that backend gone.
+- **A cancel or a statement timeout that lands inside the row-cap `DECLARE` is
+  no longer swallowed.** Agent SQL runs through a cursor so the row cap is
+  enforced by postgres, and a statement that cannot be a cursor (DDL, DML)
+  fails at `DECLARE` and is run directly instead. That fallback fired on ANY
+  `DECLARE` failure. `DECLARE` plans the query and locks every relation it
+  reads, so a statement blocked on a table lock -- the "app is frozen" case
+  `pg_inspect_locks` and `pg_kill` exist for -- is blocked inside it. Measured
+  on PostgreSQL 15, 17 and 18, identically: cancelling such a `pg_readonly`
+  call answered `signaled: true`, the backend went from `DECLARE ...` straight
+  to the bare statement and blocked again, and when the lock was released the
+  call returned **rows**, with `ok: true` in the audit log. A 3000 ms
+  statement timeout fired, was swallowed, and the statement waited another
+  3000 (6003 ms measured), holding its pooled connection for both. The
+  second attempt ran outside the row cap, on the unbounded path the cursor
+  exists to avoid. And a terminate had its `57P01` replaced by the error of a
+  `ROLLBACK TO` sent down the dead socket, so the agent read "Connection
+  terminated unexpectedly" and the audit line carried no `sqlstate`. The
+  fallback now runs only for the two SQLSTATEs with which postgres says a
+  statement cannot be a cursor: `42601` and `0A000`. That set was measured,
+  not assumed: 69 statement classes on each of the three versions, and every
+  `DECLARE` failure outside it (`42P01`, `42703`, `42883`, `22012`, `42P18`,
+  `08P01`) failed the same way on a direct run, so surfacing it at once
+  changes no outcome. After the fix the cancel returns `57014` in under
+  200 ms, the timeout fires once (3009 to 3027 ms), and the terminate reports
+  `57P01`. Affects `pg_readonly`, `pg_query` and `pg_explain`.
+- **`pg_kill` no longer takes the server down when its connection drops
+  mid-call.** 0.13.2 gave every checked-out connection an `error` listener,
+  because pg-pool removes its own while a client is out and node-pg's emit
+  with no listener is an uncaught exception. "Every" missed one: `pg_kill`
+  needs the raw client for its NOTICE listener and called
+  `getPool().connect()` itself. With a connection dropped while its query was
+  in flight the process exited, 7 of 7, and the tool call was never answered;
+  the same drop under `pg_readonly` returned an error and kept serving.
+  `pg_kill` now checks out through `acquireClient()` like everything else
+  (7 of 7 survive, the error is returned, the next call succeeds), and a test
+  fails if any source file checks a client out of the pool on its own (#57).
+- **`pg_kill` says what a permission denial looks like.** Its description,
+  which is what an agent plans from, said a denied signal comes back as
+  `signaled: false` with postgres's NOTICE in `note`. Postgres raises instead
+  -- `42501`, in every branch of `signalfuncs.c` on 15 through 18, and
+  measured on 18 -- so the call returns an error and the target keeps
+  running. The string the code quoted as that NOTICE was PostgreSQL 15's
+  ERROR message. The description, the schema comments and the handler comment
+  now say so, and say that `signaled: true` means the signal was sent, not
+  that the target stopped. The fallback `note` for a bare `false` no longer
+  lists a missing permission as a cause, which could send an agent looking
+  for a grant that was never the problem (#56).
 
 ## [0.13.2] - 2026-09-14
 

@@ -188,10 +188,16 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     });
 
     it("non-cursorable DDL falls back to direct exec from the DECLARE-failure path", async () => {
-      // DECLARE rejects DDL (feature_not_supported, 0A000) and DML-without-
-      // RETURNING (parse error, 42601). The runUserQueryBounded catch must
-      // distinguish these "DECLARE failed" cases (safe to re-run) from a
-      // FETCH-time failure (re-running could double-execute side effects).
+      // The fallback runs for exactly two SQLSTATEs (NOT_CURSORABLE_SQLSTATES in
+      // api.ts), and this test sends one statement for each against a LIVE
+      // server: DECLARE's grammar rejects DDL and DML alike with a parse error
+      // (42601), and a data-modifying CTE gets 0A000 (measured on 15/17/18).
+      // The stubbed test in mcp-wrapper.test.ts proves those two codes are in
+      // the set; only this proves postgres still SENDS them -- a new major in
+      // the matrix that answered differently would break the statement class
+      // and nothing else would notice. The catch must also tell a "cannot be a
+      // cursor" DECLARE failure (safe to re-run) from a FETCH-time failure
+      // (re-running could double-execute side effects) -- the next test.
       const original = process.env.ALLOW_WRITES;
       process.env.ALLOW_WRITES = "1";
       try {
@@ -199,8 +205,16 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           sql: `CREATE TABLE ${FIXTURE_SCHEMA}.cursor_fallback_canary (id INT)`,
         })) as { ok: boolean; error?: string };
         assert.equal(create.ok, true, `expected DDL to succeed via fallback, got error: ${create.error}`);
-        // Tidy up so re-runs of the matrix stay green.
-        await pgQuery.handler({ sql: `DROP TABLE ${FIXTURE_SCHEMA}.cursor_fallback_canary` });
+
+        // 0A000: "DECLARE CURSOR must not contain data-modifying statements in
+        // WITH". On the test's own table, so a failed assertion leaves nothing
+        // in a fixture other suites read.
+        const cte = (await pgQuery.handler({
+          sql: `WITH ins AS (INSERT INTO ${FIXTURE_SCHEMA}.cursor_fallback_canary VALUES (1) RETURNING id)
+                SELECT count(*)::int AS n FROM ins`,
+        })) as { ok: boolean; error?: string; data?: { rows: { n: number }[] } };
+        assert.equal(cte.ok, true, `expected a data-modifying CTE to succeed via fallback, got error: ${cte.error}`);
+        assert.equal(cte.data?.rows[0]?.n, 1);
 
         // DML without RETURNING -- DECLARE fails with 42601, fallback runs
         // the INSERT directly. Two-row count survives the round-trip.
@@ -213,6 +227,8 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           sql: `DELETE FROM ${FIXTURE_SCHEMA}.posts WHERE title = 'fallback-canary'`,
         });
       } finally {
+        // Tidy up so re-runs of the matrix stay green, whichever assertion threw.
+        await pgQuery.handler({ sql: `DROP TABLE IF EXISTS ${FIXTURE_SCHEMA}.cursor_fallback_canary` });
         if (original === undefined) delete process.env.ALLOW_WRITES;
         else process.env.ALLOW_WRITES = original;
       }
@@ -282,10 +298,85 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       }
     });
 
+    // The THIRD half: DECLARE failed, but not because the statement cannot be a
+    // cursor. The catch used to fall back on ANY DECLARE failure, and DECLARE
+    // is where a statement waits for its table locks -- so a cancel landing on
+    // a lock-blocked statement was swallowed: the SQL was sent again, blocked
+    // again, and when the lock went away the caller got ROWS from a query that
+    // had been cancelled. Measured on PostgreSQL 15, 17 and 18 before the fix.
+    //
+    // A dedicated table, not a fixture one: ACCESS EXCLUSIVE on a table other
+    // suites read would stall them for as long as this test holds it.
+    it("a cancel that lands inside DECLARE cancels the statement; the SQL is not sent again", async () => {
+      const table = `${FIXTURE_SCHEMA}.declare_cancel_canary`;
+      const sql = `SELECT count(*) FROM ${table}`;
+      const locker = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      const probe = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await locker.connect();
+      await probe.connect();
+      let lockHeld = false;
+      try {
+        await probe.query(`CREATE TABLE IF NOT EXISTS ${table} (i int)`);
+        await locker.query("BEGIN");
+        await locker.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+        lockHeld = true;
+
+        const call = pgReadonly.handler({ sql }) as Promise<{ ok: boolean; error?: string }>;
+        // Observed, not awaited yet: a rejection must not go unhandled if an
+        // assertion below throws first.
+        call.catch(() => {});
+
+        // Wait until the statement is blocked INSIDE the row-cap DECLARE.
+        let pid: number | undefined;
+        const deadline = Date.now() + 5000;
+        while (pid === undefined && Date.now() < deadline) {
+          const r = await probe.query<{ pid: number }>(
+            `SELECT pid FROM pg_stat_activity
+              WHERE wait_event_type = 'Lock' AND query LIKE 'DECLARE __pgmcp_cur%' AND query LIKE $1`,
+            [`%${table}%`],
+          );
+          pid = r.rows[0]?.pid;
+          if (pid === undefined) await new Promise((res) => setTimeout(res, 50));
+        }
+        assert.ok(pid !== undefined, "the statement never blocked inside DECLARE -- the staging is broken");
+
+        const cancelled = await probe.query<{ ok: boolean }>("SELECT pg_cancel_backend($1) AS ok", [pid]);
+        assert.equal(cancelled.rows[0]?.ok, true);
+
+        // The lock is STILL held, so the only way this call returns now is by
+        // honouring the cancel. Before the fix it sat here until the lock went.
+        const result = await Promise.race([
+          call,
+          new Promise<"timeout">((res) => setTimeout(() => res("timeout"), 4000)),
+        ]);
+        assert.notEqual(
+          result,
+          "timeout",
+          "the cancel was swallowed: the statement is still running 4 s after pg_cancel_backend returned true",
+        );
+        const res = result as { ok: boolean; error?: string };
+        assert.equal(res.ok, false, `a cancelled statement must not succeed, got ${JSON.stringify(res)}`);
+        assert.match(res.error ?? "", /\(code: 57014\)/);
+        assert.match(res.error ?? "", /user request/, "the error must be the cancel itself, not a later timeout");
+
+        // And it was not quietly re-run on the direct path.
+        const rerun = await probe.query<{ n: number }>(
+          "SELECT count(*)::int AS n FROM pg_stat_activity WHERE query = $1 AND state = 'active'",
+          [sql],
+        );
+        assert.equal(rerun.rows[0]?.n, 0, "the statement was sent again outside the row-cap cursor");
+      } finally {
+        if (lockHeld) await locker.query("ROLLBACK").catch(() => {});
+        await probe.query(`DROP TABLE IF EXISTS ${table}`).catch(() => {});
+        await locker.end().catch(() => {});
+        await probe.end().catch(() => {});
+      }
+    });
+
     it("a bad reference in user SQL surfaces postgres's error message", async () => {
-      // A reference to a non-existent table fails DECLARE with SQLSTATE 42P01.
-      // The fallback re-runs the SELECT directly, which surfaces the same
-      // 42P01 -- safe because DECLARE never executed the user SQL.
+      // A reference to a non-existent table fails DECLARE with SQLSTATE 42P01,
+      // which is not one of the "cannot be a cursor" codes, so it is surfaced as
+      // it is. (It used to be re-run directly, which failed the same way.)
       const res = (await pgQuery.handler({
         sql: `SELECT * FROM ${FIXTURE_SCHEMA}.does_not_exist_at_all`,
       })) as { ok: boolean; error?: string };

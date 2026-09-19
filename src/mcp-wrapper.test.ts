@@ -446,6 +446,114 @@ describe("a checked-out client has an 'error' listener for as long as it is chec
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────
+// The row-cap DECLARE may fall back to a direct run ONLY when postgres says the
+// statement cannot be a cursor (42601, 0A000 -- measured on 15/17/18 over 69
+// statement classes). It used to fall back on ANY DECLARE failure. DECLARE is
+// where a statement waits for its table locks, so a cancel landing on a
+// lock-blocked statement was swallowed and the SQL sent again; a statement
+// timeout got a second full timeout; and a terminate had its 57P01 replaced by
+// the error of a ROLLBACK TO sent down the dead socket.
+//
+// The stub records every statement, so "was the SQL sent again" is a direct
+// read of what reached the client and not an inference from the result.
+// ─────────────────────────────────────────────────────────────────────────
+describe("runUserQueryBounded: only a 'cannot be a cursor' DECLARE failure falls back", () => {
+  const USER_SQL = "SELECT 42 AS answer";
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalDbUrl = process.env.DATABASE_URL;
+  const originalError = console.error;
+  let sent: string[];
+
+  function installClient(declareError: Error) {
+    sent = [];
+    const client = {
+      on() {
+        return this;
+      },
+      removeListener() {
+        return this;
+      },
+      release() {},
+      async query(q: unknown) {
+        const text = typeof q === "string" ? q : ((q as { text?: string }).text ?? "");
+        sent.push(text);
+        if (text.startsWith("DECLARE")) throw declareError;
+        if (text === USER_SQL) return { rows: [{ answer: 42 }], fields: [], command: "SELECT", rowCount: 1 };
+        return { rows: [], fields: [], command: "", rowCount: 0 };
+      },
+    };
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(client);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  }
+
+  const pgError = (message: string, code?: string) => Object.assign(new Error(message), code ? { code } : {});
+  const sentDirectly = () => sent.filter((s) => s === USER_SQL).length;
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    // finishTransaction logs the discard of a dead connection; keep it off the
+    // test output.
+    console.error = () => {};
+  });
+
+  afterEach(async () => {
+    console.error = originalError;
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  for (const code of ["42601", "0A000"]) {
+    it(`${code}: not cursorable -> rolls back to the savepoint and runs the SQL directly, once`, async () => {
+      installClient(pgError("cannot be a cursor", code));
+      const res = await runReadOnly(USER_SQL);
+      assert.equal(res.ok, true, res.error);
+      assert.deepEqual(res.data?.rows, [{ answer: 42 }]);
+      assert.equal(sentDirectly(), 1);
+      assert.ok(sent.includes("ROLLBACK TO SAVEPOINT __pgmcp_sp"), `no savepoint rollback in ${JSON.stringify(sent)}`);
+    });
+  }
+
+  it("57014: a cancel or statement timeout inside DECLARE is surfaced, and the SQL is NOT sent again", async () => {
+    installClient(pgError("canceling statement due to user request", "57014"));
+    const res = await runReadOnly(USER_SQL);
+    assert.equal(res.ok, false, "a cancelled statement came back as a success");
+    assert.match(res.error ?? "", /canceling statement due to user request \(code: 57014\)/);
+    assert.equal(sentDirectly(), 0, `the cancelled SQL was re-run: ${JSON.stringify(sent)}`);
+  });
+
+  it("57P01: a terminate inside DECLARE keeps its own SQLSTATE, and nothing is sent down the savepoint path", async () => {
+    installClient(pgError("terminating connection due to administrator command", "57P01"));
+    const res = await runReadOnly(USER_SQL);
+    assert.equal(res.ok, false);
+    // The old fallback sent ROLLBACK TO on the dead socket, and THAT error --
+    // "Connection terminated unexpectedly", no code -- replaced this one.
+    assert.match(res.error ?? "", /\(code: 57P01\)/);
+    assert.equal(sent.includes("ROLLBACK TO SAVEPOINT __pgmcp_sp"), false);
+    assert.equal(sentDirectly(), 0);
+  });
+
+  it("no SQLSTATE at all (a dead socket): surfaced, not retried", async () => {
+    installClient(pgError("Connection terminated unexpectedly"));
+    const res = await runReadOnly(USER_SQL);
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /Connection terminated unexpectedly/);
+    assert.equal(sentDirectly(), 0);
+  });
+
+  it("42P01: a statement that is simply wrong is surfaced from DECLARE, once", async () => {
+    installClient(pgError('relation "nope" does not exist', "42P01"));
+    const res = await runReadOnly(USER_SQL);
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /relation "nope" does not exist \(code: 42P01\)/);
+    assert.equal(sentDirectly(), 0);
+  });
+});
+
 describe("index.ts wrapper shapes a withSharedClient connect throw into an error response", () => {
   const originalConnect = pg.Pool.prototype.connect;
   const originalDbUrl = process.env.DATABASE_URL;

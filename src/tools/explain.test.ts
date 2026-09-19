@@ -889,21 +889,35 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
   });
 
   it("keeps that order when the user's statement fails and the transaction is aborted", async () => {
-    // Both the cursor DECLARE and the direct fallback are rejected, so the
+    // What a real server does for pg_explain: EXPLAIN cannot be a cursor, so
+    // the DECLARE is refused with 42601 (measured on 15/17/18), the row-cap
+    // code falls back, and the direct EXPLAIN is what times out. The
     // transaction is aborted when the teardown runs; the ROLLBACK TO is what
     // lets the reset through.
+    //
+    // The DECLARE must be refused with a "cannot be a cursor" code here, not
+    // failed with the timeout: a 57014 at DECLARE is surfaced at once and the
+    // direct EXPLAIN would never be sent, leaving this test off the path it
+    // is named for.
     await withStubbedServer(
       180_000,
       async (session) => {
         const result = (await pgExplain.handler(withIndexes)) as { ok: boolean; error?: string };
         assert.equal(result.ok, false);
         assert.match(result.error ?? "", /statement timeout/);
+        assert.ok(
+          session.statements.some((s) => s.sql.startsWith("EXPLAIN")),
+          "the direct EXPLAIN was never sent -- the fallback did not run",
+        );
         const o = teardownOrder(session);
         assert.ok(o.restore >= 0 && o.reset > o.restore && o.rollback > o.reset);
         assert.deepEqual(session.releases, [undefined]);
       },
       undefined,
-      { failWhen: (sql) => sql.startsWith("DECLARE") || sql.startsWith("EXPLAIN") },
+      {
+        refuseWith: (sql) => (sql.startsWith("DECLARE") ? "42601" : undefined),
+        failWhen: (sql) => sql.startsWith("EXPLAIN"),
+      },
     );
   });
 

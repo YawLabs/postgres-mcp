@@ -1,7 +1,7 @@
 import { z } from "zod";
 import {
+  acquireClient,
   formatPgError,
-  getPool,
   getServerVersionNum,
   isWritesAllowed,
   PG18,
@@ -451,10 +451,13 @@ export const adminTools = [
       "DATABASE_URL must have permission - cancelling another user's query needs the " +
       "`pg_signal_backend` role or superuser. Note: `pg_signal_backend` does NOT cover " +
       "superuser-owned backends - only a superuser can signal another superuser's session. " +
-      "Cancel is graceful; terminate is forceful. When `signaled=false`, the `note` field " +
-      "surfaces postgres's NOTICE explaining why (e.g. 'not a PostgreSQL backend process' for " +
-      "a non-pg PID, 'must be a member of...' for permission denial) so an agent can act on " +
-      "the specific cause rather than guess from a three-way list.",
+      "Cancel is graceful; terminate is forceful. `signaled=true` means postgres SENT the " +
+      "signal, not that the target stopped: a session that is idle (or idle in a transaction) " +
+      "ignores a cancel, so re-check with `pg_health` and use `terminate` for an idle session. " +
+      "`signaled=false` means postgres found no backend with that PID; the `note` field carries " +
+      "its own warning (e.g. 'PID 123 is not a PostgreSQL backend process'). A permission " +
+      "denial is NOT a `false`: postgres raises, so the call returns an error with SQLSTATE " +
+      "42501 that says what the role lacks.",
     annotations: {
       title: "Cancel or terminate a backend",
       readOnlyHint: false,
@@ -471,15 +474,21 @@ export const adminTools = [
     }),
     // `signaled: false` is a SUCCESS response, not an error -- postgres returned
     // false rather than raising -- so this schema has to cover it. `note` is the
-    // field that makes it actionable, carrying the NOTICE postgres emitted
-    // ("not a PostgreSQL backend process" vs "must be a member of...").
+    // field that makes it actionable, carrying the WARNING postgres emitted
+    // ("PID N is not a PostgreSQL backend process", or "could not send signal to
+    // process N"). A permission denial never reaches this schema: postgres
+    // raises 42501, and an error response carries no structured content.
     outputSchema: z.object({
       pid: z.number().describe("Echoed back from the request."),
       mode: z.enum(["cancel", "terminate"]).describe("Echoed back, after the safer 'cancel' default is applied."),
-      signaled: z.boolean().describe("What pg_cancel_backend / pg_terminate_backend returned."),
+      signaled: z
+        .boolean()
+        .describe(
+          "What pg_cancel_backend / pg_terminate_backend returned: true once the signal is SENT, not once it has taken effect.",
+        ),
       note: z
         .string()
-        .describe("On `signaled: false`, postgres's own NOTICE explaining why -- act on this, not on the boolean."),
+        .describe("On `signaled: false`, postgres's own warning explaining why -- act on this, not on the boolean."),
     }),
     handler: async (input: unknown) => {
       // Zod default re-applied for direct callers -- see pg_inspect_locks above.
@@ -496,14 +505,27 @@ export const adminTools = [
       }
       const fn = mode === "terminate" ? "pg_terminate_backend" : "pg_cancel_backend";
 
-      // pg_cancel_backend / pg_terminate_backend return false for both
-      // "no such PID" and "permission denied", but postgres emits a NOTICE
-      // distinguishing them ("PID N is not a PostgreSQL server process" vs
-      // "must be a member of the role whose query is being canceled or
-      // member of pg_signal_backend"). Capture NOTICEs on the underlying
-      // client during the call so we can surface them in the `note` field
-      // -- the boolean alone is not actionable for a confused agent.
-      const client = await getPool().connect();
+      // pg_cancel_backend / pg_terminate_backend return false when there is no
+      // such backend ("PID N is not a PostgreSQL backend process") or the
+      // signal could not be delivered ("could not send signal to process N"),
+      // and say which in a WARNING. node-pg delivers a WARNING on the same
+      // `notice` event as a NOTICE, so listening there captures it for the
+      // `note` field -- the boolean alone is not actionable for a confused
+      // agent.
+      //
+      // A permission denial is NOT one of those cases. Postgres raises 42501
+      // (signalfuncs.c, PostgreSQL 15 through 18; measured on 18), so it lands
+      // in the catch below and the agent gets the message and the code. What
+      // the role lacks is named in the errmsg on 15 and in an errdetail on 17
+      // and 18; formatPgError passes on whichever is there. This comment and the tool
+      // description said otherwise until #56: the string they quoted as a
+      // NOTICE, "must be a member of the role whose query is being canceled
+      // ...", is PostgreSQL 15's ERROR message.
+      //
+      // acquireClient(), not getPool().connect(): the raw client is needed for
+      // the listener below, but a checked-out client with no `error` listener
+      // ends the process if its socket dies mid-query (#57).
+      const { client, release } = await acquireClient();
       const notices: string[] = [];
       const onNotice = (n: { message?: string }) => {
         if (n.message) notices.push(n.message);
@@ -546,14 +568,14 @@ export const adminTools = [
               ? `Sent ${mode === "terminate" ? "SIGTERM" : "SIGINT"} to backend ${pid}.`
               : noticeText
                 ? `${noticeText} (Signal returned false for PID ${pid}.)`
-                : `Signal returned false - PID ${pid} may not exist, may already be gone, or the current role lacks permission.`,
+                : `Signal returned false - postgres found no backend with PID ${pid} (it may already be gone).`,
           },
         };
       } catch (err) {
         return { ok: false, error: formatPgError(err) };
       } finally {
         client.off("notice", onNotice);
-        client.release();
+        release();
       }
     },
   },
