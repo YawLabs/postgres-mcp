@@ -60,22 +60,21 @@
  * no `oam --version` probe, no second oam. OAM_BIN is a discovery input, so it
  * is not consulted on that path: the host has already chosen which oam runs.
  *
- * POSTGRES_MCP_SANDBOX=1 takes the discovery path instead, deliberately:
+ * POSTGRES_MCP_SANDBOX, when on, takes the discovery path instead, deliberately:
  * `--permission` is a process-level flag that only a FRESH oam can apply, so
  * serving in-process there would drop the sandbox, and with it the net grant
- * pinned to DATABASE_URL, without a word -- a security downgrade dressed up as
- * an optimisation.
+ * pinned to the database endpoint -- a security downgrade dressed up as an
+ * optimisation.
  *
- * The discovery path does NOT guarantee a fresh oam, sandboxed or otherwise.
- * Discovery can still fail -- no usable binary, or a spawn that errors -- and
- * under POSTGRES_MCP_RUNTIME=auto (the default) the fallback then serves
- * WITHOUT `--permission`: in THIS process on Node or on an oam at or above the
- * floor, and nothing it prints says the sandbox was dropped. Only
- * POSTGRES_MCP_RUNTIME=oam turns those failures into a hard exit.
+ * Under the sandbox the launcher either launches a fresh oam or EXITS. No usable
+ * binary, a spawn that errors, or POSTGRES_MCP_RUNTIME=node is a refusal that
+ * names the fix, in every runtime mode and on every host -- never a fallback. A
+ * sandbox that quietly switches itself off is worse than none (#41).
  *
- * A host oam BELOW the floor never serves, sandbox or not. It hands the server
- * off to the newest usable oam, or to Node found on PATH, or exits with an
- * error when there is neither.
+ * A host oam BELOW the floor never serves, sandbox or not. Without the sandbox it
+ * hands the server off to the newest usable oam, or to Node found on PATH, or
+ * exits with an error when there is neither; under the sandbox only a fresh oam
+ * will do.
  *
  * Every spawn from an oam host PIPES stdio rather than inheriting it. Before
  * 0.9.0 oam treated `stdio: 'inherit'` as `'pipe'`, so an inherited handoff
@@ -85,13 +84,26 @@
  * fds untouched.
  *
  * THE `--permission` SANDBOX (opt-in)
- * `POSTGRES_MCP_SANDBOX=1` runs the server under oam's permission model.
+ * POSTGRES_MCP_SANDBOX runs the server under oam's permission model. It is read
+ * like src/audit.ts's strict flags: `1`/`true` on, `0`/`false`/`off` off, case and
+ * surrounding whitespace ignored, anything else stops the launcher -- an empty or
+ * whitespace-only value included, since only an ABSENT variable is unset
+ * (it used to be `=== "1"`, so `true` ran unsandboxed without a word).
  *
- * The database host is not knowable ahead of time, so the net grant is DERIVED
- * from DATABASE_URL at launch: the one endpoint this server may reach is the one
- * it was configured to reach. Both host and port are pinned, because grants are
- * prefix-matched and a bare host would also admit every other port on it.
- * Filesystem and child-process stay denied.
+ * The net grant is DERIVED at launch and must be the exact host:port string pg
+ * passes to net.connect: oam compares that literal, case-sensitively, before DNS.
+ * sandboxEndpoint() reproduces pg 8.23's resolution -- `?host=`/`?port=`, then the
+ * URL's percent-decoded host and port, then PGHOST/PGPORT, then localhost:5432 --
+ * and the suite checks it against the bundled pg. Host and port are both pinned: a
+ * grant with no port admits every port on that host, and a comma would split the
+ * grant into several entries. When no single TCP endpoint can be pinned -- a Unix
+ * socket (oam has none), a host list (pg has no multi-host support), a host a
+ * grant cannot match exactly, a port outside 1-65535, or a DATABASE_URL that is not
+ * a readable postgres:// URL -- the launcher refuses. With DATABASE_URL unset no
+ * --allow-net is passed at all: every connection is denied and the server reports
+ * the missing variable as it does unsandboxed. On Windows the sandboxed names are
+ * passed to oam in exact case. Filesystem and child-process stay denied; oam does
+ * not gate DNS lookups.
  *
  * Opt-in, not default. A denied environment variable is ABSENT from process.env
  * rather than throwing, so an under-granted DATABASE_URL would look like "not
@@ -109,11 +121,11 @@
  * reachable here. What it does depend on is the sandbox: per oam's changelog
  * `--permission` did not cover all of `fs` and `child_process` until 0.9.1,
  * and the port grant was not exact until 0.15.0.
- * An older oam is not an error under `auto`: the launcher uses a newer one or
- * falls back. The binaries it passed over, and any oam.cmd / oam.bat shim, are
- * named on stderr only when NO usable oam is found; when a newer oam is used,
- * nothing is printed about the older copies. An unusable OAM_BIN is the
- * exception: it is always named.
+ * An older oam is not an error under `auto` without the sandbox: the launcher
+ * uses a newer one or falls back. The binaries it passed over, and any
+ * oam.cmd / oam.bat shim, are named on stderr only when NO usable oam is
+ * found; when a newer oam is used, nothing is printed about the older copies.
+ * An unusable OAM_BIN is the exception: it is always named.
  *
  * SELECTION
  *   POSTGRES_MCP_RUNTIME=auto   newest usable oam, else Node (default)
@@ -121,10 +133,13 @@
  *                               (already running on oam at the floor satisfies
  *                               it, unless the sandbox forces a spawn)
  *   POSTGRES_MCP_RUNTIME=node   Node: in THIS process on Node, handed off to
- *                               Node on PATH when THIS process is oam
- *   POSTGRES_MCP_SANDBOX=1      run oam under --permission
+ *                               Node on PATH when THIS process is oam; refused
+ *                               under the sandbox
+ *   POSTGRES_MCP_SANDBOX=1|true fresh oam under --permission, else exit with
+ *                               an error
  *   OAM_BIN=/path/to/oam        use this oam when it is usable, before discovery
- * The runtime value is case-insensitive; anything else behaves like `auto`.
+ * POSTGRES_MCP_RUNTIME is case-insensitive; any other value of it behaves like
+ * `auto`.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -268,90 +283,373 @@ function pickNewest(candidates) {
  *   "discover"     choose an oam and spawn it, or fall back
  *   "handoff-node" hand it off to Node on PATH: THIS process is an oam and
  *                  Node was asked for
+ *   "refuse-sandbox" exit: the sandbox was requested with
+ *                  POSTGRES_MCP_RUNTIME=node, and Node has no --permission
  *
  * `hostOam` is `process.versions.oam`: oam's own key, absent on Node. An oam
  * host whose version cannot be read is treated as below the floor -- it never
- * proved it is a supported oam. `sandbox` is whether a spawn would carry flags
- * only a fresh oam can apply; see ALREADY RUNNING ON OAM above for why that
- * alone forces discovery, and why discovery can still end in-process. The
- * floor is OAM_MIN itself, not a parameter, so a host oam and a discovered one
- * can never be held to different minimums.
+ * proved it is a supported oam. `sandbox` is whether the sandbox is on, which
+ * means flags only a fresh oam can apply; see ALREADY RUNNING ON OAM above for
+ * why that alone forces discovery. Discovery under the sandbox ends in a pinned
+ * spawn or a refusal, never in-process. The floor is OAM_MIN itself, not a
+ * parameter, so a host oam and a discovered one can never be held to different
+ * minimums.
  *
  * Pure on purpose: every input is passed in, so the whole decision is testable
  * without booting a runtime.
  */
 function runtimePlan({ mode, hostOam, sandbox }) {
   const onOam = hostOam !== undefined;
+  if (sandbox) return mode === "node" ? "refuse-sandbox" : "discover";
   if (mode === "node") return onOam ? "handoff-node" : "in-process";
-  if (sandbox) return "discover";
   return atLeast(parseVersion(hostOam ?? ""), OAM_MIN) ? "in-process" : "discover";
 }
 
 /**
- * The `--permission` grant list, or [] when the sandbox is not requested.
+ * POSTGRES_MCP_SANDBOX -> `{ on, shown }`, or `{ on: false, invalid }` carrying
+ * the whole stderr message for a value that is neither on nor off.
+ *
+ * The same vocabulary as POSTGRES_AUDIT_REDACT in src/audit.ts, and the suite
+ * holds the two to it: trimmed, case-insensitive, and only an ABSENT variable
+ * is unset. An unknown value stops the launcher instead of reading as off --
+ * `yes` used to run unsandboxed without a word, the one outcome an operator
+ * who typed it did not want. `shown` is what the refusal messages echo back.
+ *
+ * A value that is present but empty, or only whitespace, stops it too. That is
+ * what an MCP client hands the launcher for `"POSTGRES_MCP_SANDBOX":
+ * "${SANDBOX}"` when the variable is unset where the client runs, and reading
+ * it as unset would run the server unsandboxed for an operator who asked for
+ * the sandbox -- the fail-open this flag exists to prevent, and the one
+ * src/audit.ts refuses for its own flags. It gets its own message because its
+ * likely cause is an unexpanded variable, not a typo.
+ */
+function parseSandboxSetting(raw) {
+  if (raw === undefined) return { on: false };
+  const value = raw.trim().toLowerCase();
+  const on = ["1", "true"];
+  const off = ["0", "false", "off"];
+  if (value === "") {
+    return {
+      on: false,
+      invalid:
+        "postgres-mcp: POSTGRES_MCP_SANDBOX is set but empty (an unexpanded variable in the MCP config?). Refusing to start rather than read it as unset, which would run the server without the sandbox.\n" +
+        "Remove the variable or set POSTGRES_MCP_SANDBOX=0 to run without the sandbox, or set it to 1 to run under oam's --permission sandbox.\n",
+    };
+  }
+  if (off.includes(value)) return { on: false };
+  if (on.includes(value)) return { on: true, shown: raw.trim() };
+  const expected = [...on, ...off].map((v) => JSON.stringify(v)).join(", ");
+  return {
+    on: false,
+    invalid:
+      `postgres-mcp: POSTGRES_MCP_SANDBOX=${JSON.stringify(raw)} is not a recognized value; expected one of ${expected}. Refusing to start rather than guess whether the sandbox should be on.\n` +
+      "Set POSTGRES_MCP_SANDBOX=1 to run under oam's --permission sandbox, or 0 to run without it.\n",
+  };
+}
+
+/**
+ * The one TCP endpoint the bundled pg driver will dial, as an oam net grant.
+ * Returns `{ grant: "host:port" }`, `{ grant: null }` when DATABASE_URL is unset
+ * (no --allow-net at all: every connection denied), or `{ refusal: { code, ... } }`
+ * when no single endpoint can be pinned.
+ *
+ * oam matches a grant against the literal host string pg hands net.connect, so
+ * "close enough" is not enough: a grant that differs from pg's choice denies the
+ * operator their own database, and a wider one is the fail-open #41 was about.
+ * This is pg-connection-string 2.x's parse followed by pg/lib/connection-
+ * parameters.js's fallbacks, rule for rule. The launcher runs BEFORE the bundle
+ * and cannot import pg, so the rules are restated here, and the suite runs this
+ * against the real driver on thousands of generated inputs to keep them honest.
+ *
+ * Refusal codes: "unparseable" (pg itself would throw; `part` names what),
+ * "not-postgres" (not a postgres:// or postgresql:// URL; `hint` guesses why),
+ * "unix-socket", "host-list", "bad-host", "bad-port". The DSN is never copied
+ * into a refusal -- it may carry a password.
+ */
+function sandboxEndpoint(dsn, pghost, pgport) {
+  if (dsn === undefined || dsn.trim() === "") return { grant: null };
+  const refuse = (code, fields = {}) => ({ refusal: { code, ...fields } });
+  const notPostgres = () =>
+    refuse("not-postgres", {
+      hint: /^\s/.test(dsn) ? "whitespace" : /^["']/.test(dsn) ? "quotes" : /^[A-Za-z_]+\s*=/.test(dsn) ? "key-value" : null,
+    });
+  // pg-connection-string: a leading "/" is a socket directory, then a database.
+  // NOTHING of the value is echoed: here the "host" is not a part pulled out of
+  // the DSN, it IS the DSN. A URL that lost its scheme to an unexpanded
+  // "${PROTO}//user:password@host/db" starts with "/" too, and echoing its first
+  // token printed the password.
+  if (dsn.charAt(0) === "/") return refuse("unix-socket", { host: null, from: "path" });
+  let part = null;
+  let host;
+  let portText;
+  let hostFrom = "url";
+  let portFrom = "url";
+  try {
+    // pg-connection-string: re-encode stray spaces and bad escapes, parse
+    // against a placeholder base, and retry `user@/db` with a dummy host.
+    let str = dsn;
+    if (/ |%[^a-f0-9]|%[a-f0-9][^a-f0-9]/i.test(str)) str = encodeURI(str).replace(/%25(\d\d)/g, "%$1");
+    let url;
+    let dummy = false;
+    try {
+      url = new URL(str, "postgres://base");
+    } catch {
+      str = str.replace("@/", "@___DUMMY___/");
+      dummy = true;
+      try {
+        url = new URL(str, "postgres://base");
+      } catch {
+        // pg throws here too. Name a host list when the authority holds one --
+        // after the last "@", so a comma in the password does not count.
+        const authority = /^[^:/?#]*:\/\/([^/?#]*)/.exec(dsn)?.[1] ?? "";
+        return authority.slice(authority.lastIndexOf("@") + 1).includes(",")
+          ? refuse("host-list")
+          : refuse("unparseable", { part: null });
+      }
+    }
+    try {
+      new URL(str);
+    } catch {
+      // Only pg's placeholder base made it parse, so pg would dial a host named
+      // "base": the input was never a URL.
+      return notPostgres();
+    }
+    if (url.protocol === "socket:") return refuse("unix-socket", { host: null, from: "url" });
+    if (!/^postgres(?:ql)?:\/\//.test(url.href)) return notPostgres();
+    const q = Object.create(null);
+    for (const [k, v] of url.searchParams) q[k] = v; // last duplicate wins, as in pg
+    // pg decodes these while parsing and throws a URIError on bad escapes; say
+    // so here rather than on every tool call.
+    part = "user name";
+    if (!q.user) decodeURIComponent(url.username);
+    part = "password";
+    if (!q.password) decodeURIComponent(url.password);
+    const hostname = dummy ? "" : url.hostname;
+    let pathname = url.pathname;
+    part = "host";
+    if (q.host) {
+      host = q.host;
+      hostFrom = "query";
+      if (hostname && /^%2f/i.test(hostname)) pathname = hostname + pathname;
+    } else {
+      host = decodeURIComponent(hostname);
+    }
+    if (q.port) {
+      portText = q.port;
+      portFrom = "query";
+    } else {
+      portText = url.port;
+    }
+    part = "database name";
+    const db = pathname.slice(1);
+    if (db) decodeURI(db);
+  } catch {
+    return refuse("unparseable", { part });
+  }
+  // pg/lib/connection-parameters.js: the environment and the defaults fill only
+  // a value the connection string left falsy.
+  if (!host) {
+    host = pghost || "localhost";
+    hostFrom = pghost ? "env" : "default";
+  }
+  if (!portText) {
+    portText = pgport || "5432";
+    portFrom = pgport ? "env" : "default";
+  }
+  const port = parseInt(portText, 10);
+  // pg/lib/client.js: a host starting with "/" is a Unix socket directory.
+  if (host.charAt(0) === "/") return refuse("unix-socket", { host, from: hostFrom });
+  // A comma inside a grant splits it into entries, the first one portless.
+  if (host.includes(",")) return refuse("host-list", { host, from: hostFrom });
+  if (!/^(?:[A-Za-z0-9_][A-Za-z0-9._-]*|\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$/.test(host)) {
+    return refuse("bad-host", { host, from: hostFrom });
+  }
+  // One comparison that also rejects NaN; oam would saturate a larger port.
+  if (!(port >= 1 && port <= 65535)) return refuse("bad-port", { port: portText, from: portFrom });
+  return { grant: `${host}:${port}` };
+}
+
+/**
+ * A sandboxEndpoint refusal -> `{ problem, details, remedy }` for
+ * sandboxRefusal. ASCII only, and never the DSN: a host or port is echoed only
+ * once it has been pulled out on its own.
+ */
+function endpointProblem({ code, part, host, port, from, hint }) {
+  const pin = "limits network access to the one database host and port the pg driver connects to, but";
+  const notShown = "DATABASE_URL is not shown, since it may contain a password";
+  const show = (v) =>
+    JSON.stringify(v).replace(/[^\x20-\x7E]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  const hostWhere = { url: "DATABASE_URL", query: "the host= parameter in DATABASE_URL", env: "PGHOST" }[from];
+  const portWhere = { url: "DATABASE_URL", query: "the port= parameter in DATABASE_URL", env: "PGPORT" }[from];
+  if (code === "unparseable") {
+    return {
+      problem: `${pin} the pg driver cannot read DATABASE_URL: ${part ? `the ${part} has malformed percent-encoding` : "it is not a valid URL"}`,
+      details: [notShown],
+      remedy:
+        "Write it as postgres://user:password@host:5432/database, percent-encoding @ # / ? in the user name and password (%40 %23 %2F %3F), with a port from 1 to 65535",
+    };
+  }
+  if (code === "not-postgres") {
+    const hints = {
+      whitespace: "it starts with whitespace",
+      quotes: "it is wrapped in quotes -- remove them",
+      "key-value": "it looks like a key=value connection string, which the pg driver does not read",
+    };
+    return {
+      problem: `${pin} DATABASE_URL is not a postgres:// or postgresql:// URL`,
+      details: [...(hint ? [hints[hint]] : []), notShown],
+      remedy: "Write it as postgres://user:password@host:5432/database",
+    };
+  }
+  if (code === "unix-socket") {
+    return {
+      problem:
+        host === null
+          ? `${pin} DATABASE_URL ${from === "path" ? 'starts with "/", which the pg driver reads as a Unix socket directory' : "names a Unix socket (socket://)"}, and oam can only connect over TCP`
+          : `${pin} the database host ${show(host)} from ${hostWhere} is a Unix socket directory, and oam can only connect over TCP`,
+      // host === null means nothing was pulled out of the DSN to echo, so say
+      // why it is missing, as every other no-echo refusal does.
+      details: host === null ? [notShown] : [],
+      remedy:
+        "Connect over TCP instead (for example postgres://user@localhost:5432/database), or unset POSTGRES_MCP_SANDBOX and set POSTGRES_MCP_RUNTIME=node to keep the socket without the sandbox",
+    };
+  }
+  if (code === "host-list") {
+    return {
+      problem: `${pin} ${host === undefined ? "DATABASE_URL lists" : `the host ${show(host)} from ${hostWhere} lists`} several hosts, and the pg driver does not support multi-host connection strings`,
+      details: host === undefined ? [notShown] : ["the driver would look the whole list up as one host name and fail"],
+      remedy:
+        from === "env"
+          ? "Set PGHOST to a single host"
+          : from === "query"
+            ? "Name a single host in the host= parameter of DATABASE_URL"
+            : "Name a single host in DATABASE_URL",
+    };
+  }
+  if (code === "bad-host") {
+    return {
+      problem: `${pin} the host ${show(host)} from ${hostWhere} is not a plain DNS name or IP address`,
+      details: [
+        /[^\x00-\x7F]/.test(host)
+          ? "oam does not convert international host names -- use the name's ASCII (xn--) form"
+          : /\s/.test(host)
+            ? "it contains whitespace"
+            : "a host must be a DNS name, an IPv4 address, or an IPv6 address",
+      ],
+      remedy:
+        from === "env"
+          ? "Correct PGHOST"
+          : from === "query"
+            ? "Correct the host= parameter in DATABASE_URL"
+            : "Correct the host in DATABASE_URL",
+    };
+  }
+  return {
+    problem: `${pin} the port ${show(port)} from ${portWhere} is not a whole number from 1 to 65535`,
+    details: [],
+    remedy:
+      from === "env"
+        ? "Correct PGPORT, or unset it to use 5432"
+        : from === "query"
+          ? "Correct the port= parameter in DATABASE_URL, or remove it to use 5432"
+          : "Correct the port in DATABASE_URL, or remove it to use 5432",
+  };
+}
+
+/**
+ * The stderr text for a sandbox that cannot be applied. One shape for every
+ * case, so the first line stands on its own in an MCP host's log: what was
+ * asked, what is in the way, and that nothing ran. Details are indented; the
+ * last line is the fix.
+ */
+function sandboxRefusal(shown, { problem, details = [], remedy }) {
+  return (
+    `postgres-mcp: POSTGRES_MCP_SANDBOX=${shown} ${problem}; refusing to start without the sandbox.\n` +
+    details.map((d) => `  ${d}\n`).join("") +
+    `${remedy}.\n`
+  );
+}
+
+/**
+ * The environment for a sandboxed child, with every allowlisted variable in
+ * its exact upper-case spelling.
+ *
+ * oam's `--allow-env` matches names exactly -- measured: `pghost` is stripped
+ * under `--allow-env=PGHOST` -- while Node on Windows reads them
+ * case-insensitively. So a `pghost` or `postgres_audit_log` that works on Node
+ * would reach this launcher and then vanish inside the sandbox, and the server
+ * would quietly take its default: for the audit variables, no trail. On
+ * Windows each allowlisted name is renamed to its exact spelling, and any
+ * other spelling of it is dropped so the child's environment cannot hold two;
+ * an exact spelling that is already present wins. Elsewhere names are
+ * case-sensitive for Node too, so the copy is unchanged.
+ */
+function sandboxChildEnv(source, names, platform) {
+  const out = { ...source };
+  if (platform !== "win32") return out;
+  for (const key of Object.keys(source)) {
+    const upper = key.toUpperCase();
+    if (key === upper || !names.includes(upper)) continue;
+    if (!Object.prototype.hasOwnProperty.call(out, upper)) out[upper] = source[key];
+    delete out[key];
+  }
+  return out;
+}
+
+/**
+ * Every variable the SHIPPED BUNDLE reads, including the pg driver's own
+ * lookups: the `--allow-env` grant. Adding a config env var to src/ without
+ * adding it here is a silent regression under the sandbox, not a loud one: oam
+ * removes an undeclared var from process.env rather than denying access, so
+ * the server reads undefined and quietly takes its default. The suite checks
+ * this list against the bundle's literal reads. POSTGRES_APPLICATION_NAME is
+ * read by getApplicationName() in src/api.ts; PGAPPNAME is pg's own env
+ * fallback for the same setting (connection-parameters.js: val('application_name',
+ * config, 'PGAPPNAME')), so omitting it would drop a name set the driver's way.
+ *
+ * Most of the PG* names below CANNOT be found by grepping the bundle for
+ * `process.env.PGFOO`, which is why they were missing: pg builds them at
+ * runtime as `process.env['PG' + key.toUpperCase()]`
+ * (connection-parameters.js:15), so PGUSER / PGDATABASE / PGHOST / PGPORT /
+ * PGPASSWORD / PGOPTIONS / PGBINARY / PGCLIENT_ENCODING / PGREPLICATION all
+ * exist only as a computed string. Their absence bites precisely when
+ * DATABASE_URL is not self-contained -- `postgres:///mydb` leaning on PGHOST,
+ * or password-free DSNs leaning on PGPASSWORD -- and it bites in the silent
+ * direction: the var is stripped, pg falls back to its own default, and the
+ * connection fails with something that names neither the sandbox nor the
+ * variable. Only the two spelled literally in pg's source (PGSSLMODE at
+ * connection-parameters.js:26, PGCONNECT_TIMEOUT at :127) plus the explicit
+ * third arguments (PGAPPNAME, PGSSLNEGOTIATION) are greppable.
+ * POSTGRES_AUDIT_LOG_FILE is granted as a VARIABLE here, but the sandbox
+ * still denies the filesystem, so the file sink cannot actually open its
+ * target under the sandbox. The audit module fails loudly on an unopenable
+ * sink rather than silently dropping the trail, so the combination refuses to
+ * start -- which is the correct outcome (an audit control that quietly
+ * disables itself is worse than none), but it is a surprising one to hit at
+ * runtime. Use the stderr sink under the sandbox.
+ */
+const SANDBOX_ENV = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGBINARY","PGCLIENT_ENCODING","PGCONNECT_TIMEOUT","PGDATABASE","PGHOST","PGOPTIONS","PGPASSWORD","PGPORT","PGREPLICATION","PGSSLMODE","PGSSLNEGOTIATION","PGUSER","POSTGRES_APPLICATION_NAME","POSTGRES_AUDIT_LOG","POSTGRES_AUDIT_LOG_FILE","POSTGRES_AUDIT_REDACT","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
+
+/**
+ * The `--permission` flags for a sandboxed spawn. `grant` is sandboxEndpoint's
+ * "host:port", or null for no `--allow-net` at all, which denies every
+ * connection.
  *
  * These are oam's PROCESS-level flags: they belong before the `run` subcommand,
  * not after it. `oam run --permission file.js` is rejected outright, which is a
  * good failure but only because it is loud -- ordering here is load-bearing.
  *
- * Net grants prefix-match `host` for fetch and `host:port` for sockets.
- * A denied environment variable is ABSENT from process.env rather than throwing,
- * so the env list below is derived from what the bundle actually reads; trimming
- * it produces silent misbehaviour, not a clear denial.
+ * A net grant is matched exactly against the "host:port" pg dials (since oam
+ * 0.15.0; before that a port was prefix-matched). An entry without a port
+ * admits every port on that host, and a comma splits one flag into several
+ * entries, which is why sandboxEndpoint refuses a host list rather than pass it
+ * through. A repeated flag replaces the earlier one, so each is emitted once.
+ * A denied environment variable is ABSENT from process.env rather than
+ * throwing, so the env list is derived from what the bundle actually reads;
+ * trimming it produces silent misbehaviour, not a clear denial.
  */
-function sandboxFlags() {
-  if (process.env.POSTGRES_MCP_SANDBOX !== "1") return [];
-
-  // Derived, not hardcoded: the only endpoint this server may reach is the one
-  // it was configured to reach. Grants are prefix-matched against "host:port"
-  // for sockets, so host alone would also admit any other port on that host --
-  // pin both. A DSN we cannot parse falls back to a bare grant rather than a
-  // broken one, because a wrong narrow grant fails at connect time.
-  const dsn = process.env.DATABASE_URL ?? null;
-  let netFlag = "--allow-net";
-  if (dsn) {
-    try {
-      const u = new URL(dsn);
-      if (u.hostname) netFlag = `--allow-net=${u.hostname}:${u.port || 5432}`;
-    } catch {
-      // Unparseable DATABASE_URL: leave the grant open. The server will fail on
-      // its own connection error, which names the real problem.
-    }
-  }
-
-  // Every variable the SHIPPED BUNDLE reads, including the pg driver's own
-  // lookups. Adding a config env var to src/ without adding it here is a silent
-  // regression under the sandbox, not a loud one: oam removes an undeclared var
-  // from process.env rather than denying access, so the server reads undefined
-  // and quietly takes its default. POSTGRES_APPLICATION_NAME is read by
-  // getApplicationName() in src/api.ts; PGAPPNAME is pg's own env fallback for
-  // the same setting (connection-parameters.js: val('application_name', config,
-  // 'PGAPPNAME')), so omitting it would drop a name set the driver's way.
-  //
-  // Most of the PG* names below CANNOT be found by grepping the bundle for
-  // `process.env.PGFOO`, which is why they were missing: pg builds them at
-  // runtime as `process.env['PG' + key.toUpperCase()]`
-  // (connection-parameters.js:15), so PGUSER / PGDATABASE / PGHOST / PGPORT /
-  // PGPASSWORD / PGOPTIONS / PGBINARY / PGCLIENT_ENCODING / PGREPLICATION all
-  // exist only as a computed string. Their absence bites precisely when
-  // DATABASE_URL is not self-contained -- `postgres:///mydb` leaning on PGHOST,
-  // or password-free DSNs leaning on PGPASSWORD -- and it bites in the silent
-  // direction: the var is stripped, pg falls back to its own default, and the
-  // connection fails with something that names neither the sandbox nor the
-  // variable. Only the two spelled literally in pg's source (PGSSLMODE at
-  // connection-parameters.js:26, PGCONNECT_TIMEOUT at :127) plus the explicit
-  // third arguments (PGAPPNAME, PGSSLNEGOTIATION) are greppable.
-  // POSTGRES_AUDIT_LOG_FILE is granted as a VARIABLE here, but the sandbox
-  // still denies the filesystem, so the file sink cannot actually open its
-  // target under POSTGRES_MCP_SANDBOX=1. The audit module fails loudly on an
-  // unopenable sink rather than silently dropping the trail, so the combination
-  // refuses to start -- which is the correct outcome (an audit control that
-  // quietly disables itself is worse than none), but it is a surprising one to
-  // hit at runtime. Use the stderr sink under the sandbox.
-  const env = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGBINARY","PGCLIENT_ENCODING","PGCONNECT_TIMEOUT","PGDATABASE","PGHOST","PGOPTIONS","PGPASSWORD","PGPORT","PGREPLICATION","PGSSLMODE","PGSSLNEGOTIATION","PGUSER","POSTGRES_APPLICATION_NAME","POSTGRES_AUDIT_LOG","POSTGRES_AUDIT_LOG_FILE","POSTGRES_AUDIT_REDACT","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
-
-  const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];
-  return flags;
+function sandboxFlags(grant) {
+  return ["--permission", ...(grant === null ? [] : [`--allow-net=${grant}`]), `--allow-env=${SANDBOX_ENV.join(",")}`];
 }
 
 /**
@@ -376,6 +674,12 @@ async function errSync(message) {
       // Pipe is full and the reader has not drained yet -- retry.
     }
   }
+}
+
+/** Print a refusal and exit 1. Nothing is served after this. */
+async function refuse(message) {
+  await errSync(message);
+  process.exit(1);
 }
 
 /**
@@ -480,9 +784,10 @@ const fallbackFailed = (e) => {
  *
  * `onLaunchFailed(err)` runs when the child could not be started at all; it is
  * never called once the child is running, which would double-start the server
- * on the same stdio.
+ * on the same stdio. `env` is the child's environment: a sandboxed spawn passes
+ * sandboxChildEnv's copy, everything else this process's own.
  */
-async function launchChild(cmd, args, onLaunchFailed) {
+async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
   // THIS process being an oam means one below the floor, one spawning a fresh
   // oam for the sandbox, or one handing off under POSTGRES_MCP_RUNTIME=node.
   // An oam below 0.9.0 does not hand over the fds for `stdio: 'inherit'`, and a
@@ -497,7 +802,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
       // server's shutdown path. Piping preserves both as well: bytes are copied
       // unchanged, and stdin's end propagates to the child.
       stdio: piped ? ["pipe", "pipe", "pipe"] : "inherit",
-      env: process.env,
+      env,
       windowsHide: true,
     });
   } catch (err) {
@@ -633,16 +938,23 @@ const mode = (process.env.POSTGRES_MCP_RUNTIME ?? "auto").toLowerCase();
 const hostOam = process.versions.oam;
 
 // True when THIS process is an oam at or above the floor. Such a host reaches
-// discovery only under the sandbox, and it may still serve the fallback itself.
+// discovery only under the sandbox, and never serves a fallback under the
+// sandbox.
 const hostIsSupportedOam = atLeast(parseVersion(hostOam ?? ""), OAM_MIN);
 
-/** What the fallback will do, for the stderr note that precedes it. */
+/**
+ * What the fallback will do, for the stderr note that precedes it. Never
+ * reached while POSTGRES_MCP_SANDBOX is on -- the plan, the no-chosen branch
+ * and onLaunchFailed refuse first.
+ */
 const fallbackWhat = hostIsSupportedOam ? `serving on this oam ${hostOam} instead` : "using Node instead";
 
 /**
  * No usable oam, under a mode that allows a fallback. On Node, and on an oam
  * host at or above the floor, the server runs in THIS process. An oam host
- * below the floor never serves, so it hands off to Node on PATH.
+ * below the floor never serves, so it hands off to Node on PATH. Never reached
+ * while POSTGRES_MCP_SANDBOX is on -- the plan, the no-chosen branch and
+ * onLaunchFailed refuse first.
  */
 async function fallBack(why) {
   if (hostOam === undefined || hostIsSupportedOam) {
@@ -652,10 +964,32 @@ async function fallBack(why) {
   await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and ${why}`);
 }
 
-// Computed once: the plan reads whether a spawn would carry --permission off
-// the very list the spawn below passes, so the two cannot drift.
-const sandbox = sandboxFlags();
-const plan = runtimePlan({ mode, hostOam, sandbox: sandbox.length > 0 });
+// The sandbox is settled before anything is probed or run. Once it is on, the
+// launcher either spawns oam under --permission or exits: a sandbox that
+// quietly switches itself off is worse than none (#41).
+const setting = parseSandboxSetting(process.env.POSTGRES_MCP_SANDBOX);
+if (setting.invalid) await refuse(setting.invalid);
+const plan = runtimePlan({ mode, hostOam, sandbox: setting.on });
+if (plan === "refuse-sandbox") {
+  await refuse(
+    sandboxRefusal(setting.shown, {
+      problem: "needs oam to apply --permission, but POSTGRES_MCP_RUNTIME=node runs the server on Node, which has no such sandbox",
+      remedy:
+        "Unset POSTGRES_MCP_RUNTIME (or set it to oam) to run sandboxed, or unset POSTGRES_MCP_SANDBOX to run on Node without the sandbox",
+    }),
+  );
+}
+// The flags the spawn below passes, and the environment it passes them with.
+// The net grant is derived from the SAME normalized environment the child will
+// see, so the launcher and pg cannot resolve different endpoints.
+let sandbox = [];
+let childEnv = process.env;
+if (setting.on) {
+  childEnv = sandboxChildEnv(process.env, SANDBOX_ENV, process.platform);
+  const endpoint = sandboxEndpoint(childEnv.DATABASE_URL, childEnv.PGHOST, childEnv.PGPORT);
+  if (endpoint.refusal) await refuse(sandboxRefusal(setting.shown, endpointProblem(endpoint.refusal)));
+  sandbox = sandboxFlags(endpoint.grant);
+}
 
 if (plan === "in-process") {
   await runInProcess();
@@ -672,14 +1006,29 @@ if (plan === "in-process") {
     // it lands in process.argv for the server, so `postgres-mcp version` and
     // any host-supplied flags survive the hop unchanged. The sandbox flags are
     // PROCESS-level and so go before `run`.
-    await launchChild(chosen.path, [...sandbox, "run", SERVER_ENTRY, "--", ...process.argv.slice(2)], async (err) => {
-      if (mode === "oam") {
-        await errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
-        process.exit(1);
-      }
-      await errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); ${fallbackWhat}.\n`);
-      await fallBack("the newer oam could not be launched");
-    });
+    await launchChild(
+      chosen.path,
+      [...sandbox, "run", SERVER_ENTRY, "--", ...process.argv.slice(2)],
+      async (err) => {
+        if (setting.on) {
+          // The one oam that could apply the sandbox did not start. Nothing
+          // else can, so nothing else runs.
+          await refuse(
+            sandboxRefusal(setting.shown, {
+              problem: `needs a freshly launched oam to apply --permission, but oam at ${chosen.path} failed to launch (${err?.message ?? err})`,
+              remedy: `Check that ${chosen.path} --version runs, point OAM_BIN at a working oam ${OAM_MIN.join(".")} or newer, or unset POSTGRES_MCP_SANDBOX to run without the sandbox`,
+            }),
+          );
+        }
+        if (mode === "oam") {
+          await errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
+          process.exit(1);
+        }
+        await errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); ${fallbackWhat}.\n`);
+        await fallBack("the newer oam could not be launched");
+      },
+      childEnv,
+    );
   } else {
     const shim = findOamShim();
     const notes = [
@@ -689,6 +1038,18 @@ if (plan === "in-process") {
         ? [`found ${shim}, but Node cannot execute a .cmd/.bat directly -- install the native oam binary, or point OAM_BIN at one`]
         : []),
     ];
+    if (setting.on) {
+      // Before the mode check: under the sandbox `auto` and `oam` end the same
+      // way, and the remedy must not suggest POSTGRES_MCP_RUNTIME=node.
+      await refuse(
+        sandboxRefusal(setting.shown, {
+          problem: `needs a freshly launched oam to apply --permission, but no usable oam (${OAM_MIN.join(".")} or newer) was found`,
+          details: notes.length > 0 ? notes : ["no oam binary was found in the installed locations or on PATH"],
+          remedy:
+            "Install or update oam from https://oamjs.org, set OAM_BIN=/path/to/oam, or unset POSTGRES_MCP_SANDBOX to run without the sandbox",
+        }),
+      );
+    }
     if (mode === "oam") {
       // Explicitly demanded, so this is a real misconfiguration -- do not
       // silently do something else.
@@ -699,9 +1060,9 @@ if (plan === "in-process") {
       );
       process.exit(1);
     }
-    // auto: falling back is correct, but silence is how someone never learns
-    // their OAM_BIN is wrong, their oam is too old to use, or their install is
-    // a shape this launcher skips.
+    // auto without the sandbox: falling back is correct, but silence is how
+    // someone never learns their OAM_BIN is wrong, their oam is too old to use,
+    // or their install is a shape this launcher skips.
     if (notes.length > 0) await errSync(`postgres-mcp: ${notes.join("; ")}; ${fallbackWhat}.\n`);
     await fallBack("no newer oam was found").catch(fallbackFailed);
   }

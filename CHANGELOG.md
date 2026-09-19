@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`POSTGRES_MCP_SANDBOX` no longer turns itself off without a word; when
+  the sandbox cannot be applied, the launcher refuses to start (#41).** Four
+  paths left an operator believing they were sandboxed when they were not, and
+  none of them printed anything.
+  - **The value.** Only the exact value `1` enabled the sandbox, so `true`,
+    ` 1` and `TRUE` ran unsandboxed. It now reads like the audit variables:
+    `1` or `true` on, `0`, `false` or `off` off, trimmed and case-insensitive.
+    Any other value (`yes`, `on`) stops the launcher with a message naming the
+    accepted ones. So does a value that is set but empty or only whitespace,
+    as the audit variables have done since 0.13.3: that is what
+    `"POSTGRES_MCP_SANDBOX": "${SANDBOX}"` becomes when the variable is unset
+    where the MCP client runs, and reading it as unset ran the server
+    unsandboxed for an operator who had asked for the sandbox. Only a variable
+    that is not set at all counts as unset.
+  - **The runtime.** `POSTGRES_MCP_RUNTIME=node`, no usable oam under `auto`,
+    and an oam that failed to spawn all served without `--permission` -- in
+    the launcher's own process, or handed off to Node -- with no message at all
+    when no oam existed. Each now refuses, in every mode and on every host,
+    with the fix named.
+  - **The network grant.** An unset `DATABASE_URL`, a URL with no host
+    (`postgres:///db` leaning on `PGHOST`, `postgres://u@/db`), a host list
+    with ports, or anything `new URL()` rejected produced a bare `--allow-net`:
+    every host on the internet. `postgres://h1,h2/db` produced
+    `--allow-net=h1,h2:5432`, which oam reads as `h1` on every port plus
+    `h2:5432`. And `?host=`, `?port=`, `PGPORT` and percent-encoded hosts were
+    ignored, which denied working setups their own database. The grant is now
+    the one `host:port` the pg driver dials, resolved the driver's way --
+    `?host=`/`?port=`, then the URL, then `PGHOST`/`PGPORT`, then
+    `localhost:5432` -- and the suite checks it against the bundled pg on
+    thousands of generated connection strings. With `DATABASE_URL` unset no
+    `--allow-net` is passed at all, so every connection is denied and the
+    server reports the missing variable as it does unsandboxed. A Unix socket,
+    a host list, a port outside 1-65535, a host an exact grant cannot match, or
+    an unreadable or non-`postgres://` URL now refuses; `DATABASE_URL` is never
+    printed.
+  - **Windows.** An allowlisted variable spelled in another case (`pghost`,
+    `postgres_audit_log`) reached the launcher, because Node reads names
+    case-insensitively there, and was then stripped from the sandboxed server,
+    because oam matches them exactly -- so a lower-case audit variable silently
+    switched the audit trail off. Each is now passed in its exact spelling.
+
+  **Upgrading:** this stops setups that only appeared to be sandboxed: the
+  sandbox set with no usable oam under `auto`, with
+  `POSTGRES_MCP_RUNTIME=node`, to a value such as `yes`, or to an empty value.
+  Each now gets a message naming the fix; remove `POSTGRES_MCP_SANDBOX` or set
+  it to `0` to keep running without it.
+
 ## [0.13.3] - 2026-09-18
 
 ### Fixed
