@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { readdirSync, readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import pg from "pg";
 import { shutdown } from "../api.js";
+import { initAudit, resetAuditForTests, setAuditSinkForTests } from "../audit.js";
+import { wrapToolHandler } from "../mcp-wrapper.js";
 import { adminTools } from "./admin.js";
 
 const pgKill = adminTools.find((t) => t.name === "pg_kill")!;
@@ -49,11 +54,18 @@ interface FakeClientOptions {
   // Notice messages to emit synchronously during the query call, simulating
   // postgres firing a NOTICE while pg_cancel_backend / pg_terminate_backend run.
   emitNotices?: string[];
+  // Reject the query with this instead of resolving `rows`, for the path where
+  // postgres RAISES (as opposed to returning signaled=false).
+  rejectWith?: Error;
 }
 
 function makeFakeClient(opts: FakeClientOptions) {
   const noticeListeners = new Set<NoticeListener>();
+  // Every statement the handler sent, so a test can assert the pid still went
+  // out as a bound parameter and not interpolated into the text.
+  const calls: { sql: string; params: unknown[] }[] = [];
   return {
+    calls,
     on(event: string, fn: NoticeListener) {
       if (event === "notice") noticeListeners.add(fn);
       return this;
@@ -62,12 +74,14 @@ function makeFakeClient(opts: FakeClientOptions) {
       if (event === "notice") noticeListeners.delete(fn);
       return this;
     },
-    async query(_sql: string, _params: unknown[]) {
+    async query(sql: string, params: unknown[]) {
+      calls.push({ sql, params });
       // Fire any configured NOTICEs to every registered listener before the
       // result resolves, the same ordering the real pg client uses.
       for (const message of opts.emitNotices ?? []) {
         for (const fn of noticeListeners) fn({ message });
       }
+      if (opts.rejectWith) throw opts.rejectWith;
       return { rows: opts.rows };
     },
     release() {
@@ -143,6 +157,390 @@ describe("pg_kill note construction (stubbed connect, no live DB)", () => {
     assert.equal(res.ok, true);
     assert.equal(res.data.signaled, false);
     assert.match(res.data.note, new RegExp(noticeText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// pg_kill audit line (#39).
+//
+// pg_kill cannot go through runInternal / withSharedClient -- it needs the raw
+// client for the NOTICE listener -- so it queried that client directly and the
+// statement never reached auditQuery. Cancelling or terminating ANOTHER session
+// was the one action the trail could not show.
+//
+// Driven through wrapToolHandler with `pgKill.name`, the exact pairing
+// index.ts registers, because the `tool` field only exists if the handler's
+// statement runs inside that wrapper's async context: asserting on the bare
+// handler would prove a line is written and say nothing about attribution.
+// Delete the auditQuery wrapper in admin.ts and every test here that expects a
+// line goes red on the line count (checked: six fail). Two hold either way, by
+// design: the ALLOW_WRITES one asserts NO line, and the README one checks what
+// is SENT, not what is logged.
+// ─────────────────────────────────────────────────────────────────────────
+
+const AUDIT_ENV = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
+
+describe("pg_kill audit line (stubbed connect, no live DB)", () => {
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalAllowWrites = process.env.ALLOW_WRITES;
+  const originalDbUrl = process.env.DATABASE_URL;
+  let auditEnvSnapshot: Record<string, string | undefined> = {};
+  let fakeClient: ReturnType<typeof makeFakeClient>;
+  let lines: string[];
+
+  // Seven digits on purpose: no `ts` or `ms` value can contain the run by
+  // accident, so its absence from the raw line is a real statement about the
+  // pid and not luck.
+  const PID = 4191234;
+
+  const killViaWrapper = wrapToolHandler(pgKill.handler as (input: unknown) => Promise<unknown>, pgKill.name);
+
+  function installStub(opts: FakeClientOptions) {
+    fakeClient = makeFakeClient(opts);
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(fakeClient);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  }
+
+  function onlyLine(): { raw: string; entry: Record<string, unknown> } {
+    assert.equal(lines.length, 1, `expected exactly one audit line per signal call, got ${JSON.stringify(lines)}`);
+    const raw = lines[0]!;
+    return { raw, entry: JSON.parse(raw) as Record<string, unknown> };
+  }
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    process.env.ALLOW_WRITES = "1";
+    // Cleared first, then set. The capture sink installed below replaces
+    // whatever initAudit() opens, so an ambient POSTGRES_AUDIT_LOG_FILE cannot
+    // take the lines -- but initAudit() would still open (and create) that
+    // file, or throw in this hook on an unopenable path. The one that fails
+    // assertions is an ambient POSTGRES_AUDIT_REDACT=1: it swaps `sql` for
+    // sqlKeyword/sqlSha256, and the `entry.sql` checks go red for a reason
+    // that has nothing to do with pg_kill.
+    auditEnvSnapshot = {};
+    for (const name of AUDIT_ENV) {
+      auditEnvSnapshot[name] = process.env[name];
+      delete process.env[name];
+    }
+    // api.ts ran initAudit() at import with auditing off; reset so this env is
+    // the one that gets read.
+    resetAuditForTests();
+    process.env.POSTGRES_AUDIT_LOG = "1";
+    initAudit();
+    lines = [];
+    setAuditSinkForTests((line) => {
+      lines.push(line);
+    });
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    resetAuditForTests();
+    for (const name of AUDIT_ENV) {
+      const original = auditEnvSnapshot[name];
+      if (original === undefined) delete process.env[name];
+      else process.env[name] = original;
+    }
+    if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
+    else process.env.ALLOW_WRITES = originalAllowWrites;
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("writes exactly one line per signal call, attributed to pg_kill", async () => {
+    installStub({ rows: [{ signaled: true }] });
+    const res = await killViaWrapper({ pid: PID, mode: "cancel" });
+    assert.notEqual(res.isError, true, `pg_kill itself failed: ${JSON.stringify(res)}`);
+
+    const { entry } = onlyLine();
+    assert.equal(entry.tool, "pg_kill");
+    assert.equal(entry.sql, "SELECT pg_cancel_backend($1) AS signaled");
+    assert.equal(entry.ok, true);
+    assert.equal(entry.rows, 1);
+    // "internal": the server composes this statement and the agent supplies
+    // only a bound value. See the comment at the auditQuery call in admin.ts.
+    assert.equal(entry.source, "internal");
+  });
+
+  it("logs the parameter COUNT and never the pid value", async () => {
+    installStub({ rows: [{ signaled: true }] });
+    await killViaWrapper({ pid: PID, mode: "cancel" });
+
+    const { raw, entry } = onlyLine();
+    assert.equal(entry.params, 1);
+    assert.equal(raw.includes(String(PID)), false, `the pid value reached the audit line: ${raw}`);
+    // The audit wrap must not have changed what is SENT: still one statement,
+    // with the pid bound rather than interpolated into the text.
+    assert.deepEqual(fakeClient.calls, [{ sql: "SELECT pg_cancel_backend($1) AS signaled", params: [PID] }]);
+  });
+
+  it("names pg_terminate_backend on a terminate, so the two modes read differently in the trail", async () => {
+    installStub({ rows: [{ signaled: true }] });
+    await killViaWrapper({ pid: PID, mode: "terminate" });
+    assert.equal(onlyLine().entry.sql, "SELECT pg_terminate_backend($1) AS signaled");
+  });
+
+  // The README quotes both statement texts verbatim. Under
+  // POSTGRES_AUDIT_REDACT the two modes log the same sqlKeyword (SELECT) and
+  // differ only in sqlSha256, so those texts are what an operator hashes to
+  // tell a cancel line from a terminate line -- one character of drift and the
+  // hash they compute matches nothing. The text is taken from what the handler
+  // SENDS, not from a literal here, so a change to the statement in admin.ts
+  // fails this until the README follows.
+  it("README quotes the exact statement text of both modes", async () => {
+    // Runs from dist/tools/, two levels below the repo root.
+    const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
+    for (const mode of ["cancel", "terminate"] as const) {
+      installStub({ rows: [{ signaled: true }] });
+      await killViaWrapper({ pid: PID, mode });
+      const sent = fakeClient.calls[0]!.sql;
+      assert.ok(readme.includes(`\`${sent}\``), `README.md does not quote pg_kill's ${mode} statement: ${sent}`);
+    }
+  });
+
+  // The README says a redacted pg_kill line reads sqlKeyword SELECT in both
+  // modes. resetAuditForTests() + a fresh initAudit() is what makes
+  // POSTGRES_AUDIT_REDACT take effect here; the suite's beforeEach cleared it.
+  it("under POSTGRES_AUDIT_REDACT both modes log SELECT and differ only in the hash", async () => {
+    resetAuditForTests();
+    process.env.POSTGRES_AUDIT_REDACT = "1";
+    initAudit();
+    setAuditSinkForTests((line) => {
+      lines.push(line);
+    });
+
+    const hashes: string[] = [];
+    for (const mode of ["cancel", "terminate"] as const) {
+      lines.length = 0;
+      installStub({ rows: [{ signaled: true }] });
+      await killViaWrapper({ pid: PID, mode });
+      const { entry } = onlyLine();
+      assert.equal("sql" in entry, false, "redaction must drop the statement text");
+      assert.equal(entry.sqlKeyword, "SELECT");
+      assert.equal(entry.sqlSha256, createHash("sha256").update(fakeClient.calls[0]!.sql).digest("hex"));
+      hashes.push(entry.sqlSha256 as string);
+    }
+    assert.notEqual(hashes[0], hashes[1], "cancel and terminate must stay distinguishable under redaction");
+  });
+
+  it("still captures the NOTICE with auditing on, and signaled=false is an ok:true line", async () => {
+    const noticeText = "PID 4191234 is not a PostgreSQL backend process";
+    installStub({ rows: [{ signaled: false }], emitNotices: [noticeText] });
+    const res = await killViaWrapper({ pid: PID, mode: "cancel" });
+
+    const data = res.structuredContent as { signaled: boolean; note: string };
+    assert.equal(data.signaled, false);
+    assert.ok(data.note.includes(noticeText), `the NOTICE was lost from the note: ${data.note}`);
+
+    // postgres answered `false` rather than raising, so the STATEMENT ran. The
+    // line says that and no more -- and the NOTICE text, which quotes the pid,
+    // stays out of it like every other server message.
+    const { raw, entry } = onlyLine();
+    assert.equal(entry.ok, true);
+    assert.equal("sqlstate" in entry, false);
+    assert.equal(raw.includes("PostgreSQL backend process"), false, `NOTICE text reached the audit line: ${raw}`);
+  });
+
+  it("records ok:false with the SQLSTATE when postgres raises, and still returns the error", async () => {
+    const message = "permission denied to terminate process 4191234";
+    installStub({ rows: [], rejectWith: Object.assign(new Error(message), { code: "42501" }) });
+    const res = await killViaWrapper({ pid: PID, mode: "terminate" });
+
+    assert.equal(res.isError, true);
+    assert.ok(res.content[0]!.text.includes("permission denied"), `error text was lost: ${res.content[0]!.text}`);
+
+    const { raw, entry } = onlyLine();
+    assert.equal(entry.tool, "pg_kill");
+    assert.equal(entry.ok, false);
+    assert.equal(entry.sqlstate, "42501");
+    assert.equal(entry.rows, null);
+    assert.equal(raw.includes("permission denied"), false, `the error message reached the audit line: ${raw}`);
+  });
+
+  it("writes no line when the ALLOW_WRITES gate refuses, because no statement is sent", async () => {
+    process.env.ALLOW_WRITES = "0";
+    installStub({ rows: [{ signaled: true }] });
+    const res = await killViaWrapper({ pid: PID, mode: "cancel" });
+    assert.equal(res.isError, true);
+    assert.deepEqual(lines, []);
+    assert.deepEqual(fakeClient.calls, []);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// pg_kill's checkout carries an 'error' listener (#57).
+//
+// pg-pool removes its idle 'error' listener while a client is checked out, and
+// node-pg emits 'error' on the client when its socket dies -- from a socket
+// callback, outside the handler's stack. With no listener that emit is an
+// uncaught exception. 0.13.2 fixed it for every checkout that went through
+// acquireClient(); pg_kill called getPool().connect() itself and was missed.
+// Measured: a connection dropped while pg_kill's query was in flight ended the
+// process 7 of 7, where the same drop under pg_readonly kept serving.
+//
+// A real EventEmitter stands in for the client (as in mcp-wrapper.test.ts)
+// because the makeFakeClient above cannot see this: its `on` ignores every
+// event but `notice`. The assertions are on the LISTENER, not on the tool
+// result: an emit made inside `query` would throw into pg_kill's own catch and
+// come back as the same { ok: false } with or without the fix.
+// ─────────────────────────────────────────────────────────────────────────
+describe("pg_kill's checkout carries an 'error' listener (stubbed connect, no live DB)", () => {
+  class EmitterClient extends EventEmitter {
+    errorListenersDuringQuery = -1;
+    releases = 0;
+    dieMidQuery = false;
+    async query(_sql: string, _params: unknown[]) {
+      this.errorListenersDuringQuery = this.listenerCount("error");
+      if (this.dieMidQuery) {
+        const dead = new Error("Connection terminated unexpectedly");
+        // What node-pg does: fail the query in flight, then emit on the client
+        // from the socket callback -- NOT from inside this call's stack.
+        await new Promise<void>((resolve) => {
+          setImmediate(() => {
+            this.emit("error", dead);
+            resolve();
+          });
+        });
+        throw dead;
+      }
+      return { rows: [{ signaled: true }], rowCount: 1 };
+    }
+    release() {
+      this.releases += 1;
+    }
+  }
+
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalAllowWrites = process.env.ALLOW_WRITES;
+  const originalDbUrl = process.env.DATABASE_URL;
+  const originalError = console.error;
+  let client: EmitterClient;
+  let logged: string[];
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    process.env.ALLOW_WRITES = "1";
+    client = new EmitterClient();
+    logged = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(client);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  });
+
+  afterEach(async () => {
+    console.error = originalError;
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
+    else process.env.ALLOW_WRITES = originalAllowWrites;
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("attached while the signal runs, removed after release, and the NOTICE listener with it", async () => {
+    assert.equal(client.listenerCount("error"), 0);
+    const res = (await pgKill.handler({ pid: 4242, mode: "cancel" })) as { ok: boolean };
+    assert.equal(res.ok, true);
+    assert.equal(client.errorListenersDuringQuery, 1, "no 'error' listener while pg_kill had the client checked out");
+    assert.equal(client.listenerCount("error"), 0, "the 'error' listener outlived the checkout");
+    assert.equal(client.listenerCount("notice"), 0, "the 'notice' listener outlived the checkout");
+    assert.equal(client.releases, 1);
+  });
+
+  it("a socket death mid-signal is logged and returned as an error, not thrown out of the process", async () => {
+    client.dieMidQuery = true;
+    const res = (await pgKill.handler({ pid: 4242, mode: "terminate" })) as { ok: boolean; error?: string };
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /Connection terminated unexpectedly/);
+    assert.deepEqual(logged, [
+      "[postgres-mcp] connection error on a checked-out client: Connection terminated unexpectedly",
+    ]);
+    assert.equal(client.releases, 1, "the dead client must still be handed back so the pool can drop it");
+    assert.equal(client.listenerCount("error"), 0);
+  });
+});
+
+// The structural half of #57: acquireClient() is the only place a client may be
+// checked out, because it is the only place the 'error' listener is attached.
+// pg_kill was the one raw checkout, found by grep after the fact; this makes the
+// next one fail here instead. Comment lines are skipped -- several explain the
+// rule by naming the call.
+//
+// Runs from dist/tools/, two levels below the repo root.
+describe("getPool().connect() appears only inside acquireClient", () => {
+  it("no non-test source file checks a client out of the pool on its own", () => {
+    const srcRoot = new URL("../../src/", import.meta.url);
+    const offenders: string[] = [];
+    let inApi = 0;
+    for (const entry of readdirSync(srcRoot, { recursive: true, encoding: "utf8" })) {
+      const rel = entry.replaceAll("\\", "/");
+      if (!rel.endsWith(".ts") || rel.endsWith(".test.ts") || rel.startsWith("integration/")) continue;
+      const lines = readFileSync(new URL(rel, srcRoot), "utf8").split("\n");
+      lines.forEach((line, i) => {
+        const code = line.trim();
+        if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) return;
+        if (!/\bgetPool\(\)\s*\.connect\(/.test(code)) return;
+        if (rel === "api.ts") inApi += 1;
+        else offenders.push(`${rel}:${i + 1}`);
+      });
+    }
+    assert.deepEqual(offenders, [], "a raw pool checkout has no 'error' listener -- go through acquireClient()");
+    assert.equal(inApi, 1, "expected exactly one checkout in api.ts (acquireClient); the scan may be broken");
+  });
+});
+
+// pg_kill's agent-facing contract (#56). The description is what an agent plans
+// from, and it promised a shape the tool never returns: a permission denial as
+// `signaled: false` plus a NOTICE. Postgres raises 42501 for that, on every
+// version this server supports.
+describe("pg_kill says what a permission denial and a `false` really are", () => {
+  it("the description names 42501 as an error and no longer quotes the ERROR text as a NOTICE", () => {
+    assert.match(pgKill.description, /42501/);
+    assert.doesNotMatch(pgKill.description, /must be a member/);
+    assert.doesNotMatch(pgKill.description, /three-way/);
+    // `true` is "sent", not "stopped": measured -- a session idle in a
+    // transaction ignored the cancel on 15, 17 and 18.
+    assert.match(pgKill.description, /SENT/);
+  });
+});
+
+describe("pg_kill fallback note (stubbed connect, no live DB)", () => {
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalAllowWrites = process.env.ALLOW_WRITES;
+  const originalDbUrl = process.env.DATABASE_URL;
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    process.env.ALLOW_WRITES = "1";
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
+    else process.env.ALLOW_WRITES = originalAllowWrites;
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("a `false` with no warning captured does not send the agent looking for a grant", async () => {
+    const fake = makeFakeClient({ rows: [{ signaled: false }] });
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(fake);
+    } as unknown as typeof pg.Pool.prototype.connect;
+    const res = (await pgKill.handler({ pid: 9999, mode: "cancel" })) as { ok: boolean; data: { note: string } };
+    assert.equal(res.ok, true);
+    assert.match(res.data.note, /found no backend with PID 9999/);
+    // Missing permission can never be why postgres answered `false`.
+    assert.doesNotMatch(res.data.note, /permission/i);
   });
 });
 

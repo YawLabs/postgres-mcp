@@ -1765,8 +1765,8 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
     // Nonexistent-PID path: the tool wraps the postgres function's boolean
     // return in a `note` that explains why a `false` came back. v0.6.13
-    // captures pg's NOTICE channel so the note is specific ("not a
-    // PostgreSQL server process") rather than the generic three-way list.
+    // captures pg's notice channel (postgres sends this one as a WARNING, which
+    // node-pg delivers on the same event) so the note is postgres's own words.
     // We exercise with PID 1 -- guaranteed not to be a postgres backend.
     it("returns signaled=false with a NOTICE-derived note for a PID that is not a postgres backend", async () => {
       const original = process.env.ALLOW_WRITES;
@@ -1786,9 +1786,13 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         // running postgres doesn't emit one at all.
         assert.match(
           res.data?.note ?? "",
-          /not a PostgreSQL (backend|server) process|may not exist|lacks permission/i,
+          /not a PostgreSQL (backend|server) process|found no backend/i,
           `expected a notice-derived or fallback note, got ${JSON.stringify(res.data?.note)}`,
         );
+        // A `false` is never a permission problem -- postgres raises for those
+        // (the test below) -- so the note must not send the agent looking for a
+        // grant. It did until #56.
+        assert.doesNotMatch(res.data?.note ?? "", /permission/i);
         // The PID must appear somewhere in the note so the caller can
         // correlate even if multiple pg_kill calls are in flight.
         assert.match(res.data?.note ?? "", /\b1\b/, `note must reference PID 1, got ${JSON.stringify(res.data?.note)}`);
@@ -1887,6 +1891,82 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         }
         if (original === undefined) delete process.env.ALLOW_WRITES;
         else process.env.ALLOW_WRITES = original;
+      }
+    });
+
+    // The denied path (#56). The tool's description, its schema comment and its
+    // handler comment all said a permission denial comes back as `signaled:
+    // false` plus a NOTICE. Postgres RAISES instead -- 42501, in every branch of
+    // signalfuncs.c on 15 through 18 -- so it is an error response, and the
+    // target is untouched.
+    //
+    // No fixture role is needed: POSTGRES_POOL_MAX=1 makes the pool a single
+    // connection, `SET ROLE pg_monitor` on it sticks for the session, and
+    // pg_kill then runs as a role that is neither a superuser nor a member of
+    // pg_signal_backend, aimed at a superuser's backend. That is postgres's
+    // NOSUPERUSER branch; the NOPERMISSION one (another non-superuser's
+    // backend) needs a second login role and raises the same SQLSTATE.
+    it("a signal the role may not send is an ERROR with 42501, and the target keeps running", async (t) => {
+      const probe = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await probe.connect();
+      const isSuper = (
+        await probe.query<{ rolsuper: boolean }>("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+      ).rows[0]?.rolsuper;
+      if (isSuper !== true) {
+        await probe.end();
+        t.skip("DATABASE_URL is not a superuser, so SET ROLE pg_monitor is not available to stage the denial");
+        return;
+      }
+
+      const originalWrites = process.env.ALLOW_WRITES;
+      const originalPoolMax = process.env.POSTGRES_POOL_MAX;
+      const sideClient = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await sideClient.connect();
+      let targetPid: number | undefined;
+      try {
+        process.env.ALLOW_WRITES = "1";
+        process.env.POSTGRES_POOL_MAX = "1";
+        await shutdown();
+
+        targetPid = (await sideClient.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
+        const sleepPromise = sideClient.query("SELECT pg_sleep(30)").catch((e: unknown) => e);
+        await waitForActiveSleep(targetPid);
+
+        const setRole = await runInternal("SET ROLE pg_monitor");
+        assert.equal(setRole.ok, true, `could not stage the unprivileged role: ${setRole.error}`);
+        const who = await runInternal<{ current_user: string }>("SELECT current_user");
+        assert.equal(who.data?.[0]?.current_user, "pg_monitor", "the single pooled connection did not keep the role");
+
+        for (const mode of ["cancel", "terminate"] as const) {
+          const res = (await pgKill.handler({ pid: targetPid, mode })) as {
+            ok: boolean;
+            error?: string;
+            data?: unknown;
+          };
+          assert.equal(res.ok, false, `${mode}: a denied signal must be an error, got ${JSON.stringify(res)}`);
+          assert.match(res.error ?? "", /\(code: 42501\)/, `${mode}: expected SQLSTATE 42501, got: ${res.error}`);
+          assert.equal(res.data, undefined, `${mode}: an error response carries no signaled/note payload`);
+        }
+
+        // Still sleeping: neither denied signal reached it.
+        const still = await probe.query<{ n: number }>(
+          "SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = $1 AND state = 'active' AND query LIKE '%pg_sleep%'",
+          [targetPid],
+        );
+        assert.equal(still.rows[0]?.n, 1, "the target was disturbed by a signal postgres refused");
+
+        await probe.query("SELECT pg_cancel_backend($1)", [targetPid]);
+        assert.ok((await sleepPromise) instanceof Error, "the cleanup cancel (as a superuser) should have landed");
+      } finally {
+        // The pooled connection is pg_monitor. Drop it rather than hand it on:
+        // shutdown() ends the pool, and the next caller builds a fresh one.
+        await shutdown();
+        if (originalPoolMax === undefined) delete process.env.POSTGRES_POOL_MAX;
+        else process.env.POSTGRES_POOL_MAX = originalPoolMax;
+        if (originalWrites === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = originalWrites;
+        await sideClient.end().catch(() => {});
+        await probe.end().catch(() => {});
       }
     });
   });

@@ -395,6 +395,35 @@ export function formatPgError(err: unknown): string {
 }
 
 /**
+ * The SQLSTATEs with which postgres says "this statement cannot be a cursor",
+ * and so the only DECLARE failures that may fall back to a direct run.
+ *
+ * Measured on PostgreSQL 15, 17 and 18 over 69 statement classes, identical on
+ * all three: `42601` for everything the DECLARE grammar rejects (DDL, DML with
+ * or without RETURNING, MERGE, EXPLAIN, SHOW, SET, utility commands, a
+ * multi-statement string, an empty one), and `0A000` for a data-modifying CTE.
+ * Every other DECLARE failure in that set -- 42P01, 42703, 42883, 22012, 42P18,
+ * 08P01 -- failed the same way on a direct run, so rethrowing it changes no
+ * outcome.
+ *
+ * It used to be "any DECLARE failure", which also caught the failures that are
+ * about the ATTEMPT and not the statement. DECLARE plans the query and locks
+ * every relation it reads, so a statement blocked on a table lock is blocked
+ * inside DECLARE -- and a cancel (57014) landing there was swallowed: the SQL
+ * was sent again, outside the row cap, and the caller later got rows back from
+ * a query that had been cancelled. A statement timeout got a second full
+ * timeout the same way (3000 ms configured, 6003 ms measured), and a terminate
+ * had its 57P01 replaced by the error of a ROLLBACK TO sent down the dead
+ * socket, leaving the audit line with no SQLSTATE.
+ */
+const NOT_CURSORABLE_SQLSTATES: ReadonlySet<string> = new Set(["42601", "0A000"]);
+
+function isNotCursorable(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && NOT_CURSORABLE_SQLSTATES.has(code);
+}
+
+/**
  * Run user SQL with a memory-bounded fetch.
  *
  * Without this wrapper, node-pg materializes the entire result set into
@@ -407,12 +436,11 @@ export function formatPgError(err: unknown): string {
  * fetch only `maxRows + 1` rows, close the cursor. Postgres now does the
  * heavy lifting and we never hold more than the response size in Node.
  *
- * Not every statement is cursorable -- DDL, DML without RETURNING, and
- * a few utility commands fail at DECLARE with SQLSTATE 0A000. We wrap
- * the attempt in a SAVEPOINT so a DECLARE failure doesn't abort the
- * outer transaction; on the fallback path we execute the SQL directly,
- * accepting that those statements never produce a runaway result set
- * anyway (DDL returns no rows, DML without RETURNING returns no rows).
+ * Not every statement is cursorable -- DECLARE only takes a SELECT-shaped
+ * statement. We wrap the attempt in a SAVEPOINT so a DECLARE failure doesn't
+ * abort the outer transaction; on the fallback path we execute the SQL
+ * directly, accepting that those statements never produce a runaway result
+ * set anyway (DDL returns no rows, DML without RETURNING returns no rows).
  */
 async function runUserQueryBounded(
   client: pg.PoolClient,
@@ -422,11 +450,11 @@ async function runUserQueryBounded(
 ): Promise<{ result: pg.QueryResult; viaCursor: boolean }> {
   await client.query("SAVEPOINT __pgmcp_sp");
   // Track where in the pipeline we are. If DECLARE itself fails the user SQL
-  // has not executed yet, so falling through to a direct exec is safe -- it's
-  // either non-cursorable (DDL / DML-without-RETURNING / utility) and will
-  // succeed, or genuinely bad and will surface the same error. If DECLARE
-  // succeeded and a later step (FETCH / CLOSE / RELEASE) threw, the user SQL
-  // already ran; re-running it could double-execute side effects.
+  // has not executed yet, so a direct exec cannot double-execute anything --
+  // but it is only RIGHT when postgres said the statement cannot be a cursor
+  // (see NOT_CURSORABLE_SQLSTATES). If DECLARE succeeded and a later step
+  // (FETCH / CLOSE / RELEASE) threw, the user SQL already ran; re-running it
+  // could double-execute side effects.
   let declareSucceeded = false;
   try {
     await client.query({
@@ -454,10 +482,16 @@ async function runUserQueryBounded(
       // instead of silently re-executing the statement.
       throw err;
     }
-    // DECLARE failed before any user SQL ran. Roll back the savepoint and
-    // retry on the direct-exec path; postgres rejects DECLARE on DDL with
-    // 0A000 (feature_not_supported) and on DML-without-RETURNING with
-    // 42601 (parse error), so a single broad fallback covers both.
+    if (!isNotCursorable(err)) {
+      // DECLARE failed for a reason that is not about cursorability: a cancel
+      // or timeout, a terminate, a deadlock, a dead socket, or a statement that
+      // is simply wrong. Surface THAT error, once. Sending the SQL again would
+      // swallow the interrupt, and nothing more may be sent on this connection
+      // if it is gone -- the caller's transaction cleanup handles both.
+      throw err;
+    }
+    // Not cursorable, and no user SQL has run. Roll back the savepoint and
+    // retry on the direct-exec path.
     await client.query("ROLLBACK TO SAVEPOINT __pgmcp_sp");
     await client.query("RELEASE SAVEPOINT __pgmcp_sp");
     // Direct exec: the command tag postgres returns here IS the user's
@@ -637,8 +671,16 @@ const HOOK_SAVEPOINT = "__pgmcp_hooks";
  * marked the client unqueryable, and pg-pool destroys an unqueryable client on
  * release, so there is nothing else for it to do. `release(err)` destroys the
  * client instead of pooling it, for a caller that left session state behind.
+ *
+ * This is the ONLY place a client may be checked out. It is exported for the
+ * one tool that needs the raw client rather than a runner -- pg_kill, whose
+ * NOTICE listener has to sit on the connection the signal runs on. pg_kill
+ * used to call `getPool().connect()` itself and so had no listener: a
+ * connection that dropped during its round trip ended the process (7 of 7),
+ * where the same drop under pg_readonly returned an error and kept serving. A
+ * test pins `getPool().connect()` to this function.
  */
-interface Checkout {
+export interface Checkout {
   client: pg.PoolClient;
   /** Hand the connection back, or destroy it when a reason is given. */
   release: (discard?: Error) => void;
@@ -649,7 +691,7 @@ interface Checkout {
   expectClose: () => void;
 }
 
-async function acquireClient(): Promise<Checkout> {
+export async function acquireClient(): Promise<Checkout> {
   const client = await getPool().connect();
   let closeExpected = false;
   const onError = (err: Error): void => {
