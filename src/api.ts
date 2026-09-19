@@ -25,7 +25,9 @@
  *   - POSTGRES_AUDIT_LOG                   - "1", "true", or "stderr" to write one JSON line per
  *                                            statement to stderr (default: off). Bound parameter
  *                                            VALUES are never logged in any mode -- only their
- *                                            count. See audit.ts.
+ *                                            count. The server refuses to start on an empty or
+ *                                            unrecognized value rather than read it as off.
+ *                                            See audit.ts.
  *   - POSTGRES_AUDIT_LOG_FILE              - append the audit lines to this path instead of stderr.
  *                                            Setting it alone turns auditing on. The server refuses
  *                                            to start when the file cannot be opened, rather than
@@ -33,6 +35,9 @@
  *   - POSTGRES_AUDIT_REDACT                - "1" or "true" to log each statement's first keyword
  *                                            plus a sha256 of its text instead of the SQL, for
  *                                            operators who want the trail without the literals.
+ *                                            An empty or unrecognized value stops the server too,
+ *                                            even with auditing off: read as off, it would log
+ *                                            full SQL.
  *
  * Safety model:
  *   User-provided SQL runs in a `BEGIN READ ONLY` transaction by default, so
