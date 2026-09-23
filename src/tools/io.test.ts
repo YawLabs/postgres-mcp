@@ -195,8 +195,22 @@ describe("pg_io_stats (stubbed connect, no live DB)", () => {
     assert.equal(seen.length, 0);
   });
 
-  it("probe failure (0 sentinel): says 'could not be determined', not 'too old'", async () => {
+  it("probe threw: reports the probe's own failure, not a version verdict", async () => {
     installStub(null);
+    const res = (await pgIoStats.handler({})) as { ok: boolean; error?: string };
+    assert.equal(res.ok, false);
+    // The server was never asked, so neither "too old" nor "could not be
+    // determined, retry" is the remediation: the cause is the error the probe
+    // hit (a refused connection, a timeout), and the agent gets it as it would
+    // from any other tool (#42, found in review).
+    assert.match(res.error ?? "", /version probe unavailable/);
+    assert.doesNotMatch(res.error ?? "", /PostgreSQL 16 or newer|could not be determined/);
+    assert.equal(connectCalls, 0);
+    assert.equal(seen.length, 0);
+  });
+
+  it("probe answered nonsense (0 sentinel): says 'could not be determined', not 'too old'", async () => {
+    installStub(Number.NaN);
     const res = (await pgIoStats.handler({})) as { ok: boolean; error?: string };
     assert.equal(res.ok, false);
     // The two remediations differ -- "upgrade the server" vs "retry" -- so

@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent SQL that never ran now leaves an audit line (#42).** Whether a call
+  that failed before its statement was sent wrote a line depended on which
+  helper it went through. `runInternal` connects inside its audited step, so
+  a refused connection wrote an `internal` line with `ok: false` and
+  `sqlstate: "ECONNREFUSED"` for every tool that starts with a catalog query.
+  The three runners behind agent SQL checked the connection out, opened the
+  transaction and ran any hooks BEFORE the audited step, so `pg_query`,
+  `pg_readonly` and `pg_explain` -- the tools the trail exists for -- wrote
+  nothing, and so did `pg_kill`, whose checkout sat before its audit too.
+  Measured by calling all 23 tools over stdio against
+  `postgres://u:p@127.0.0.1:1/x` with `POSTGRES_AUDIT_LOG=stderr` (24 calls;
+  `pg_explain` once plain and once with `hypothetical_indexes`): 13 lines,
+  none of them `user`, and 11 calls with no line at all. An operator asking
+  "what did the agent try to run during the outage" found nothing for
+  exactly the tools that carry agent SQL. The same shape hid a failed
+  `BEGIN` and a hook setup that threw: a `pg_explain` whose hypothetical
+  index could not be created never ran its statement, and its only line was
+  the HypoPG-installed check, with `ok: true`. The checkout, the `BEGIN`, the
+  hook savepoint and the hypothetical-index setup now sit inside the
+  statement's audited span, so whichever of them fails writes the
+  statement's one `user` line: `ok: false`, the agent's `sql` (its keyword
+  and hash under `POSTGRES_AUDIT_REDACT`), `params` as a count, the `tool`,
+  and the code where there is one -- the Node code for a refused or
+  unresolvable connection, none for a connect timeout or a missing
+  `DATABASE_URL`, the SQLSTATE for a `BEGIN` or a setup the server refused
+  (`42P01` for a hypothetical index on a table that does not exist). Never
+  two: the span is one wrapper and nothing inside it audits on its own, so a
+  statement that is sent and fails writes exactly the line it always did.
+  `pg_kill`'s signal statement gets the same treatment. Review of the fix
+  found two more silent paths with the same shape. `pg_explain` with a
+  version-floored option (`settings`, `wal`, `generic_plan`, `memory`,
+  `serialize`, `buffers` without `analyze`) probes `server_version_num`
+  before composing its statement, the probe swallowed every failure into its
+  "assume oldest" sentinel, and the gate then answered "the server version
+  could not be determined ... drop the option and re-run" with no line
+  written -- the wrong remediation for an outage, and the same unaudited
+  probe is what six other tools ran first. The probe is now an `internal`
+  line like the catalog SQL `runInternal` sends: once per successful
+  reading, which is then cached for the life of the process (calls that
+  race the first reading share one probe and one line), and on every probing
+  call while the server is unreachable, since a failure is not cached. And
+  the two gates that turn the sentinel into an error, `pg_explain`'s and
+  `pg_io_stats`'s, now report the probe's own failure when it threw (`connect
+  ECONNREFUSED ...`, `DATABASE_URL is not set`), keeping "could not be
+  determined" for a server that answered something unparsable. The second
+  path: the seven tools that run several catalog queries on one shared
+  connection (`pg_describe_table`, `pg_health`, `pg_advisor`,
+  `pg_replication_status`, `pg_seq_scan_tables`, `pg_unused_indexes`,
+  `pg_io_stats`) checked that connection out before composing their first
+  statement, so once the version was cached -- an outage that begins
+  mid-session, the case the trail exists for -- a refused connection wrote
+  nothing for any of them. `withSharedClient` now checks the connection out
+  inside its first statement's audited step, so the refusal is that
+  statement's `ok: false` line; statements waiting on the same checkout, or
+  issued after it failed, fail with the same error and write nothing, and
+  the failure still propagates as the exception every caller handles. The
+  same 24 calls now write 30 lines (a tool that probes and then queries logs
+  a failed probe and then its failed first statement), three of them `user`,
+  and no call is silent; with the version cached beforehand, each of the
+  seven writes its first statement's line. The README's "Audit logging"
+  section says which line each tool writes for a refused connection -- for
+  `pg_explain` that is the `EXPLAIN` itself unless a version-floored option
+  or `hypothetical_indexes` was passed, when the probe's or the HypoPG
+  check's line is the record and the `EXPLAIN` text is not on it. Two things
+  follow for readers of the trail. `ms` on a `user` line (and on `pg_kill`'s)
+  now runs from the checkout to the statement's completion, so it includes
+  waiting for a pooled connection and the transaction setup, as `internal`
+  lines already could. And a refused connection comes back from
+  `runReadOnly`, `runReadWrite`, `runReadWriteRollback` and `pg_kill`'s
+  handler as `{ok: false}` like every other failure, where it used to
+  propagate as an exception; over MCP that is the same `isError` envelope,
+  its message now ending in the code, `(code: ECONNREFUSED)`. Tests drive
+  each of the three runners against a pool whose `connect()` rejects and
+  against a client whose `BEGIN` is refused, `runReadOnly` against a connect
+  timeout, a missing `DATABASE_URL` and a hook setup that throws, `pg_query`
+  and `pg_readonly` through the MCP wrapper for the `tool` tag, `pg_kill`
+  against a rejecting `connect()`, `pg_explain` against a stubbed server that
+  refuses `hypopg_create_index` and against a probe that fails, the probe
+  itself for its shared, once-per-reading line, `withSharedClient` for the
+  first statement's line under a fan-out, and each of the seven
+  shared-connection tools with the version cached and the connection then
+  refused; every fake client also records when it was released, so the
+  restructured release paths are checked against their last statement.
+
 ## [0.13.4] - 2026-09-18
 
 ### Security

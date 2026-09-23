@@ -377,7 +377,8 @@ export const healthTools = [
         // This path only covers per-catalog-query permission/visibility
         // failures (one of the six fanout queries erroring while the
         // connection is fine). Broad connectivity loss never reaches here --
-        // it throws out of getPool().connect() inside withSharedClient and is
+        // it throws out of the first statement's checkout inside
+        // withSharedClient (after writing that statement's audit line) and is
         // caught upstream in mcp-wrapper.
         //
         // Every check below is an independent `if`, never an early return:

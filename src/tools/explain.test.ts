@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import pg from "pg";
 import { shutdown } from "../api.js";
+import { initAudit, resetAuditForTests, setAuditSinkForTests } from "../audit.js";
 import { explainTools } from "./explain.js";
 
 const [pgExplain] = explainTools;
@@ -230,9 +231,7 @@ describe("pg_explain planner option dependencies", () => {
     // Not rejected by the dependency guard and not version-gated, so the
     // handler runs on to the connection -- which is the observable proof it
     // passed validation. See withoutDatabaseUrl below for the mechanism.
-    await withoutDatabaseUrl(() =>
-      assert.rejects(() => pgExplain.handler({ sql: "SELECT 1", costs: false }), /DATABASE_URL is not set/),
-    );
+    await withoutDatabaseUrl(() => assertReachedConnection({ costs: false }));
   });
 
   it("rejects generic_plan combined with analyze", async () => {
@@ -320,9 +319,16 @@ describe("pg_explain server-version gating", () => {
     { name: "buffers without analyze", input: { buffers: true }, version: /PostgreSQL 13\+/ },
   ];
 
+  // The 0 sentinel WITHOUT a probe failure: the server answered, with
+  // something that is not a version. (A probe that threw no longer reaches the
+  // gate's own wording -- the handler reports the probe's error instead, see
+  // the case below -- so an unset DATABASE_URL cannot stand in for "unknown
+  // version" here as it used to.)
+  const unknownVersion = <T>(fn: () => Promise<T>) => withStubbedServer(Number.NaN, fn);
+
   for (const c of cases) {
     it(`rejects \`${c.name}\` when the server version is unknown, naming the required version`, async () => {
-      const result = (await withoutDatabaseUrl(() => pgExplain.handler({ sql: "SELECT 1", ...c.input }))) as {
+      const result = (await unknownVersion(() => pgExplain.handler({ sql: "SELECT 1", ...c.input }))) as {
         ok: boolean;
         error?: string;
       };
@@ -333,7 +339,7 @@ describe("pg_explain server-version gating", () => {
   }
 
   it("reports that the version could not be determined rather than inventing one", async () => {
-    const result = (await withoutDatabaseUrl(() => pgExplain.handler({ sql: "SELECT 1", generic_plan: true }))) as {
+    const result = (await unknownVersion(() => pgExplain.handler({ sql: "SELECT 1", generic_plan: true }))) as {
       ok: boolean;
       error?: string;
     };
@@ -341,7 +347,7 @@ describe("pg_explain server-version gating", () => {
   });
 
   it("names every unsupported option at once", async () => {
-    const result = (await withoutDatabaseUrl(() =>
+    const result = (await unknownVersion(() =>
       pgExplain.handler({ sql: "SELECT 1", analyze: true, wal: true, memory: true }),
     )) as { ok: boolean; error?: string };
     assert.equal(result.ok, false);
@@ -349,33 +355,52 @@ describe("pg_explain server-version gating", () => {
     assert.match(result.error ?? "", /`memory` requires PostgreSQL 17\+/);
   });
 
+  it("reports the probe's own failure, not a version verdict, when the probe threw", async () => {
+    // With DATABASE_URL unset the probe throws before reaching any server.
+    // Telling the agent to drop `settings` and re-run would send it back into
+    // the same failure with one option fewer; the cause is what it needs
+    // (#42, found in review).
+    const result = (await withoutDatabaseUrl(() => pgExplain.handler({ sql: "SELECT 1", settings: true }))) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /DATABASE_URL is not set/);
+    assert.doesNotMatch(result.error ?? "", /requires PostgreSQL|could not be determined|Drop the option/);
+  });
+
   it("does NOT gate the pre-existing options when the version probe fails", async () => {
     // A probe of 0 must not block analyze/format/params -- those work on every
     // supported server. Reaching the connection attempt is the proof: the
     // handler got past validation and tried to run the EXPLAIN.
-    await withoutDatabaseUrl(() =>
-      assert.rejects(
-        () => pgExplain.handler({ sql: "SELECT 1", analyze: true, format: "json" }),
-        /DATABASE_URL is not set/,
-      ),
-    );
+    await withoutDatabaseUrl(() => assertReachedConnection({ analyze: true, format: "json" }));
   });
 
   it("does NOT gate the analyze-implied BUFFERS default", async () => {
     // `buffers` defaults to true under analyze, and BUFFERS *with* ANALYZE has
     // no version floor -- so the new default can never trip the PG13 gate,
     // which only covers BUFFERS without ANALYZE.
-    await withoutDatabaseUrl(() =>
-      assert.rejects(() => pgExplain.handler({ sql: "SELECT 1", analyze: true }), /DATABASE_URL is not set/),
-    );
+    await withoutDatabaseUrl(() => assertReachedConnection({ analyze: true }));
   });
 
   it("does NOT gate a plain EXPLAIN with buffers omitted", async () => {
-    await withoutDatabaseUrl(() =>
-      assert.rejects(() => pgExplain.handler({ sql: "SELECT 1" }), /DATABASE_URL is not set/),
-    );
+    await withoutDatabaseUrl(() => assertReachedConnection({}));
   });
 });
+
+/**
+ * Asserts the handler got past validation and asked for a connection. Under
+ * withoutDatabaseUrl the first thing after validation is the pool refusing
+ * to build, and that failure comes back as the call's `{ok: false}` -- the
+ * checkout sits inside the statement's audited span and is returned like any
+ * other failure (#42). It used to propagate as a rejection, which is what
+ * these cases asserted on.
+ */
+async function assertReachedConnection(input: Record<string, unknown>): Promise<void> {
+  const result = (await pgExplain.handler({ sql: "SELECT 1", ...input })) as { ok: boolean; error?: string };
+  assert.equal(result.ok, false, `expected the connection attempt to fail, got ${JSON.stringify(result)}`);
+  assert.match(result.error ?? "", /DATABASE_URL is not set/);
+}
 
 /** One statement the fake client saw, with the values bound to it. */
 interface StubStatement {
@@ -1345,5 +1370,85 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
       undefined,
       { failWhen: (sql) => sql === "SAVEPOINT __pgmcp_hooks" },
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// A hypothetical index that cannot be created still leaves the EXPLAIN's
+// audit line (#42).
+//
+// Setup runs inside the transaction, before the statement. When it threw, the
+// EXPLAIN never ran and the call's only line was the ok:true HypoPG-installed
+// check -- nothing recorded that the call failed, or what it had asked to
+// explain. Measured on PostgreSQL 17 with an index on a missing table: five
+// statements sent, an error returned, one ok:true line. The setup now sits
+// inside the statement's audited span (api.ts), so the call writes that check
+// AND the EXPLAIN's ok:false line, carrying the setup failure's SQLSTATE.
+// ─────────────────────────────────────────────────────────────────────────
+describe("pg_explain audit line when the hypothetical-index setup fails (stubbed server)", () => {
+  const AUDIT_ENV = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
+  let snapshot: Record<string, string | undefined> = {};
+  let lines: string[] = [];
+
+  beforeEach(() => {
+    snapshot = {};
+    for (const name of AUDIT_ENV) {
+      snapshot[name] = process.env[name];
+      delete process.env[name];
+    }
+    // api.ts ran initAudit() at import with auditing off; reset so this env
+    // is the one that gets read, and capture the lines instead of writing
+    // them to stderr.
+    resetAuditForTests();
+    process.env.POSTGRES_AUDIT_LOG = "1";
+    initAudit();
+    lines = [];
+    setAuditSinkForTests((line) => {
+      lines.push(line);
+    });
+  });
+
+  afterEach(() => {
+    resetAuditForTests();
+    for (const name of AUDIT_ENV) {
+      const original = snapshot[name];
+      if (original === undefined) delete process.env[name];
+      else process.env[name] = original;
+    }
+  });
+
+  it("writes the EXPLAIN's ok:false line with the setup failure's SQLSTATE, after the HypoPG check", async () => {
+    const sql = "SELECT * FROM orders WHERE id = 42";
+    const { result, session } = await withStubbedServer(
+      170_000,
+      async (session) => {
+        const result = (await pgExplain.handler({
+          sql,
+          hypothetical_indexes: [{ table: "orders", columns: ["id"] }],
+        })) as { ok: boolean; error?: string };
+        return { result, session };
+      },
+      undefined,
+      // hypopg_create_index on a table that does not exist: the server
+      // refuses the CREATE INDEX text with 42P01.
+      { refuseWith: (s) => (s.includes("hypopg_create_index") ? "42P01" : undefined) },
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /42P01/);
+    assert.equal(session.explainSql(), "", "sanity: the EXPLAIN never went out");
+
+    const entries = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.equal(entries.length, 2, `expected the HypoPG check and the EXPLAIN's line, got ${JSON.stringify(lines)}`);
+    const [check, explain] = entries as [Record<string, unknown>, Record<string, unknown>];
+    assert.equal(check.source, "internal");
+    assert.equal(check.ok, true);
+    assert.match(String(check.sql), /hypopg/);
+    assert.equal(explain.source, "user");
+    assert.match(String(explain.sql), /^EXPLAIN/, "the composed statement, as the user line always carries it");
+    assert.ok(String(explain.sql).includes(sql), `the agent's SQL is on the line: ${String(explain.sql)}`);
+    assert.equal(explain.ok, false);
+    assert.equal(explain.rows, null);
+    assert.equal(explain.sqlstate, "42P01");
+    assert.equal(explain.params, 0);
   });
 });

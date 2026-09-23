@@ -1,7 +1,9 @@
 import { z } from "zod";
 import {
   type ApiResponse,
+  formatPgError,
   getServerVersionNum,
+  getVersionProbeFailure,
   isWritesAllowed,
   PG12,
   PG13,
@@ -451,6 +453,16 @@ export const explainTools = [
         const serverVersion = await getServerVersionNum();
         const unsupported = gated.filter((g) => serverVersion < g.min);
         if (unsupported.length > 0) {
+          // A probe that threw is not a version answer, and the option is not
+          // the problem: the server never got to judge it. Report the cause
+          // the agent can act on -- a refused connection, a timeout, an unset
+          // DATABASE_URL -- as any other tool would, instead of "drop the
+          // option and re-run", which sends it back into the same outage with
+          // one option fewer (#42). The sentinel without a failure is a server
+          // that answered something unparsable; that one still reads as
+          // "could not be determined" below.
+          const probeFailure = serverVersion === 0 ? getVersionProbeFailure() : undefined;
+          if (probeFailure !== undefined) return { ok: false, error: formatPgError(probeFailure) };
           const server =
             serverVersion === 0
               ? "the server version could not be determined, so the oldest supported behavior is assumed"
