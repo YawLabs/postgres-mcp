@@ -37,7 +37,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { closeSync, openSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, openSync, writeSync } from "node:fs";
 
 /**
  * `internal` marks catalog/introspection SQL this server composes itself;
@@ -183,6 +183,18 @@ export function initAudit(): void {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(
         `[postgres-mcp] audit log file ${JSON.stringify(config.file)} could not be opened for append: ${message}. ` +
+          "Refusing to start: degrading to no audit trail leaves the operator believing one exists.",
+      );
+    }
+    // On Windows, openSync(dir, "a") succeeds and returns a valid fd -- the
+    // error only surfaces on the first writeSync as EISDIR. Check via fstat on
+    // the fd we already hold (not reopen-by-path, which reintroduces the
+    // rename race the comment above describes). Reject directories; allow
+    // regular files, FIFOs, and character devices (e.g. /dev/stderr).
+    if (fstatSync(fd).isDirectory()) {
+      closeSync(fd);
+      throw new Error(
+        `[postgres-mcp] audit log path ${JSON.stringify(config.file)} is a directory, not a file. ` +
           "Refusing to start: degrading to no audit trail leaves the operator believing one exists.",
       );
     }
