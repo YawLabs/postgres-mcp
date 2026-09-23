@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   acquireClient,
+  type Checkout,
   formatPgError,
   getServerVersionNum,
   isWritesAllowed,
@@ -525,17 +526,22 @@ export const adminTools = [
       // acquireClient(), not getPool().connect(): the raw client is needed for
       // the listener below, but a checked-out client with no `error` listener
       // ends the process if its socket dies mid-query (#57).
-      const { client, release } = await acquireClient();
+      //
+      // The checkout sits INSIDE the audited call, as it does for agent SQL in
+      // api.ts (#42): the statement is known before the connection is asked
+      // for, so a pool that refuses one still leaves this statement's
+      // `ok: false` line. With the checkout before the audit, a pg_kill
+      // against an unreachable server wrote nothing.
+      const sql = `SELECT ${fn}($1) AS signaled`;
+      const params = [pid];
       const notices: string[] = [];
       const onNotice = (n: { message?: string }) => {
         if (n.message) notices.push(n.message);
       };
-      client.on("notice", onNotice);
+      let checkout: Checkout | undefined;
       try {
-        const sql = `SELECT ${fn}($1) AS signaled`;
-        const params = [pid];
         // Audited in place, not through runInternal / withSharedClient: neither
-        // hands back the client, and the NOTICE listener above has to sit on
+        // hands back the client, and the NOTICE listener below has to sit on
         // the connection the signal runs on. Without this the one tool whose
         // whole purpose is to affect OTHER sessions left no line at all.
         //
@@ -553,7 +559,11 @@ export const adminTools = [
         // start.
         const result = await auditQuery(
           { source: "internal", sql, paramCount: params.length },
-          () => client.query<{ signaled: boolean }>(sql, params),
+          async () => {
+            checkout = await acquireClient();
+            checkout.client.on("notice", onNotice);
+            return checkout.client.query<{ signaled: boolean }>(sql, params);
+          },
           (r) => r.rowCount ?? r.rows.length,
         );
         const signaled = result.rows[0]?.signaled === true;
@@ -574,8 +584,10 @@ export const adminTools = [
       } catch (err) {
         return { ok: false, error: formatPgError(err) };
       } finally {
-        client.off("notice", onNotice);
-        release();
+        if (checkout !== undefined) {
+          checkout.client.off("notice", onNotice);
+          checkout.release();
+        }
       }
     },
   },

@@ -265,6 +265,28 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
     assert.equal(entry.source, "internal");
   });
 
+  it("a refused connection still writes the signal statement's ok:false line (#42)", async () => {
+    // The checkout sits inside the audited call, so a pool that refuses a
+    // connection leaves the line for the statement that never went out. With
+    // the checkout before the audit, this call wrote nothing.
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.reject(Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }));
+    } as typeof pg.Pool.prototype.connect;
+    const res = await killViaWrapper({ pid: PID, mode: "terminate" });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0]!.text, /ECONNREFUSED/);
+
+    const { raw, entry } = onlyLine();
+    assert.equal(entry.tool, "pg_kill");
+    assert.equal(entry.source, "internal");
+    assert.equal(entry.sql, "SELECT pg_terminate_backend($1) AS signaled");
+    assert.equal(entry.params, 1);
+    assert.equal(raw.includes(String(PID)), false, `the pid value reached the audit line: ${raw}`);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.rows, null);
+    assert.equal(entry.sqlstate, "ECONNREFUSED");
+  });
+
   it("logs the parameter COUNT and never the pid value", async () => {
     installStub({ rows: [{ signaled: true }] });
     await killViaWrapper({ pid: PID, mode: "cancel" });

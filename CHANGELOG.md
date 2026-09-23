@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent SQL that never ran now leaves an audit line (#42).** Whether a call
+  that failed before its statement was sent wrote a line depended on which
+  helper it went through. `runInternal` connects inside its audited step, so
+  a refused connection wrote an `internal` line with `ok: false` and
+  `sqlstate: "ECONNREFUSED"` for every tool that starts with a catalog query.
+  The three runners behind agent SQL checked the connection out, opened the
+  transaction and ran any hooks BEFORE the audited step, so `pg_query`,
+  `pg_readonly` and `pg_explain` -- the tools the trail exists for -- wrote
+  nothing, and so did `pg_kill`, whose checkout sat before its audit too.
+  Measured by calling all 23 tools over stdio against
+  `postgres://u:p@127.0.0.1:1/x` with `POSTGRES_AUDIT_LOG=stderr` (24 calls;
+  `pg_explain` once plain and once with `hypothetical_indexes`): 13 lines,
+  none of them `user`, and 11 calls with no line at all. An operator asking
+  "what did the agent try to run during the outage" found nothing for
+  exactly the tools that carry agent SQL. The same shape hid a failed
+  `BEGIN` and a hook setup that threw: a `pg_explain` whose hypothetical
+  index could not be created never ran its statement, and its only line was
+  the HypoPG-installed check, with `ok: true`. The checkout, the `BEGIN`, the
+  hook savepoint and the hypothetical-index setup now sit inside the
+  statement's audited span, so whichever of them fails writes the
+  statement's one `user` line: `ok: false`, the agent's `sql` (its keyword
+  and hash under `POSTGRES_AUDIT_REDACT`), `params` as a count, the `tool`,
+  and the code where there is one -- the Node code for a refused or
+  unresolvable connection, none for a connect timeout or a missing
+  `DATABASE_URL`, the SQLSTATE for a `BEGIN` or a setup the server refused
+  (`42P01` for a hypothetical index on a table that does not exist). Never
+  two: the span is one wrapper and nothing inside it audits on its own, so a
+  statement that is sent and fails writes exactly the line it always did.
+  `pg_kill`'s signal statement gets the same treatment. Review of the fix
+  found one more silent path with the same shape: `pg_explain` with a
+  version-floored option (`settings`, `wal`, `generic_plan`, `memory`,
+  `serialize`, `buffers` without `analyze`) probes `server_version_num`
+  before composing its statement, the probe swallows every failure into its
+  "assume oldest" sentinel, and the gate then answered "the server version
+  could not be determined" with no line written -- and the same unaudited
+  probe is what the six tools that version-gate before checking out their
+  shared connection ran first. The probe is now an `internal` line like the
+  catalog SQL `runInternal` sends: once per process on a server that
+  answers, since a successful reading is cached, and on every probing call
+  while the server is unreachable, since a failure is not. The same 24 calls
+  now write 24 lines, three of them `user`, and the two calls left without a
+  line are `pg_health` and `pg_replication_status`, which run several
+  catalog queries on one shared connection and check it out before the first
+  of them is composed. That silence is deliberate, and the README's "Audit
+  logging" section now says so: there is no statement to attribute the
+  failure to, the trail records statements and not calls, and the agent
+  still gets the error. It also says which line each tool writes for a
+  refused connection -- for `pg_explain` that is the `EXPLAIN` itself unless
+  a version-floored option or `hypothetical_indexes` was passed, when the
+  probe's or the HypoPG check's line is the record and the `EXPLAIN` text is
+  not on it. Two things follow for readers of the trail. `ms` on a `user`
+  line (and on `pg_kill`'s) now runs from the checkout to the statement's
+  completion, so it includes waiting for a pooled connection and the
+  transaction setup, as `internal` lines already could. And a refused
+  connection comes back from `runReadOnly`, `runReadWrite`,
+  `runReadWriteRollback` and `pg_kill`'s handler as `{ok: false}` like every
+  other failure, where it used to propagate as an exception; over MCP that is
+  the same `isError` envelope, its message now ending in the code, `(code:
+  ECONNREFUSED)`. Tests drive each of the three runners against a pool whose
+  `connect()` rejects and against a client whose `BEGIN` is refused,
+  `runReadOnly` against a connect timeout, a missing `DATABASE_URL` and a
+  hook setup that throws, `pg_query` and `pg_readonly` through the MCP
+  wrapper for the `tool` tag, `pg_kill` against a rejecting `connect()`,
+  `pg_explain` against a stubbed server that refuses `hypopg_create_index`
+  and against a probe that fails, and the probe itself for its once-per-
+  process line; moving the checkouts back out of their audited spans and
+  the probe back out of its audit turns them red (22 failures).
+
 ## [0.13.4] - 2026-09-18
 
 ### Security

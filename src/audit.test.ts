@@ -4,6 +4,15 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import pg from "pg";
+import {
+  getServerVersionNum,
+  runReadOnly,
+  runReadWrite,
+  runReadWriteRollback,
+  shutdown,
+  withSharedClient,
+} from "./api.js";
 import {
   auditQuery,
   getAuditConfig,
@@ -14,6 +23,8 @@ import {
   setAuditSinkForTests,
 } from "./audit.js";
 import { wrapToolHandler } from "./mcp-wrapper.js";
+import { explainTools } from "./tools/explain.js";
+import { queryTools } from "./tools/query.js";
 
 const AUDIT_ENV = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
 
@@ -534,5 +545,411 @@ describe("initAudit is idempotent", () => {
     );
     const entry = parseOnly(lines);
     assert.equal(entry.sql, "SELECT 1", "the second init must not have swapped in the redacted mode");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// A statement that never ran still gets its line (#42).
+//
+// The three user-SQL runners used to check the connection out, BEGIN, and run
+// any hooks BEFORE the audited step, so a refused connection, a BEGIN the
+// server refused, or a hook setup that threw skipped auditQuery entirely.
+// Against a pool that refused connections, every tool that starts with a
+// catalog query wrote its ok:false line and pg_query / pg_readonly / pg_explain
+// -- the tools the trail exists for -- wrote nothing. The checkout and the
+// transaction setup now sit inside the statement's audited span.
+//
+// These cases drive the REAL runners against `pg.Pool.prototype.connect`
+// stubs, the same boundary mcp-wrapper.test.ts and admin.test.ts stub: no
+// network, no live server. Move the checkout back out of the span in api.ts
+// and every "one line" assertion below goes red on the count.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** A failure shaped the way pg reports one: a `code` when the server (or Node) supplied one. */
+function pgError(message: string, code?: string): Error {
+  return code === undefined ? new Error(message) : Object.assign(new Error(message), { code });
+}
+
+/**
+ * A checked-out client that answers every statement with an empty result,
+ * except the ones `refuse` names. It records what was sent, so a test can
+ * prove the agent's SQL never went out.
+ */
+function makeFakeClient(refuse: (sql: string) => Error | undefined = () => undefined) {
+  const statements: string[] = [];
+  // The argument of each client.release() call. The runners' release paths
+  // were restructured around the audited span, so each case below checks the
+  // checkout went back exactly once, and with no discard reason -- an Error
+  // here would make pg-pool destroy the connection.
+  const releases: unknown[] = [];
+  return {
+    statements,
+    releases,
+    async query(config: unknown) {
+      const sql = typeof config === "string" ? config : ((config as { text?: string }).text ?? "");
+      statements.push(sql);
+      const err = refuse(sql);
+      if (err) throw err;
+      // `fields: []` keeps safeResolveTypeNames from asking for pg_type.
+      return { rows: [], fields: [], command: "", rowCount: 0 };
+    },
+    release(discard?: unknown) {
+      releases.push(discard);
+    },
+    // acquireClient() attaches an 'error' listener for the checked-out
+    // lifetime through `on` and removes it here.
+    on() {
+      return this;
+    },
+    removeListener() {
+      return this;
+    },
+  };
+}
+
+describe("a statement that never ran still gets its audit line (#42)", () => {
+  const originalConnect = pg.Pool.prototype.connect;
+  const originalAllowWrites = process.env.ALLOW_WRITES;
+  const originalDbUrl = process.env.DATABASE_URL;
+  let lines: string[] = [];
+  const sql = "SELECT * FROM orders WHERE customer = $1";
+  // Seven digits on purpose: no `ts` or `ms` value can contain the run by
+  // accident, so its absence from the raw line says something about the
+  // parameter and not about luck.
+  const params = ["cust-4191234"];
+  const refused = () => pgError("connect ECONNREFUSED 127.0.0.1:1", "ECONNREFUSED");
+
+  /** `pool.connect()` rejects with `err`; nothing is ever checked out. */
+  function refuseConnections(err: Error): void {
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.reject(err);
+    } as typeof pg.Pool.prototype.connect;
+  }
+
+  /** `pool.connect()` hands out `client`. */
+  function connectTo(client: ReturnType<typeof makeFakeClient>): void {
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      return Promise.resolve(client);
+    } as unknown as typeof pg.Pool.prototype.connect;
+  }
+
+  function onlyLine(): { raw: string; entry: Record<string, unknown> } {
+    assert.equal(lines.length, 1, `expected exactly one audit line, got ${JSON.stringify(lines)}`);
+    const raw = lines[0]!;
+    return { raw, entry: JSON.parse(raw) as Record<string, unknown> };
+  }
+
+  beforeEach(async () => {
+    // Rebuild the pool against the stub. A DATABASE_URL must be present or
+    // getPool() throws on construction, before connect() is ever reached --
+    // a different failure path (covered by index.test.ts) than the one here.
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    process.env.ALLOW_WRITES = "1";
+    lines = captureAudit();
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.connect = originalConnect;
+    await shutdown();
+    if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
+    else process.env.ALLOW_WRITES = originalAllowWrites;
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  const runners = [
+    { name: "runReadOnly", begin: "BEGIN READ ONLY", run: () => runReadOnly(sql, params) },
+    { name: "runReadWrite", begin: "BEGIN", run: () => runReadWrite(sql, params) },
+    { name: "runReadWriteRollback", begin: "BEGIN", run: () => runReadWriteRollback(sql, params) },
+  ] as const;
+
+  for (const { name, run } of runners) {
+    it(`${name}: a refused connection writes the statement's ok:false line and returns the error`, async () => {
+      refuseConnections(refused());
+      const res = await run();
+      assert.equal(res.ok, false, "a refused connection is the call's failure, returned like any other");
+      assert.match(res.error ?? "", /ECONNREFUSED/);
+
+      const { raw, entry } = onlyLine();
+      assert.equal(entry.source, "user");
+      assert.equal(entry.sql, sql);
+      assert.equal(entry.params, 1, "the count, never the values");
+      assert.equal(raw.includes("cust-4191234"), false, `a parameter value reached the audit line: ${raw}`);
+      assert.equal(entry.ok, false);
+      assert.equal(entry.rows, null);
+      assert.equal(entry.sqlstate, "ECONNREFUSED", "the Node code stands in for the SQLSTATE a server never sent");
+    });
+  }
+
+  for (const { name, begin, run } of runners) {
+    it(`${name}: a BEGIN the server refuses writes the line with its SQLSTATE, and the statement is never sent`, async () => {
+      const client = makeFakeClient((s) =>
+        s === begin ? pgError("terminating connection due to administrator command", "57P01") : undefined,
+      );
+      connectTo(client);
+      const res = await run();
+      assert.equal(res.ok, false);
+      assert.match(res.error ?? "", /57P01/);
+
+      const { entry } = onlyLine();
+      assert.equal(entry.source, "user");
+      assert.equal(entry.sql, sql);
+      assert.equal(entry.ok, false);
+      assert.equal(entry.sqlstate, "57P01");
+      assert.equal(client.statements[0], begin, "sanity: the transaction was opened first");
+      assert.ok(
+        client.statements.every((s) => !s.includes(sql)),
+        `the agent's SQL went out after a failed BEGIN: ${JSON.stringify(client.statements)}`,
+      );
+      assert.deepEqual(client.releases, [undefined], "the checkout goes back to the pool once, and is kept");
+    });
+  }
+
+  it("a connect timeout, which carries no code, writes the line without a sqlstate", async () => {
+    refuseConnections(pgError("timeout exceeded when trying to connect"));
+    const res = await runReadOnly(sql, params);
+    assert.equal(res.ok, false);
+    const { entry } = onlyLine();
+    assert.equal(entry.ok, false);
+    assert.equal("sqlstate" in entry, false, "no code was supplied, so none may be invented");
+  });
+
+  it("a missing DATABASE_URL writes the line with no sqlstate, and the error names the variable", async () => {
+    // getPool() throws before the pool exists, from inside the audited span.
+    // index.test.ts pins the same for the catalog tools over the wire; this is
+    // the agent-SQL path, in process.
+    delete process.env.DATABASE_URL;
+    await shutdown();
+    const res = await runReadOnly(sql, params);
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /DATABASE_URL is not set/);
+    const { entry } = onlyLine();
+    assert.equal(entry.source, "user");
+    assert.equal(entry.sql, sql);
+    assert.equal(entry.ok, false);
+    assert.equal("sqlstate" in entry, false);
+  });
+
+  it("a hook setup that throws writes the line for the statement it was preparing", async () => {
+    // pg_explain's hypothetical_indexes: setup creates the indexes inside the
+    // transaction, before the EXPLAIN. When it throws, the EXPLAIN never runs
+    // -- and used to leave no trace of having been asked for.
+    const client = makeFakeClient();
+    connectTo(client);
+    let teardownRan = false;
+    const explainSql = "EXPLAIN SELECT * FROM orders";
+    const res = await runReadOnly(explainSql, [], {
+      setup: async () => {
+        throw pgError('relation "orders" does not exist', "42P01");
+      },
+      teardown: async () => {
+        teardownRan = true;
+      },
+      sessionStateCreated: () => false,
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /42P01/);
+
+    const { entry } = onlyLine();
+    assert.equal(entry.source, "user");
+    assert.equal(entry.sql, explainSql);
+    assert.equal(entry.params, 0);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.sqlstate, "42P01", "the setup failure's code, on the line of the statement it stopped");
+    // What went out: the transaction and the hook savepoint, then the
+    // rollback -- never the EXPLAIN, and never a teardown for state that was
+    // not created.
+    assert.deepEqual(client.statements, ["BEGIN READ ONLY", "SAVEPOINT __pgmcp_hooks", "ROLLBACK"]);
+    assert.equal(teardownRan, false);
+    assert.deepEqual(client.releases, [undefined], "released once, kept: a clean rollback leaves nothing behind");
+  });
+
+  it("is one line, not two, when the statement itself is what fails", async () => {
+    // The span around the checkout must not add a line to the one the
+    // statement's own failure already wrote.
+    const client = makeFakeClient((s) =>
+      s.startsWith("DECLARE") ? pgError('relation "orders" does not exist', "42P01") : undefined,
+    );
+    connectTo(client);
+    const res = await runReadOnly(sql, params);
+    assert.equal(res.ok, false);
+    const { entry } = onlyLine();
+    assert.equal(entry.ok, false);
+    assert.equal(entry.sqlstate, "42P01");
+    assert.ok(
+      client.statements.some((s) => s.includes(sql)),
+      "sanity: this time the statement was sent",
+    );
+    assert.deepEqual(client.releases, [undefined]);
+  });
+
+  it("is one ok:true line when everything works", async () => {
+    const client = makeFakeClient();
+    connectTo(client);
+    const res = await runReadOnly(sql, params);
+    assert.equal(res.ok, true, res.error);
+    const { entry } = onlyLine();
+    assert.equal(entry.ok, true);
+    assert.equal(entry.rows, 0);
+    assert.equal(entry.sql, sql);
+    assert.deepEqual(client.releases, [undefined]);
+  });
+
+  it("runReadWrite: one ok:true line, and the checkout is released once after COMMIT", async () => {
+    const client = makeFakeClient();
+    connectTo(client);
+    const res = await runReadWrite(sql, params);
+    assert.equal(res.ok, true, res.error);
+    const { entry } = onlyLine();
+    assert.equal(entry.ok, true);
+    assert.equal(client.statements[0], "BEGIN");
+    assert.equal(client.statements.at(-1), "COMMIT");
+    assert.deepEqual(client.releases, [undefined]);
+  });
+
+  for (const toolName of ["pg_readonly", "pg_query"] as const) {
+    it(`${toolName}: the line carries the tool when driven through the MCP wrapper`, async () => {
+      // pg_readonly runs through runReadOnly and pg_query, with ALLOW_WRITES
+      // set, through runReadWrite: both runners, under the names index.ts
+      // registers.
+      refuseConnections(refused());
+      const tool = queryTools.find((t) => t.name === toolName)!;
+      const wrapped = wrapToolHandler(tool.handler as (input: unknown) => Promise<unknown>, tool.name);
+      const res = await wrapped({ sql, params });
+      assert.equal(res.isError, true);
+      assert.match(res.content[0]!.text, /ECONNREFUSED/);
+
+      const { entry } = onlyLine();
+      assert.equal(entry.tool, toolName);
+      assert.equal(entry.source, "user");
+      assert.equal(entry.sql, sql);
+      assert.equal(entry.ok, false);
+    });
+  }
+
+  it("under POSTGRES_AUDIT_REDACT the never-sent statement is still only a keyword and a hash", async () => {
+    resetAuditForTests();
+    lines = captureAudit({ POSTGRES_AUDIT_LOG: "1", POSTGRES_AUDIT_REDACT: "1" });
+    refuseConnections(refused());
+    await runReadOnly(sql, params);
+    const { raw, entry } = onlyLine();
+    assert.equal("sql" in entry, false, "redaction must drop the statement text on this path too");
+    assert.equal(entry.sqlKeyword, "SELECT");
+    assert.equal(entry.sqlSha256, createHash("sha256").update(sql).digest("hex"));
+    assert.equal(raw.includes("orders"), false);
+    assert.equal(entry.sqlstate, "ECONNREFUSED");
+  });
+
+  it("withSharedClient writes nothing for a refused connection, by design", async () => {
+    // Deliberate, and documented at withSharedClient in api.ts: the
+    // connection is checked out before the callback composes a statement,
+    // so there is no truthful `sql` to put on a line. Pinned so that a change
+    // is a decision and not a side effect.
+    refuseConnections(refused());
+    await assert.rejects(
+      withSharedClient(async (run) => run("SELECT 1")),
+      /ECONNREFUSED/,
+    );
+    assert.deepEqual(lines, []);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// The server-version probe is an internal line (#42, found in review).
+//
+// pg_explain with a version-floored option, and the tools that probe before
+// checking out their shared connection (pg_describe_table, pg_advisor,
+// pg_table_bloat, pg_seq_scan_tables, pg_unused_indexes, pg_io_stats,
+// pg_index_advisor), run getServerVersionNum() before anything else reaches
+// the database, and it swallows every failure into the 0 sentinel. Unaudited,
+// a refused connection under any of them wrote no line: the fix above moved
+// the checkout into the agent statement's span, and this path never reached
+// that span. The probe's own query is now audited like runInternal's.
+// ─────────────────────────────────────────────────────────────────────────
+describe("the server-version probe writes an internal line (#42)", () => {
+  const originalQuery = pg.Pool.prototype.query;
+  const originalDbUrl = process.env.DATABASE_URL;
+  let lines: string[] = [];
+  const probeSql = "SELECT current_setting('server_version_num') AS v";
+
+  /** The pool answers the probe with `version`, or rejects with `err`. */
+  function probeAnswers(version: string | undefined, err?: Error): void {
+    pg.Pool.prototype.query = function queryStub(this: pg.Pool) {
+      if (err) return Promise.reject(err);
+      return Promise.resolve({ rows: [{ v: version }], fields: [], command: "SELECT", rowCount: 1 });
+    } as unknown as typeof pg.Pool.prototype.query;
+  }
+
+  beforeEach(async () => {
+    await shutdown();
+    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+    lines = captureAudit();
+  });
+
+  afterEach(async () => {
+    pg.Pool.prototype.query = originalQuery;
+    await shutdown();
+    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDbUrl;
+  });
+
+  it("logs a successful probe once per process: the second call is served from the cache", async () => {
+    probeAnswers("170000");
+    assert.equal(await getServerVersionNum(), 170_000);
+    assert.equal(await getServerVersionNum(), 170_000);
+    assert.equal(lines.length, 1, `expected one line for two calls, got ${JSON.stringify(lines)}`);
+    const entry = JSON.parse(lines[0]!) as Record<string, unknown>;
+    assert.equal(entry.source, "internal");
+    assert.equal(entry.sql, probeSql);
+    assert.equal(entry.params, 0);
+    assert.equal(entry.ok, true);
+    assert.equal(entry.rows, 1);
+  });
+
+  it("logs a failed probe on every call, with the code, and still returns the 0 sentinel", async () => {
+    probeAnswers(undefined, pgError("connect ECONNREFUSED 127.0.0.1:1", "ECONNREFUSED"));
+    assert.equal(await getServerVersionNum(), 0, "the probe's contract: never throw, report 0");
+    assert.equal(await getServerVersionNum(), 0);
+    assert.equal(lines.length, 2, "a failure is not cached, so each call probes and each probe is logged");
+    for (const raw of lines) {
+      const entry = JSON.parse(raw) as Record<string, unknown>;
+      assert.equal(entry.source, "internal");
+      assert.equal(entry.sql, probeSql);
+      assert.equal(entry.ok, false);
+      assert.equal(entry.rows, null);
+      assert.equal(entry.sqlstate, "ECONNREFUSED");
+    }
+  });
+
+  it("logs a probe that cannot start because DATABASE_URL is unset, with no sqlstate", async () => {
+    delete process.env.DATABASE_URL;
+    await shutdown();
+    assert.equal(await getServerVersionNum(), 0);
+    assert.equal(lines.length, 1);
+    const entry = JSON.parse(lines[0]!) as Record<string, unknown>;
+    assert.equal(entry.ok, false);
+    assert.equal("sqlstate" in entry, false);
+  });
+
+  it("pg_explain with a version-floored option on a refused connection: the probe's line, under the tool", async () => {
+    // The case review found: the gate answered "the server version could not
+    // be determined" from the 0 sentinel and returned before any audited
+    // span, so the call left no trace. Now the probe's own ok:false line
+    // records it, tagged pg_explain; the EXPLAIN text itself is not on it,
+    // because the statement is composed only after the gate.
+    probeAnswers(undefined, pgError("connect ECONNREFUSED 127.0.0.1:1", "ECONNREFUSED"));
+    const pgExplain = explainTools.find((t) => t.name === "pg_explain")!;
+    const wrapped = wrapToolHandler(pgExplain.handler as (input: unknown) => Promise<unknown>, pgExplain.name);
+    const res = await wrapped({ sql: "SELECT * FROM orders", settings: true });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0]!.text, /could not be determined/);
+    assert.equal(lines.length, 1, `expected the probe's line, got ${JSON.stringify(lines)}`);
+    const entry = JSON.parse(lines[0]!) as Record<string, unknown>;
+    assert.equal(entry.tool, "pg_explain");
+    assert.equal(entry.source, "internal");
+    assert.equal(entry.sql, probeSql);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.sqlstate, "ECONNREFUSED");
   });
 });

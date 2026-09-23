@@ -186,6 +186,9 @@ let serverVersionNum: number | null = null;
 // counter is the equivalent for a scalar.
 let poolGeneration = 0;
 
+/** The probe's statement, named so the audit line and the query cannot drift apart. */
+const VERSION_PROBE_SQL = "SELECT current_setting('server_version_num') AS v";
+
 /**
  * Returns `server_version_num` (e.g. 180000 for PG 18), or 0 when it cannot
  * be determined.
@@ -203,14 +206,33 @@ let poolGeneration = 0;
  * Concurrency: two callers racing before the cache is populated both run the
  * probe and both write the same value. Harmless duplicate work, same tradeoff
  * as the typeNameCache bootstrap above.
+ *
+ * Audited as an `internal` line, like the catalog SQL runInternal sends, and
+ * for the same reason (#42): the callers that gate on the version run this
+ * probe BEFORE anything else reaches the database, and a failure here comes
+ * back as the 0 sentinel with no error attached. Unaudited, a refused
+ * connection under pg_explain with a version-floored option, or under any of
+ * the tools that probe before checking out their shared connection, wrote no
+ * line at all -- the call answered "the server version could not be
+ * determined" and the trail showed nothing was attempted. On a healthy server
+ * the line appears once per process, since a successful reading is cached;
+ * while the server is unreachable it appears on every probing call, since a
+ * failure is not. `getPool()` sits inside the audited step so a missing
+ * DATABASE_URL is recorded too, as runInternal records it.
  */
 export async function getServerVersionNum(client?: VersionProbeRunner): Promise<number> {
   if (serverVersionNum !== null) return serverVersionNum;
   // Snapshot BEFORE the await -- see poolGeneration.
   const generation = poolGeneration;
   try {
-    const runner: VersionProbeRunner = client ?? getPool();
-    const res = await runner.query<{ v: string }>("SELECT current_setting('server_version_num') AS v");
+    const res = await auditQuery(
+      { source: "internal", sql: VERSION_PROBE_SQL, paramCount: 0 },
+      async () => {
+        const runner: VersionProbeRunner = client ?? getPool();
+        return runner.query<{ v: string }>(VERSION_PROBE_SQL);
+      },
+      (r) => r.rowCount ?? r.rows.length,
+    );
     const parsed = Number.parseInt(res.rows[0]?.v ?? "", 10);
     if (Number.isFinite(parsed) && parsed > 0) {
       // Only publish if no shutdown() landed while we were suspended. If one
@@ -511,24 +533,43 @@ async function runUserQueryBounded(
 }
 
 /**
- * `runUserQueryBounded` plus one audit line (no-op unless POSTGRES_AUDIT_LOG /
+ * One audit line for one agent statement (no-op unless POSTGRES_AUDIT_LOG /
  * POSTGRES_AUDIT_LOG_FILE is set). It exists as its own wrapper so all three
  * user-SQL paths record the statement identically -- one path quietly missing
  * the audit is the failure an inline call at each site invites, and a partial
  * trail is the kind an operator only discovers during an incident.
  *
+ * `run` is EVERYTHING the statement needs in order to execute -- checking the
+ * connection out of the pool, `BEGIN`, the hook savepoint and `setup`, and
+ * only then the statement itself through runUserQueryBounded -- not just that
+ * last step. The line is written whichever of them fails, so a call that got
+ * no connection, or whose `BEGIN` or hypothetical-index setup was refused,
+ * still records the SQL the agent asked to run: `ok: false`, with the code of
+ * the failure where there is one. Auditing only the statement left exactly
+ * those calls silent, and only them: runInternal connects inside its audited
+ * step, so against a refused connection every tool that starts with a catalog
+ * query wrote its `ok: false` line while pg_query, pg_readonly and pg_explain
+ * -- the tools the trail exists for -- wrote nothing (#42). A pg_explain whose
+ * hypothetical index could not be created was the same shape: five statements
+ * sent, an error returned, and one line, the `ok: true` HypoPG check.
+ *
+ * Because the span is a single wrapper, a failure is logged once: nothing
+ * inside it audits on its own (hooks query the client directly). The cost is
+ * that `ms` on a `user` line runs from the checkout to the statement's
+ * completion, so it includes waiting for a pooled connection and the
+ * transaction setup, as `internal` lines already could.
+ *
  * `source: "user"` separates agent-supplied SQL from the internal catalog
  * queries runInternal / withSharedClient record.
  */
-async function runUserQueryAudited(
-  client: pg.PoolClient,
+async function auditUserStatement<T extends { result: pg.QueryResult }>(
   sql: string,
   params: unknown[],
-  maxRows: number,
-): Promise<{ result: pg.QueryResult; viaCursor: boolean }> {
+  run: () => Promise<T>,
+): Promise<T> {
   return auditQuery(
     { source: "user", sql, paramCount: params.length },
-    () => runUserQueryBounded(client, sql, params, maxRows),
+    run,
     // Rows as postgres reported them: the affected-row count on the
     // direct-exec path, and on the cursor path the bounded FETCH count
     // (maxRows + 1 at most) -- the true total is unknowable there by design,
@@ -904,24 +945,38 @@ async function runUserSqlInTransaction(
   params: unknown[],
   hooks: RunHooks,
 ): Promise<ApiResponse<QueryResult>> {
-  const checkout = await acquireClient();
-  const { client, release } = checkout;
   const maxRows = getMaxRows();
   const state = { began: false, hookSavepoint: false };
+  // Assigned inside the audited span, so it is still undefined when the pool
+  // refused a connection: nothing to finish or release then.
+  let checkout: Checkout | undefined;
   let outcome: { result: pg.QueryResult; viaCursor: boolean } | undefined;
   let failed: ApiResponse<QueryResult> | undefined;
   try {
-    await client.query(begin);
-    state.began = true;
-    if (hooks.teardown) {
-      await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
-      state.hookSavepoint = true;
-    }
-    if (hooks.setup) await hooks.setup(client);
-    outcome = await runUserQueryAudited(client, sql, params, maxRows);
+    // The checkout and the transaction setup sit INSIDE the audited span; see
+    // auditUserStatement for why. Whatever fails in here is the statement's
+    // one `ok: false` line.
+    outcome = await auditUserStatement(sql, params, async () => {
+      checkout = await acquireClient();
+      const { client } = checkout;
+      await client.query(begin);
+      state.began = true;
+      if (hooks.teardown) {
+        await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
+        state.hookSavepoint = true;
+      }
+      if (hooks.setup) await hooks.setup(client);
+      return runUserQueryBounded(client, sql, params, maxRows);
+    });
   } catch (err) {
     failed = { ok: false, error: formatPgError(err) };
   }
+  // No connection: the pool refused one, or DATABASE_URL is unset. Returned
+  // like every other failure, as runInternal returns its own. It propagated
+  // as an exception while the checkout sat before the try; the MCP wrapper
+  // shaped both into the same error envelope.
+  if (checkout === undefined) return failed ?? { ok: false, error: "no connection" };
+  const { client, release } = checkout;
   const finished = await finishTransaction(checkout, state, hooks);
   try {
     if (failed || !outcome) return failed ?? { ok: false, error: "no result" };
@@ -950,23 +1005,32 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
       error: "Write blocked: ALLOW_WRITES is not set. Set ALLOW_WRITES=1 in the MCP server env to enable DML/DDL.",
     };
   }
-  const { client, release } = await acquireClient();
   const maxRows = getMaxRows();
+  // Assigned inside the audited span (see runUserSqlInTransaction), so a
+  // refused connection leaves it undefined: nothing to roll back or release.
+  let checkout: Checkout | undefined;
   try {
-    await client.query("BEGIN");
-    const { result, viaCursor } = await runUserQueryAudited(client, sql, params, maxRows);
+    const { client, result, viaCursor } = await auditUserStatement(sql, params, async () => {
+      checkout = await acquireClient();
+      const { client } = checkout;
+      await client.query("BEGIN");
+      const bounded = await runUserQueryBounded(client, sql, params, maxRows);
+      return { client, ...bounded };
+    });
     await client.query("COMMIT");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      // Ignore - best effort.
+    if (checkout !== undefined) {
+      try {
+        await checkout.client.query("ROLLBACK");
+      } catch {
+        // Ignore - best effort.
+      }
     }
     return { ok: false, error: formatPgError(err) };
   } finally {
-    release();
+    checkout?.release();
   }
 }
 
@@ -1024,9 +1088,28 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
  * when called via `Promise.all`.
  *
  * Behavior note: connect failures (pool exhausted, bad DATABASE_URL) propagate
- * as exceptions out of this helper, whereas `runInternal` catches the same
- * failures and returns `{ok: false}`. The MCP wrapper in index.ts handles
- * both shapes, but don't assume drop-in equivalence between the two.
+ * as exceptions out of this helper, whereas `runInternal` and the user-SQL
+ * runners catch the same failures and return `{ok: false}`. The MCP wrapper
+ * in index.ts handles both shapes, but don't assume drop-in equivalence
+ * between the two.
+ *
+ * Audit note: a connect failure here writes NO audit line, and that is the
+ * deliberate exception (#42). runInternal logs its refused connection as the
+ * `ok: false` line of the statement it was about to run, and the user-SQL
+ * runners log the agent's statement the same way, because in both the
+ * statement is known when the connection is asked for. Here the connection
+ * is checked out BEFORE the callback composes its first statement, so there
+ * is nothing truthful to put in `sql` -- a placeholder would be a
+ * non-statement in the field every consumer, and the redacted mode's hash,
+ * reads as one. Nothing agent-supplied is lost: every caller sends only
+ * server-composed catalog SQL through this helper, and the one that carries
+ * agent input, pg_index_advisor's workload statements, reaches the database
+ * through runInternal first, whose line records the failure. Connecting
+ * lazily on the first `runOnClient` would attribute the failure to a real
+ * statement, but it would also turn the exception above into a per-statement
+ * `{ok: false}` that a caller's partial-failure handling (pg_health's "never
+ * an early return") would report as a degraded success. The README's "What
+ * the trail does not show" names the tools this covers.
  */
 /**
  * Per-call options for {@link withSharedClient}'s runner.
