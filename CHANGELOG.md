@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-09-23
+
+### Changed
+- fix(audit): reject directory paths at startup on Windows (#61)
+
 ## [0.13.5] - 2026-09-23
 
 ### Fixed
