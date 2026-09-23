@@ -536,6 +536,22 @@ describe("audit file sink", () => {
     assert.throws(() => initAudit(), /could not be opened for append/);
     assert.equal(isAuditEnabled(), false);
   });
+
+  // On Windows, openSync(dir, "a") succeeds and the error only surfaces on the
+  // first writeSync as EISDIR -- every audit line is silently lost after one
+  // warning. This test goes red on Windows without the fstat guard in
+  // initAudit(); on Linux it passes either way because openSync already rejects
+  // directories.
+  it("throws at startup when the path is a directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pgmcp-audit-dir-"));
+    try {
+      process.env.POSTGRES_AUDIT_LOG_FILE = dir;
+      assert.throws(() => initAudit(), /is a directory, not a file/);
+      assert.equal(isAuditEnabled(), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("initAudit is idempotent", () => {
