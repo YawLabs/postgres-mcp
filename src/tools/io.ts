@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getServerVersionNum, PG16, PG18, withSharedClient } from "../api.js";
+import { formatPgError, getServerVersionNum, getVersionProbeFailure, PG16, PG18, withSharedClient } from "../api.js";
 import { warningsField } from "./output.js";
 
 /**
@@ -233,7 +233,12 @@ export const ioTools = [
         // too. That is the intended "assume oldest" behaviour, but the caller
         // must be able to tell "your server is too old" (act: upgrade) from "we
         // could not check" (act: retry) -- an undifferentiated version error
-        // would send an agent to the wrong remediation.
+        // would send an agent to the wrong remediation. And when the probe
+        // THREW, the server was never asked at all: the cause -- a refused
+        // connection, a timeout, an unset DATABASE_URL -- is what the agent
+        // needs, reported as any other tool reports it (#42).
+        const probeFailure = serverVersion === 0 ? getVersionProbeFailure() : undefined;
+        if (probeFailure !== undefined) return { ok: false, error: formatPgError(probeFailure) };
         const detected =
           serverVersion > 0
             ? `this server reports server_version_num=${serverVersion}`

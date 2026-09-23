@@ -319,9 +319,16 @@ describe("pg_explain server-version gating", () => {
     { name: "buffers without analyze", input: { buffers: true }, version: /PostgreSQL 13\+/ },
   ];
 
+  // The 0 sentinel WITHOUT a probe failure: the server answered, with
+  // something that is not a version. (A probe that threw no longer reaches the
+  // gate's own wording -- the handler reports the probe's error instead, see
+  // the case below -- so an unset DATABASE_URL cannot stand in for "unknown
+  // version" here as it used to.)
+  const unknownVersion = <T>(fn: () => Promise<T>) => withStubbedServer(Number.NaN, fn);
+
   for (const c of cases) {
     it(`rejects \`${c.name}\` when the server version is unknown, naming the required version`, async () => {
-      const result = (await withoutDatabaseUrl(() => pgExplain.handler({ sql: "SELECT 1", ...c.input }))) as {
+      const result = (await unknownVersion(() => pgExplain.handler({ sql: "SELECT 1", ...c.input }))) as {
         ok: boolean;
         error?: string;
       };
@@ -332,7 +339,7 @@ describe("pg_explain server-version gating", () => {
   }
 
   it("reports that the version could not be determined rather than inventing one", async () => {
-    const result = (await withoutDatabaseUrl(() => pgExplain.handler({ sql: "SELECT 1", generic_plan: true }))) as {
+    const result = (await unknownVersion(() => pgExplain.handler({ sql: "SELECT 1", generic_plan: true }))) as {
       ok: boolean;
       error?: string;
     };
@@ -340,12 +347,26 @@ describe("pg_explain server-version gating", () => {
   });
 
   it("names every unsupported option at once", async () => {
-    const result = (await withoutDatabaseUrl(() =>
+    const result = (await unknownVersion(() =>
       pgExplain.handler({ sql: "SELECT 1", analyze: true, wal: true, memory: true }),
     )) as { ok: boolean; error?: string };
     assert.equal(result.ok, false);
     assert.match(result.error ?? "", /`wal` requires PostgreSQL 13\+/);
     assert.match(result.error ?? "", /`memory` requires PostgreSQL 17\+/);
+  });
+
+  it("reports the probe's own failure, not a version verdict, when the probe threw", async () => {
+    // With DATABASE_URL unset the probe throws before reaching any server.
+    // Telling the agent to drop `settings` and re-run would send it back into
+    // the same failure with one option fewer; the cause is what it needs
+    // (#42, found in review).
+    const result = (await withoutDatabaseUrl(() => pgExplain.handler({ sql: "SELECT 1", settings: true }))) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /DATABASE_URL is not set/);
+    assert.doesNotMatch(result.error ?? "", /requires PostgreSQL|could not be determined|Drop the option/);
   });
 
   it("does NOT gate the pre-existing options when the version probe fails", async () => {

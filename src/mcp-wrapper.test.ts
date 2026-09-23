@@ -289,15 +289,20 @@ describe("withSharedClient connect failure propagates as a throw", () => {
     );
   });
 
-  it("never invokes the callback when connect rejects", async () => {
-    let callbackRan = false;
+  it("throws the connect failure from the callback's first statement, and sends nothing after it", async () => {
+    // The checkout happens inside the first statement's audited step (#42),
+    // so the callback starts -- composing SQL is all any caller does before
+    // its first statement -- and its first `run` is where the failure lands.
+    let reachedSecond = false;
     await assert.rejects(
       withSharedClient(async (run) => {
-        callbackRan = true;
-        return run("SELECT 1");
+        await run("SELECT 1");
+        reachedSecond = true;
+        return run("SELECT 2");
       }),
+      /pool could not acquire a client/,
     );
-    assert.equal(callbackRan, false, "fn must not run when getPool().connect() rejects");
+    assert.equal(reachedSecond, false, "the callback must not get past the statement that found no connection");
   });
 });
 
@@ -350,7 +355,10 @@ describe("withSharedClient discard: a connection with dirty session state is des
     };
     try {
       await assert.rejects(
-        withSharedClient(async (_run, { discard }) => {
+        withSharedClient(async (run, { discard }) => {
+          // The checkout exists from the first statement (#42); a discard
+          // before any statement would have nothing to destroy.
+          await run("SELECT 1");
           discard(first);
           discard(new Error("second"));
           throw new Error("callback failed");
@@ -412,9 +420,13 @@ describe("a checked-out client has an 'error' listener for as long as it is chec
     else process.env.DATABASE_URL = originalDbUrl;
   });
 
-  it("withSharedClient: attached while the callback runs, removed after release", async () => {
+  it("withSharedClient: attached from the first statement's checkout, removed after release", async () => {
     assert.equal(client.listenerCount("error"), 0);
-    await withSharedClient(async () => {
+    await withSharedClient(async (run) => {
+      // Nothing is checked out until the first statement asks (#42), so
+      // there is nothing yet for a listener to guard.
+      assert.equal(client.listenerCount("error"), 0, "checked out before the first statement");
+      await run("SELECT 1");
       assert.equal(client.listenerCount("error"), 1, "no error listener while checked out");
       return undefined;
     });
@@ -423,7 +435,8 @@ describe("a checked-out client has an 'error' listener for as long as it is chec
   });
 
   it("withSharedClient: a socket death while checked out is logged, not thrown", async () => {
-    await withSharedClient(async () => {
+    await withSharedClient(async (run) => {
+      await run("SELECT 1");
       // Exactly what node-pg does from the socket callback.
       client.emit("error", new Error("Connection terminated unexpectedly"));
       return undefined;

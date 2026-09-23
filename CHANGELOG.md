@@ -38,44 +38,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two: the span is one wrapper and nothing inside it audits on its own, so a
   statement that is sent and fails writes exactly the line it always did.
   `pg_kill`'s signal statement gets the same treatment. Review of the fix
-  found one more silent path with the same shape: `pg_explain` with a
+  found two more silent paths with the same shape. `pg_explain` with a
   version-floored option (`settings`, `wal`, `generic_plan`, `memory`,
   `serialize`, `buffers` without `analyze`) probes `server_version_num`
-  before composing its statement, the probe swallows every failure into its
+  before composing its statement, the probe swallowed every failure into its
   "assume oldest" sentinel, and the gate then answered "the server version
-  could not be determined" with no line written -- and the same unaudited
-  probe is what the six tools that version-gate before checking out their
-  shared connection ran first. The probe is now an `internal` line like the
-  catalog SQL `runInternal` sends: once per process on a server that
-  answers, since a successful reading is cached, and on every probing call
-  while the server is unreachable, since a failure is not. The same 24 calls
-  now write 24 lines, three of them `user`, and the two calls left without a
-  line are `pg_health` and `pg_replication_status`, which run several
-  catalog queries on one shared connection and check it out before the first
-  of them is composed. That silence is deliberate, and the README's "Audit
-  logging" section now says so: there is no statement to attribute the
-  failure to, the trail records statements and not calls, and the agent
-  still gets the error. It also says which line each tool writes for a
-  refused connection -- for `pg_explain` that is the `EXPLAIN` itself unless
-  a version-floored option or `hypothetical_indexes` was passed, when the
-  probe's or the HypoPG check's line is the record and the `EXPLAIN` text is
-  not on it. Two things follow for readers of the trail. `ms` on a `user`
-  line (and on `pg_kill`'s) now runs from the checkout to the statement's
-  completion, so it includes waiting for a pooled connection and the
-  transaction setup, as `internal` lines already could. And a refused
-  connection comes back from `runReadOnly`, `runReadWrite`,
-  `runReadWriteRollback` and `pg_kill`'s handler as `{ok: false}` like every
-  other failure, where it used to propagate as an exception; over MCP that is
-  the same `isError` envelope, its message now ending in the code, `(code:
-  ECONNREFUSED)`. Tests drive each of the three runners against a pool whose
-  `connect()` rejects and against a client whose `BEGIN` is refused,
-  `runReadOnly` against a connect timeout, a missing `DATABASE_URL` and a
-  hook setup that throws, `pg_query` and `pg_readonly` through the MCP
-  wrapper for the `tool` tag, `pg_kill` against a rejecting `connect()`,
-  `pg_explain` against a stubbed server that refuses `hypopg_create_index`
-  and against a probe that fails, and the probe itself for its once-per-
-  process line; moving the checkouts back out of their audited spans and
-  the probe back out of its audit turns them red (22 failures).
+  could not be determined ... drop the option and re-run" with no line
+  written -- the wrong remediation for an outage, and the same unaudited
+  probe is what six other tools ran first. The probe is now an `internal`
+  line like the catalog SQL `runInternal` sends: once per successful
+  reading, which is then cached for the life of the process (calls that
+  race the first reading share one probe and one line), and on every probing
+  call while the server is unreachable, since a failure is not cached. And
+  the two gates that turn the sentinel into an error, `pg_explain`'s and
+  `pg_io_stats`'s, now report the probe's own failure when it threw (`connect
+  ECONNREFUSED ...`, `DATABASE_URL is not set`), keeping "could not be
+  determined" for a server that answered something unparsable. The second
+  path: the seven tools that run several catalog queries on one shared
+  connection (`pg_describe_table`, `pg_health`, `pg_advisor`,
+  `pg_replication_status`, `pg_seq_scan_tables`, `pg_unused_indexes`,
+  `pg_io_stats`) checked that connection out before composing their first
+  statement, so once the version was cached -- an outage that begins
+  mid-session, the case the trail exists for -- a refused connection wrote
+  nothing for any of them. `withSharedClient` now checks the connection out
+  inside its first statement's audited step, so the refusal is that
+  statement's `ok: false` line; statements waiting on the same checkout, or
+  issued after it failed, fail with the same error and write nothing, and
+  the failure still propagates as the exception every caller handles. The
+  same 24 calls now write 30 lines (a tool that probes and then queries logs
+  a failed probe and then its failed first statement), three of them `user`,
+  and no call is silent; with the version cached beforehand, each of the
+  seven writes its first statement's line. The README's "Audit logging"
+  section says which line each tool writes for a refused connection -- for
+  `pg_explain` that is the `EXPLAIN` itself unless a version-floored option
+  or `hypothetical_indexes` was passed, when the probe's or the HypoPG
+  check's line is the record and the `EXPLAIN` text is not on it. Two things
+  follow for readers of the trail. `ms` on a `user` line (and on `pg_kill`'s)
+  now runs from the checkout to the statement's completion, so it includes
+  waiting for a pooled connection and the transaction setup, as `internal`
+  lines already could. And a refused connection comes back from
+  `runReadOnly`, `runReadWrite`, `runReadWriteRollback` and `pg_kill`'s
+  handler as `{ok: false}` like every other failure, where it used to
+  propagate as an exception; over MCP that is the same `isError` envelope,
+  its message now ending in the code, `(code: ECONNREFUSED)`. Tests drive
+  each of the three runners against a pool whose `connect()` rejects and
+  against a client whose `BEGIN` is refused, `runReadOnly` against a connect
+  timeout, a missing `DATABASE_URL` and a hook setup that throws, `pg_query`
+  and `pg_readonly` through the MCP wrapper for the `tool` tag, `pg_kill`
+  against a rejecting `connect()`, `pg_explain` against a stubbed server that
+  refuses `hypopg_create_index` and against a probe that fails, the probe
+  itself for its shared, once-per-reading line, `withSharedClient` for the
+  first statement's line under a fan-out, and each of the seven
+  shared-connection tools with the version cached and the connection then
+  refused; every fake client also records when it was released, so the
+  restructured release paths are checked against their last statement.
 
 ## [0.13.4] - 2026-09-18
 

@@ -203,9 +203,9 @@ const VERSION_PROBE_SQL = "SELECT current_setting('server_version_num') AS v";
  * very first tool call), and the probe is a single cheap GUC read -- retrying
  * on the next call costs far less than being permanently wrong.
  *
- * Concurrency: two callers racing before the cache is populated both run the
- * probe and both write the same value. Harmless duplicate work, same tradeoff
- * as the typeNameCache bootstrap above.
+ * Concurrency: callers racing before the cache is populated share one probe,
+ * and so one audit line (`versionProbe` below). A probe on a caller-supplied
+ * runner is never shared: it belongs to that connection.
  *
  * Audited as an `internal` line, like the catalog SQL runInternal sends, and
  * for the same reason (#42): the callers that gate on the version run this
@@ -214,14 +214,53 @@ const VERSION_PROBE_SQL = "SELECT current_setting('server_version_num') AS v";
  * connection under pg_explain with a version-floored option, or under any of
  * the tools that probe before checking out their shared connection, wrote no
  * line at all -- the call answered "the server version could not be
- * determined" and the trail showed nothing was attempted. On a healthy server
- * the line appears once per process, since a successful reading is cached;
- * while the server is unreachable it appears on every probing call, since a
- * failure is not. `getPool()` sits inside the audited step so a missing
- * DATABASE_URL is recorded too, as runInternal records it.
+ * determined" and the trail showed nothing was attempted. The line appears
+ * once per successful reading, which the cache then serves for the life of
+ * the process; while the server is unreachable it appears on every probing
+ * call, since a failure is not cached. `getPool()` sits inside the audited
+ * step so a missing DATABASE_URL is recorded too, as runInternal records it.
+ *
+ * A probe that threw is remembered (`versionProbeFailure`), so a caller that
+ * turns the 0 sentinel into an error -- pg_explain's version gate,
+ * pg_io_stats -- can report the cause, a refused connection or a timeout,
+ * instead of telling the agent to drop an option the server never got to
+ * judge. See {@link getVersionProbeFailure}.
  */
 export async function getServerVersionNum(client?: VersionProbeRunner): Promise<number> {
   if (serverVersionNum !== null) return serverVersionNum;
+  if (client !== undefined) return probeServerVersion(client);
+  if (versionProbe === null) {
+    const probe = probeServerVersion(undefined);
+    versionProbe = probe;
+    // Cleared once it settles: a success is served from the cache from then
+    // on, and a failure is deliberately not cached, so the next caller probes
+    // again. probeServerVersion never rejects.
+    void probe.finally(() => {
+      if (versionProbe === probe) versionProbe = null;
+    });
+  }
+  return versionProbe;
+}
+
+// The pool probe in flight, shared by every caller that arrives before it
+// settles. Reset by shutdown() with the rest of the version state.
+let versionProbe: Promise<number> | null = null;
+// What the last probe threw; undefined once a probe answers (parsable or not).
+let versionProbeFailure: unknown;
+
+/**
+ * The error the last server-version probe threw, or undefined when the last
+ * probe got an answer from the server, or none has run yet. A 0 from
+ * {@link getServerVersionNum} with a failure here means the server was never
+ * asked -- the connection was refused, timed out, or DATABASE_URL is unset --
+ * and a caller about to say "this server is too old" or "the version could
+ * not be determined" should say that instead.
+ */
+export function getVersionProbeFailure(): unknown {
+  return versionProbeFailure;
+}
+
+async function probeServerVersion(client: VersionProbeRunner | undefined): Promise<number> {
   // Snapshot BEFORE the await -- see poolGeneration.
   const generation = poolGeneration;
   try {
@@ -233,6 +272,7 @@ export async function getServerVersionNum(client?: VersionProbeRunner): Promise<
       },
       (r) => r.rowCount ?? r.rows.length,
     );
+    versionProbeFailure = undefined;
     const parsed = Number.parseInt(res.rows[0]?.v ?? "", 10);
     if (Number.isFinite(parsed) && parsed > 0) {
       // Only publish if no shutdown() landed while we were suspended. If one
@@ -242,7 +282,8 @@ export async function getServerVersionNum(client?: VersionProbeRunner): Promise<
       return parsed;
     }
     return 0;
-  } catch {
+  } catch (err) {
+    versionProbeFailure = err;
     return 0;
   }
 }
@@ -1088,28 +1129,28 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
  * when called via `Promise.all`.
  *
  * Behavior note: connect failures (pool exhausted, bad DATABASE_URL) propagate
- * as exceptions out of this helper, whereas `runInternal` and the user-SQL
- * runners catch the same failures and return `{ok: false}`. The MCP wrapper
- * in index.ts handles both shapes, but don't assume drop-in equivalence
- * between the two.
+ * as exceptions out of the runner and out of this helper, whereas
+ * `runInternal` and the user-SQL runners catch the same failures and return
+ * `{ok: false}`. The MCP wrapper in index.ts handles both shapes, but don't
+ * assume drop-in equivalence between the two. The exception is what keeps a
+ * caller's per-statement `{ok: false}` handling -- pg_health's independent
+ * checks, "never an early return" -- from reporting an outage as a degraded
+ * answer.
  *
- * Audit note: a connect failure here writes NO audit line, and that is the
- * deliberate exception (#42). runInternal logs its refused connection as the
- * `ok: false` line of the statement it was about to run, and the user-SQL
- * runners log the agent's statement the same way, because in both the
- * statement is known when the connection is asked for. Here the connection
- * is checked out BEFORE the callback composes its first statement, so there
- * is nothing truthful to put in `sql` -- a placeholder would be a
- * non-statement in the field every consumer, and the redacted mode's hash,
- * reads as one. Nothing agent-supplied is lost: every caller sends only
- * server-composed catalog SQL through this helper, and the one that carries
- * agent input, pg_index_advisor's workload statements, reaches the database
- * through runInternal first, whose line records the failure. Connecting
- * lazily on the first `runOnClient` would attribute the failure to a real
- * statement, but it would also turn the exception above into a per-statement
- * `{ok: false}` that a caller's partial-failure handling (pg_health's "never
- * an early return") would report as a degraded success. The README's "What
- * the trail does not show" names the tools this covers.
+ * Audit note (#42): the connection is checked out by the FIRST statement the
+ * callback runs, inside that statement's audited step, not on entry. A pool
+ * that refuses it then leaves that statement's `ok: false` line, as
+ * runInternal leaves one for the statement it was about to run. Checked out
+ * on entry, a refused connection wrote nothing, for the seven tools whose
+ * first database access is this helper -- or whose first is the version
+ * probe, which the cache skips once it has answered, so an outage that began
+ * mid-session left no trace of pg_describe_table, pg_health, pg_advisor,
+ * pg_replication_status, pg_seq_scan_tables, pg_unused_indexes or
+ * pg_io_stats being called. One refused connection is one line: statements
+ * waiting on the same checkout (a `Promise.all` fan-out), or issued after it
+ * failed, fail with the same error and write nothing. The callback itself
+ * now starts before a connection exists; every caller composes SQL there
+ * and nothing else.
  */
 /**
  * Per-call options for {@link withSharedClient}'s runner.
@@ -1176,13 +1217,43 @@ export async function withSharedClient<T>(
     controls: SharedClientControls,
   ) => Promise<T>,
 ): Promise<T> {
-  const { client, release, expectClose } = await acquireClient();
+  let checkout: Checkout | undefined;
+  let acquiring: Promise<Checkout> | undefined;
+  // Wrapped so that a thrown `undefined` could not read as "no failure". Read
+  // through `connectFailed` below: it is assigned inside the checkout's
+  // rejection handler, which TypeScript's narrowing cannot see, so a direct
+  // read after the early throw in the runner would be typed `never`.
+  let connectFailure: { error: unknown } | undefined;
+  const connectFailed = (): { error: unknown } | undefined => connectFailure;
   let discardReason: Error | undefined;
+  let closeExpected = false;
   const controls: SharedClientControls = {
     discard(reason) {
       discardReason ??= reason;
     },
-    expectClose,
+    // Before the checkout exists the intent is kept and applied to it; after,
+    // forwarded.
+    expectClose() {
+      closeExpected = true;
+      checkout?.expectClose();
+    },
+  };
+  // One checkout per call, started by the first statement that asks (see the
+  // audit note above) and awaited by every statement that asks while it is in
+  // flight.
+  const acquire = (): Promise<Checkout> => {
+    acquiring ??= acquireClient().then(
+      (acquired) => {
+        checkout = acquired;
+        if (closeExpected) acquired.expectClose();
+        return acquired;
+      },
+      (err: unknown) => {
+        connectFailure = { error: err };
+        throw err;
+      },
+    );
+    return acquiring;
   };
   try {
     const runOnClient = async <R extends pg.QueryResultRow = pg.QueryResultRow>(
@@ -1190,26 +1261,49 @@ export async function withSharedClient<T>(
       params: unknown[] = [],
       options: RunOnClientOptions = {},
     ): Promise<SharedRunnerResult<R>> => {
+      const alreadyFailed = connectFailed();
+      if (alreadyFailed !== undefined) throw alreadyFailed.error;
+      // The first statement checks the connection out INSIDE its audited step,
+      // so a refusal is its line. Later ones wait for that checkout outside
+      // theirs: a refusal is thrown to them unlogged, so a fan-out on one
+      // refused connection is one line, not one per statement.
+      const first = acquiring === undefined;
+      if (!first) await acquire();
       try {
         // Same "internal" tagging as runInternal -- these run on a shared
         // client but are the same class of server-composed catalog SQL.
         const result = await auditQuery(
           { source: "internal", sql, paramCount: params.length },
-          () =>
-            options.extended
+          async () => {
+            const { client } = await acquire();
+            return options.extended
               ? client.query<R>({ text: sql, values: params, queryMode: "extended" } as UserQueryConfig)
-              : client.query<R>(sql, params),
+              : client.query<R>(sql, params);
+          },
           (r) => r.rowCount ?? r.rows.length,
         );
         return { ok: true, data: result.rows };
       } catch (err) {
+        // The connection, not the statement, failed: the documented contract
+        // is an exception, out of the runner and out of this helper.
+        const failed = connectFailed();
+        if (failed !== undefined && err === failed.error) throw err;
         const code = sqlState(err);
         return { ok: false, error: formatPgError(err), serverError: code !== undefined, code };
       }
     };
     return await fn(runOnClient, controls);
   } finally {
-    release(discardReason);
+    // Awaited rather than read: a callback that returned without awaiting a
+    // statement could leave the checkout still in flight, and a connection
+    // handed out after this ran would never go back.
+    if (acquiring !== undefined) {
+      try {
+        (await acquiring).release(discardReason);
+      } catch {
+        // Never checked out; nothing to hand back.
+      }
+    }
   }
 }
 
@@ -1219,6 +1313,8 @@ export async function shutdown(): Promise<void> {
   // DATABASE_URL (tests do exactly this), and a stale version would then gate
   // catalog queries against the wrong server.
   serverVersionNum = null;
+  versionProbe = null;
+  versionProbeFailure = undefined;
   // Invalidate any probe still in flight so it cannot republish the version of
   // the pool being torn down here.
   poolGeneration++;
