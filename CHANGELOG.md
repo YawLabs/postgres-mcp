@@ -19,12 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treats the version as published instead of failing with the token-error
   message. The MCP Registry publish is attempted up to four times, 30/60/90 s
   apart, but only on the answers waiting cures -- the version not found yet,
-  "Likely transient, retry later", or a failed npm metadata fetch; any other
-  error still fails at once, and a duplicate-version answer counts as done. The
-  registry's own HTTP 429, 502, 503 and 504 on that publish are retried on the
-  same clock, with a fresh registry login before each retry, since an attempt
-  that meets a timing-out gateway spends the gateway's own timeout and four of
-  them could outlast the 5-minute token.
+  "Likely transient, retry later", a failed npm metadata fetch, or the
+  registry's own HTTP 429, 502, 503 or 504 -- with a fresh registry login
+  before each retry; any other error still fails at once, and a
+  duplicate-version answer counts as done.
 
 ## [0.13.6] - 2026-09-23
 
