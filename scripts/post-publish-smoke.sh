@@ -44,7 +44,23 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "  -> installing ${PKG}@${VERSION} into ${TMP}"
 npm init -y >/dev/null
-npm install --no-save "${PKG}@${VERSION}" >/dev/null
+# npm resolves the version through its CDN-cached package document, which can
+# trail the publish by minutes: the post-publish npx smoke for
+# @yawlabs/lemonsqueezy-mcp 1.0.1 needed 313 s (2026-09-29).
+# So the install is retried, 60 attempts 10 s apart. The version check below
+# stays single-shot: a package that installs but reports the wrong version
+# still fails at once.
+ATTEMPT=1
+until npm install --no-save "${PKG}@${VERSION}" >/dev/null 2>"${TMP}/install.err"; do
+  if [ "$ATTEMPT" -ge 60 ]; then
+    cat "${TMP}/install.err" >&2
+    echo "  FAIL npm could not install ${PKG}@${VERSION} in 60 attempts" >&2
+    exit 1
+  fi
+  echo "  -> ${PKG}@${VERSION} is not installable yet (attempt ${ATTEMPT}/60) -- retrying in 10s"
+  ATTEMPT=$((ATTEMPT + 1))
+  sleep 10
+done
 
 echo "  -> invoking ${BIN} version"
 GOT=$(./node_modules/.bin/"${BIN}" version 2>&1 | tail -1)
