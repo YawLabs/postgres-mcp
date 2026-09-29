@@ -250,7 +250,7 @@ release_notes() {
 }
 
 # True when npm itself serves @yawlabs/postgres-mcp@${VERSION}: a 200 from the
-# per-version document, the exact URL the MCP Registry's validator fetches. NOT
+# per-version document, the same path the MCP Registry's validator fetches. NOT
 # `npm view`: that reads the whole packument, which registry.npmjs.org serves
 # from Cloudflare's edge for up to 300 s (Cache-Control: public, max-age=300;
 # measured 2026-09-28 still HIT with no-cache request headers), so right after
@@ -883,11 +883,13 @@ fi
 #     revalidation does not get past it), so a poll through it can keep
 #     reporting the pre-publish answer well after the version is live -- the
 #     loop would then outlast the condition it is waiting on.
-#   * The EXACT URL the MCP Registry fetches. Its npm validator requests
+#   * The same path the MCP Registry fetches. Its npm validator requests
 #     <base>/url.PathEscape(name)/<version>, and Go's PathEscape turns the scope
-#     slash into %2F (`@yawlabs%2Fpkg`, the `@` left bare). A literal-slash URL
-#     reaches the same origin but can be a different CDN cache entry, so success
-#     there would be a proxy rather than evidence about the path that fails.
+#     slash into %2F (`@yawlabs%2Fpkg`, the `@` left bare). npm_version_live
+#     adds an ignored `_` cache-buster query. Today that makes no difference,
+#     because this document is served uncached. If the edge ever did cache it,
+#     this gate would read origin while the validator read the edge, so step 7's
+#     retry loop, not this gate, is the backstop for that gap.
 #   * WARN, never fail, on timeout. If propagation is genuinely stuck, letting
 #     mcp-publisher run produces its own precise error naming the version and
 #     status; a timeout message from this loop would replace that with something
