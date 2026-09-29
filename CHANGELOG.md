@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-09-29
+
 ### Fixed
 
 - **`release.sh` reads npm's per-version document and retries the MCP Registry
