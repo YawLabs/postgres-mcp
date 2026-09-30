@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `release.sh` waits up to 600 s, not 300, for npm to serve a new version before
+  the MCP Registry step, and polls npm up to 120 times 5 s apart in its final
+  check, not five times. `scripts/post-publish-smoke.sh` tries its `npm install`
+  of the new version up to 60 times, 10 s apart, instead of once. On 2026-09-29
+  the @yawlabs/fetch-mcp 0.8.2 release spent 295 s of its 300 s gate waiting for
+  npm to serve the new version, and `npx` needed 313 s, 24 of its 30 attempts,
+  to install @yawlabs/lemonsqueezy-mcp 1.0.1. Release tooling only; the server
+  itself is unchanged.
+
 ## [0.13.7] - 2026-09-29
 
 ### Fixed
