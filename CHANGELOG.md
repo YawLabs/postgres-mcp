@@ -65,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   403 says what the io.github.YawLabs namespace takes: a YawLabs org Owner whose
   token can read org roles. Release tooling only; the server itself is
   unchanged.
+- `scripts/update-manifests.mjs` escapes every value it writes into a Ruby
+  string in the Homebrew formula (CodeQL js/incomplete-sanitization). The
+  description was escaped for `"` only, so a `\"` in it came out as `\\"`, an
+  escaped backslash and then a closing quote, and a `#{...}` in it would have
+  run as Ruby when brew loaded the formula. A new `rubyString()` escapes the
+  backslash first, then `"`, a `#` that starts interpolation, CR and LF, and is
+  applied to desc, homepage, version, license, the asset URLs and hashes and
+  the command name. The script only runs its release steps when executed
+  directly (comparing real paths, so a junction or symlink still counts), so
+  `src/update-manifests.test.ts` can import it. For the real package.json the
+  generated formula and Scoop manifest are byte-identical to before. Release
+  tooling only; the server itself is unchanged.
 
 ## [0.13.7] - 2026-09-29
 
