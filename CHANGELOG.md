@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.15.2 to 0.18.0, so the `postgres-mcp` launcher
+  no longer runs the server on an older oam.** This server is verified on one
+  oam release at a time, and the floor keeps the launcher off anything older
+  than that release. 0.18.0 is verified on the published
+  aarch64-pc-windows-msvc binary, checksum matched against the release
+  SHA256SUMS, through the launcher with `OAM_BIN` pointing at it and a local
+  PostgreSQL 18.3: a full MCP handshake listing all 23 tools (the same 23 as on
+  Node), a `pg_readonly` query answering byte-for-byte as it does on Node (same
+  rows, same `dataTypeName` values), and the server process confirmed as that
+  binary (`oam run .../dist/index.js` as the launcher's child). The sandbox the
+  README documents was re-measured on it: with `POSTGRES_MCP_SANDBOX=1
+  POSTGRES_MCP_RUNTIME=oam` the launcher spawns `oam --permission
+  --allow-net=localhost:5432 --allow-env=... run`, the same query answers as it
+  does on Node, and under the same flags a connect to port 5433 and a file read
+  are refused with `ERR_ACCESS_DENIED`. **If the launcher finds only an oam from
+  0.15.2 to 0.17.x, it now falls back to Node under the default
+  `POSTGRES_MCP_RUNTIME=auto`, and exits with an error under
+  `POSTGRES_MCP_RUNTIME=oam` or `POSTGRES_MCP_SANDBOX=1`** -- it says so on
+  stderr, naming the version it found and the floor (measured with oam 0.17.0:
+  `is oam 0.17.0, older than 0.18.0; using Node instead.`). On Node every tool
+  answers the same; what is lost is the sandbox, which needs a fresh oam at the
+  floor and refuses to start without one. A host that launches the command with
+  `oam run` on 0.15.2 to 0.17.x now hands off to a newer oam or to Node instead
+  of serving in-process. A client that runs `oam run
+  /path/to/postgres-mcp/dist/index.js` directly bypasses the launcher and keeps
+  the oam it names. Run `oam self-update`, or set `POSTGRES_MCP_RUNTIME=node` to
+  make the choice explicit.
+
 ### Fixed
 - `release.sh` waits up to 600 s, not 300, for npm to serve a new version before
   the MCP Registry step, and polls npm up to 120 times 5 s apart in its final
