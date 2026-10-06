@@ -43,7 +43,7 @@
  * version, and the NEWEST one at or above the floor wins; a tie keeps search
  * order. Taking the first binary found instead let a stale copy early in the
  * search order hide a current one later: with oam 0.9.0 in ~/.oam/bin and
- * 0.15.2 on PATH, a launcher that stops at the first hit runs 0.9.0.
+ * 0.18.0 on PATH, a launcher that stops at the first hit runs 0.9.0.
  *
  * An OAM_BIN that does not exist, is below the floor, or will not run is named
  * on stderr and discovery carries on. It used to stop everything: a typo in
@@ -112,7 +112,7 @@
  * and friends) -- a hand-written list misses those.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
  * Below 0.9.0 `child_process.execFile` ran its arguments through a SHELL,
  * `exec` accepted `timeout` and ignored it, `spawnSync` truncated at
@@ -149,7 +149,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam this launcher will run on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 15, 2];
+const OAM_MIN = [0, 18, 0];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
