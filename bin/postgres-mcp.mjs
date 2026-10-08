@@ -97,13 +97,20 @@
  * and the suite checks it against the bundled pg. Host and port are both pinned: a
  * grant with no port admits every port on that host, and a comma would split the
  * grant into several entries. When no single TCP endpoint can be pinned -- a Unix
- * socket (oam has none), a host list (pg has no multi-host support), a host a
- * grant cannot match exactly, a port outside 1-65535, or a DATABASE_URL that is not
- * a readable postgres:// URL -- the launcher refuses. With DATABASE_URL unset no
+ * socket (the launcher only grants host:port), a host list (pg has no multi-host
+ * support), a host a grant cannot match exactly, a port outside 1-65535, or a
+ * DATABASE_URL that is not a readable postgres:// URL -- the launcher refuses.
+ * oam itself dials a Unix socket since 0.18.0, and under --permission it admits
+ * one through an exact `--allow-net=<dir>/.s.PGSQL.<port>` plus --allow-fs-read
+ * and --allow-fs-write of that path; the launcher does not emit that grant until
+ * it has been verified against a real socket on a Unix host. With DATABASE_URL unset no
  * --allow-net is passed at all: every connection is denied and the server reports
  * the missing variable as it does unsandboxed. On Windows the sandboxed names are
  * passed to oam in exact case. Filesystem and child-process stay denied; oam does
- * not gate DNS lookups.
+ * not gate DNS lookups. A `--permission` or `--allow-*` in an inherited
+ * NODE_OPTIONS is removed from the child's copy: oam reads permission flags from
+ * NODE_OPTIONS too and adds them to the ones on its command line, so one left in
+ * place would widen the grant without a word.
  *
  * Opt-in, not default. A denied environment variable is ABSENT from process.env
  * rather than throwing, so an under-granted DATABASE_URL would look like "not
@@ -190,6 +197,11 @@ function pathKey(p) {
  * defaults to %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin
  * first and OAM_INSTALL_DIR can pick either.
  *
+ * OAM_INSTALL_DIR itself, when set, is checked first: it is the directory oam's
+ * installers and `oam self-update` write the binary to (oam docs/cli-reference.md),
+ * so an oam installed to a custom directory that is not on PATH is still found.
+ * Like the other installed locations it only breaks a version tie.
+ *
  * PATH is resolved manually rather than by spawning `which`/`where`, which
  * would cost a subprocess on every launch just to decide whether to spawn.
  *
@@ -205,6 +217,7 @@ function discoverOamPaths() {
   if (isWin) {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
+  if (process.env.OAM_INSTALL_DIR) installed.unshift(join(process.env.OAM_INSTALL_DIR, exe));
   const onPath = (process.env.PATH ?? "")
     .split(delimiter)
     .filter(Boolean)
@@ -505,13 +518,13 @@ function endpointProblem({ code, part, host, port, from, hint }) {
     return {
       problem:
         host === null
-          ? `${pin} DATABASE_URL ${from === "path" ? 'starts with "/", which the pg driver reads as a Unix socket directory' : "names a Unix socket (socket://)"}, and oam can only connect over TCP`
-          : `${pin} the database host ${show(host)} from ${hostWhere} is a Unix socket directory, and oam can only connect over TCP`,
+          ? `${pin} DATABASE_URL ${from === "path" ? 'starts with "/", which the pg driver reads as a Unix socket directory' : "names a Unix socket (socket://)"}, and the sandbox can only pin a TCP host and port`
+          : `${pin} the database host ${show(host)} from ${hostWhere} is a Unix socket directory, and the sandbox can only pin a TCP host and port`,
       // host === null means nothing was pulled out of the DSN to echo, so say
       // why it is missing, as every other no-echo refusal does.
       details: host === null ? [notShown] : [],
       remedy:
-        "Connect over TCP instead (for example postgres://user@localhost:5432/database), or unset POSTGRES_MCP_SANDBOX and set POSTGRES_MCP_RUNTIME=node to keep the socket without the sandbox",
+        "Connect over TCP instead (for example postgres://user@localhost:5432/database), or unset POSTGRES_MCP_SANDBOX to keep the socket without the sandbox",
     };
   }
   if (code === "host-list") {
@@ -731,18 +744,27 @@ function unusableReason(path, version, label = path) {
  * Choose the oam to spawn: a usable OAM_BIN, else the newest usable discovered
  * binary. Returns the choice (or null) plus stderr notes: `overrideNote` about
  * an unusable OAM_BIN, and `skipped` describing what was found and rejected
- * when nothing was usable.
+ * when nothing was usable. `passedOver` holds the version of every binary that
+ * was found and rejected (null for one that would not run), and
+ * `overrideMissing` says OAM_BIN named a path that does not exist -- the
+ * inputs remedyFor needs to say which fix applies.
  */
 function chooseOam() {
   const override = process.env.OAM_BIN;
   let overrideNote = null;
+  let overrideMissing = false;
+  const passedOver = [];
   if (override) {
     if (!existsSync(override)) {
       overrideNote = `OAM_BIN=${override} does not exist`;
+      overrideMissing = true;
     } else {
       const version = oamVersion(override);
-      if (atLeast(version, OAM_MIN)) return { chosen: { path: override, version }, overrideNote, skipped: [] };
+      if (atLeast(version, OAM_MIN)) {
+        return { chosen: { path: override, version }, overrideNote, skipped: [], passedOver, overrideMissing };
+      }
       overrideNote = unusableReason(override, version, `OAM_BIN=${override}`);
+      passedOver.push(version);
     }
   }
   const overrideKey = override ? pathKey(override) : null;
@@ -751,7 +773,40 @@ function chooseOam() {
     .map((path) => ({ path, version: oamVersion(path) }));
   const chosen = pickNewest(candidates);
   const skipped = chosen ? [] : candidates.map((c) => unusableReason(c.path, c.version));
-  return { chosen, overrideNote, skipped };
+  if (!chosen) passedOver.push(...candidates.map((c) => c.version));
+  return { chosen, overrideNote, skipped, passedOver, overrideMissing };
+}
+
+/**
+ * The fix for "no usable oam", split by cause, as sentences without their
+ * final period. An oam that is merely too old needs `oam self-update`, which
+ * updates it in place and verifies the signed release manifest; sending its
+ * owner to the website to reinstall is the long way round, and since 0.18.0
+ * the installers also need ssh-keygen 8.1 or newer. One that would not run
+ * needs checking, not updating. Only when nothing was found at all is
+ * installing the answer -- and not on Linux off x64, where oam publishes no
+ * build to install. `tail` is the way out that drops oam, which differs by
+ * mode.
+ *
+ * Pure on purpose: `platform` and `arch` are passed in so every branch is
+ * testable on one machine.
+ */
+function remedyFor({ passedOver, overrideMissing, shim }, tail, platform = process.platform, arch = process.arch) {
+  const lines = [];
+  if (passedOver.some((v) => v !== null)) lines.push(`Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer`);
+  if (passedOver.some((v) => v === null)) {
+    lines.push("Check that each binary named above is an executable oam for this platform, or point OAM_BIN at one");
+  }
+  if (overrideMissing) lines.push("Point OAM_BIN at an existing oam binary, or unset it");
+  if (lines.length === 0 && !shim) {
+    lines.push(
+      platform === "linux" && arch !== "x64"
+        ? `oam publishes no build for linux-${arch}, so there is nothing to install here: set OAM_BIN=/path/to/oam if you built one yourself`
+        : "Install oam from https://oamjs.org, or set OAM_BIN=/path/to/oam",
+    );
+  }
+  lines.push(tail);
+  return lines;
 }
 
 /** Run the server in THIS process. The zero-overhead fallback. */
@@ -909,11 +964,78 @@ async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
 }
 
 /**
+ * A NODE_OPTIONS value with oam's permission flags taken out: `--permission`
+ * and every `--allow-*` token, in either `--flag=value` or bare form. Every
+ * other token is kept as written, quoted ones included. Returns undefined when
+ * nothing is left, so the caller can drop the variable instead of passing an
+ * empty one.
+ *
+ * Why: oam 0.18.0 passes a `--permission` parent's grants to every child in
+ * NODE_OPTIONS, for any program, and oam-only flags such as `--allow-net` or
+ * `--allow-env` there make Node exit 9 before it runs a line ("--allow-net= is
+ * not allowed in NODE_OPTIONS", measured on Node 22.22 under oam 0.18.0). A
+ * NODE_OPTIONS that reached this launcher already carrying them -- from an oam
+ * grandparent -- would kill a Node handoff the same way.
+ */
+function stripPermissionOptions(value) {
+  if (value === undefined) return undefined;
+  const tokens = value.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
+  const kept = tokens.filter((t) => !/^--(?:permission|allow-[A-Za-z0-9-]+)(?:=.*)?$/.test(t));
+  return kept.length > 0 ? kept.join(" ") : undefined;
+}
+
+/**
+ * `source` with NODE_OPTIONS passed through stripPermissionOptions, under any
+ * spelling of the name. Every other variable is untouched. Used for two
+ * children:
+ *   - a Node handoff, which exits 9 on oam-only flags in NODE_OPTIONS;
+ *   - the sandboxed oam, which reads permission flags from NODE_OPTIONS as well
+ *     as from its argv and ADDS them: measured on oam 0.18.0,
+ *     `NODE_OPTIONS=--allow-fs-read=* oam --permission run x.mjs` reads any
+ *     file. An inherited NODE_OPTIONS would widen the pinned sandbox past the
+ *     one database endpoint without a word.
+ */
+function withoutPermissionOptions(source) {
+  const out = { ...source };
+  for (const key of Object.keys(out)) {
+    if (key.toUpperCase() !== "NODE_OPTIONS") continue;
+    const stripped = stripPermissionOptions(out[key]);
+    if (stripped === undefined) delete out[key];
+    else out[key] = stripped;
+  }
+  return out;
+}
+
+/**
+ * Whether THIS process is an oam that will push its `--permission` grants onto
+ * a Node child. From oam 0.18.0 every child is handed them in NODE_OPTIONS at
+ * spawn time, after any env this launcher passes -- so stripping them from the
+ * env cannot stop it, and a Node child exits 9 on the oam-only ones (measured:
+ * the same exit with NODE_OPTIONS cleared in the spawn's env). Up to 0.17.1 a
+ * child started with none of them, so an older host is not affected.
+ */
+function permissionReachesChildren(hostOam, execArgv) {
+  if (!atLeast(parseVersion(hostOam ?? ""), [0, 18, 0])) return false;
+  return execArgv.some((a) => a === "--permission" || a.startsWith("--permission="));
+}
+
+/**
  * Hand the server to Node on PATH. Only reachable when THIS process is oam --
  * one below the floor, or any oam under POSTGRES_MCP_RUNTIME=node -- so there
  * is no in-process option left.
  */
 async function handOffToNode(reason) {
+  if (permissionReachesChildren(process.versions.oam, process.execArgv)) {
+    // oam would append its grants to Node's NODE_OPTIONS, and Node refuses
+    // the oam-only ones: the handoff could only end in a cryptic exit 9.
+    await errSync(
+      `postgres-mcp: ${reason || "POSTGRES_MCP_RUNTIME=node"}, but this oam runs under --permission, and it passes its --permission and --allow-* flags to every child in NODE_OPTIONS, which Node rejects.\n` +
+        (reason
+          ? `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`
+          : "Unset POSTGRES_MCP_RUNTIME to run on this oam, or launch this command with node.\n"),
+    );
+    process.exit(1);
+  }
   const node = findNodeOnPath();
   if (!node) {
     // An empty reason is POSTGRES_MCP_RUNTIME=node on a supported oam, where
@@ -928,10 +1050,15 @@ async function handOffToNode(reason) {
     process.exit(1);
   }
   if (reason) await errSync(`postgres-mcp: ${reason}; running on ${node} instead.\n`);
-  await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
-    await errSync(`postgres-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
-    process.exit(1);
-  });
+  await launchChild(
+    node,
+    [SERVER_ENTRY, ...process.argv.slice(2)],
+    async (err) => {
+      await errSync(`postgres-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+      process.exit(1);
+    },
+    withoutPermissionOptions(process.env),
+  );
 }
 
 const mode = (process.env.POSTGRES_MCP_RUNTIME ?? "auto").toLowerCase();
@@ -985,7 +1112,7 @@ if (plan === "refuse-sandbox") {
 let sandbox = [];
 let childEnv = process.env;
 if (setting.on) {
-  childEnv = sandboxChildEnv(process.env, SANDBOX_ENV, process.platform);
+  childEnv = withoutPermissionOptions(sandboxChildEnv(process.env, SANDBOX_ENV, process.platform));
   const endpoint = sandboxEndpoint(childEnv.DATABASE_URL, childEnv.PGHOST, childEnv.PGPORT);
   if (endpoint.refusal) await refuse(sandboxRefusal(setting.shown, endpointProblem(endpoint.refusal)));
   sandbox = sandboxFlags(endpoint.grant);
@@ -996,7 +1123,7 @@ if (plan === "in-process") {
 } else if (plan === "handoff-node") {
   await handOffToNode(hostIsSupportedOam ? "" : `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}`);
 } else {
-  const { chosen, overrideNote, skipped } = chooseOam();
+  const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
   if (chosen) {
     if (overrideNote) {
@@ -1031,6 +1158,7 @@ if (plan === "in-process") {
     );
   } else {
     const shim = findOamShim();
+    const found = { passedOver, overrideMissing, shim };
     const notes = [
       ...(overrideNote ? [overrideNote] : []),
       ...skipped,
@@ -1045,8 +1173,7 @@ if (plan === "in-process") {
         sandboxRefusal(setting.shown, {
           problem: `needs a freshly launched oam to apply --permission, but no usable oam (${OAM_MIN.join(".")} or newer) was found`,
           details: notes.length > 0 ? notes : ["no oam binary was found in the installed locations or on PATH"],
-          remedy:
-            "Install or update oam from https://oamjs.org, set OAM_BIN=/path/to/oam, or unset POSTGRES_MCP_SANDBOX to run without the sandbox",
+          remedy: remedyFor(found, "Or unset POSTGRES_MCP_SANDBOX to run without the sandbox").join(".\n"),
         }),
       );
     }
@@ -1056,7 +1183,9 @@ if (plan === "in-process") {
       await errSync(
         `postgres-mcp: POSTGRES_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
-          "Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, or use POSTGRES_MCP_RUNTIME=node.\n",
+          remedyFor(found, "Or use POSTGRES_MCP_RUNTIME=node to run on Node")
+            .map((line) => `${line}.\n`)
+            .join(""),
       );
       process.exit(1);
     }

@@ -54,6 +54,7 @@
     "test:integration": "npm run build && node scripts/run-tests.mjs dist --integration",
     "lint": "node scripts/lint.mjs check src/",
     "lint:fix": "node scripts/lint.mjs check --write src/",
+    "check:oam-floor": "node scripts/check-oam-floor.mjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

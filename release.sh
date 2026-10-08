@@ -360,6 +360,17 @@ cd "$SCRIPT_DIR"
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
 
+# ---- oam floor: drift and staleness ----
+# The drift half also runs in the unit suite (src/oam-floor.test.ts). This adds
+# the staleness half, which needs the network: a floor behind the latest oam
+# release stops the release unless POSTGRES_MCP_ALLOW_STALE_OAM=1 is the
+# deliberate way past it. A machine with no network is not a failure -- the
+# check says so and continues.
+if [ -f scripts/check-oam-floor.mjs ]; then
+  echo ""
+  node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set POSTGRES_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
+fi
+
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 RESUMING=false
 

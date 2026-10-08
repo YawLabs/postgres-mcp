@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`POSTGRES_MCP_SANDBOX=1` no longer lets an inherited `NODE_OPTIONS` widen
+  the sandbox.** oam 0.18.0 reads `--permission` and `--allow-*` flags from
+  `NODE_OPTIONS` as well as from its command line, and adds them together:
+  measured, `NODE_OPTIONS=--allow-fs-read=*` beside the launcher's
+  `oam --permission ... run` let the server read any file. The launcher now
+  removes those flags from the sandboxed oam's copy of `NODE_OPTIONS` and keeps
+  every other token.
+
+### Fixed
+- **A Node handoff from an oam 0.18.0 host running under `--permission` now
+  says why it cannot work, instead of Node exiting 9.** oam 0.18.0 hands its
+  `--permission` and `--allow-*` flags to every child in `NODE_OPTIONS`, after
+  any environment the launcher passes, and Node rejects the oam-only ones
+  (`--allow-net= is not allowed in NODE_OPTIONS`). With
+  `POSTGRES_MCP_RUNTIME=node` on such a host the launcher now exits with a
+  message naming the fix. Every other Node handoff gets a `NODE_OPTIONS` with
+  oam's permission flags removed, so one inherited from an oam further up the
+  tree does not stop Node either.
+- **"No usable oam" now names the fix that fits what was found.** An oam that
+  is too old gets "Run `oam self-update` to get oam 0.18.0 or newer", one that
+  would not run gets a check of the binary, and a missing `OAM_BIN` gets a
+  pointer to fix it. Only when no oam was found at all does the message say to
+  install from oamjs.org -- and on Linux off x64, where oam publishes no
+  build, it says so instead. Both messages changed: `POSTGRES_MCP_RUNTIME=oam`
+  and `POSTGRES_MCP_SANDBOX=1`. They used to say "Install or update oam from
+  https://oamjs.org" in every case.
+- **The Unix-socket sandbox refusal no longer says oam cannot connect to a
+  socket.** oam has dialled Unix sockets since 0.18.0; what the sandbox cannot
+  do is pin one, because the launcher only grants a TCP host and port. The
+  refusal now says that, and its remedy is "connect over TCP, or unset
+  `POSTGRES_MCP_SANDBOX`" -- it no longer sends you to
+  `POSTGRES_MCP_RUNTIME=node`, which the socket does not need.
+- **The launcher finds an oam installed to `OAM_INSTALL_DIR`.** That variable
+  is where oam's installers and `oam self-update` put the binary, but discovery
+  only checked the default directories and `PATH`, so an oam installed
+  somewhere custom and not on `PATH` was never found. `$OAM_INSTALL_DIR` is now
+  checked first.
+
+### Added
+- **An integration test runs the sandbox against a real oam and database.**
+  With `OAM_BIN` and `DATABASE_URL` both set, it completes an MCP handshake and
+  a `select 1` through the launcher with `POSTGRES_MCP_SANDBOX=1
+  POSTGRES_MCP_RUNTIME=oam`, then checks under the launcher's own flags that
+  the pinned port connects and the port next to it is refused with
+  `ERR_ACCESS_DENIED`. The grant semantics oam 0.18.0 changed were measured by
+  hand until now.
+- **`scripts/check-oam-floor.mjs`, ported from aws-mcp.** It checks that every
+  floor claim in the launcher, the README and the suite names the same version
+  as `OAM_MIN` (on every `npm test`, through `src/oam-floor.test.ts`), and,
+  from `release.sh`, that the floor is not behind the latest oam release.
+  `POSTGRES_MCP_ALLOW_STALE_OAM=1` releases on an old floor deliberately; no
+  network is not a failure.
+
 ## [0.13.8] - 2026-10-06
 
 ### Changed
