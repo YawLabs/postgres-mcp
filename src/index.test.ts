@@ -1958,12 +1958,12 @@ describe("launcher: oam's permission flags in NODE_OPTIONS", () => {
       ATLEAST_DECL,
       /function stripPermissionOptions\(value\) \{[\s\S]*?\r?\n\}/,
       /function withoutPermissionOptions\(source\) \{[\s\S]*?\r?\n\}/,
-      /function permissionReachesChildren\(hostOam, execArgv\) \{[\s\S]*?\r?\n\}/,
+      /function permissionReachesChildren\(hostOam, execArgv, nodeOptions\) \{[\s\S]*?\r?\n\}/,
     ])}\nreturn { stripPermissionOptions, withoutPermissionOptions, permissionReachesChildren };`,
   )() as {
     stripPermissionOptions: (v: string | undefined) => string | undefined;
     withoutPermissionOptions: (env: Record<string, string | undefined>) => Record<string, string | undefined>;
-    permissionReachesChildren: (hostOam: string | undefined, execArgv: string[]) => boolean;
+    permissionReachesChildren: (hostOam: string | undefined, execArgv: string[], nodeOptions?: string) => boolean;
   };
 
   it("removes --permission and every --allow-* token, and keeps the rest as written", () => {
@@ -1977,6 +1977,19 @@ describe("launcher: oam's permission flags in NODE_OPTIONS", () => {
     assert.equal(stripPermissionOptions(undefined), undefined);
     // Not a permission flag, whatever it looks like.
     assert.equal(stripPermissionOptions("--allowed-thing --no-warnings"), "--allowed-thing --no-warnings");
+  });
+
+  it("judges a quoted token on the value oam reads, not on its raw text", () => {
+    // oam unquotes single and double quotes anywhere in a token; measured on
+    // 0.18.0, each of these widens a --permission run like the bare flag.
+    for (const spelled of ['"--allow-fs-read=*"', "'--allow-fs-read=*'", '--allow-"fs-read"=*', "'--permission'"]) {
+      assert.equal(stripPermissionOptions(`--no-warnings ${spelled}`), "--no-warnings", spelled);
+    }
+    // A quoted value that is not a permission flag is kept as written, spaces and all.
+    assert.equal(
+      stripPermissionOptions("--require '/a b/--allow-net.js' --allow-net"),
+      "--require '/a b/--allow-net.js'",
+    );
   });
 
   it("drops a NODE_OPTIONS that held only permission flags, under any spelling of the name, and nothing else", () => {
@@ -1994,6 +2007,11 @@ describe("launcher: oam's permission flags in NODE_OPTIONS", () => {
     assert.equal(permissionReachesChildren("0.17.1", ["--permission"]), false);
     assert.equal(permissionReachesChildren("0.18.0", ["--no-warnings"]), false);
     assert.equal(permissionReachesChildren(undefined, ["--permission"]), false);
+    // --permission from NODE_OPTIONS turns the model on without showing in
+    // execArgv, and oam still copies execArgv's --allow-* entries.
+    assert.equal(permissionReachesChildren("0.18.0", ["--allow-net=db:5432"], "--permission"), true);
+    assert.equal(permissionReachesChildren("0.18.0", ["--allow-net=db:5432"], "--no-warnings"), false);
+    assert.equal(permissionReachesChildren("0.18.0", ["--no-warnings"], "--permission"), false);
   });
 
   it("strips them from the sandboxed oam's environment, so they cannot widen the pinned grant", async () => {

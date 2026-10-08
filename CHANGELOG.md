@@ -10,11 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **`POSTGRES_MCP_SANDBOX=1` no longer lets an inherited `NODE_OPTIONS` widen
   the sandbox.** oam 0.18.0 reads `--permission` and `--allow-*` flags from
-  `NODE_OPTIONS` as well as from its command line, and adds them together:
-  measured, `NODE_OPTIONS=--allow-fs-read=*` beside the launcher's
+  `NODE_OPTIONS` as well as from its command line, and takes every one the
+  command line leaves out from there: measured,
+  `NODE_OPTIONS=--allow-fs-read=*` beside the launcher's
   `oam --permission ... run` let the server read any file. The launcher now
-  removes those flags from the sandboxed oam's copy of `NODE_OPTIONS` and keeps
-  every other token.
+  removes those flags from the sandboxed oam's copy of `NODE_OPTIONS` -- judged
+  on the value oam reads, so a quoted `"--allow-fs-read=*"` goes too -- and
+  keeps every other token.
 
 ### Fixed
 - **A Node handoff from an oam 0.18.0 host running under `--permission` now

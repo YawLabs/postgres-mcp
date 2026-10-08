@@ -109,8 +109,10 @@
  * passed to oam in exact case. Filesystem and child-process stay denied; oam does
  * not gate DNS lookups. A `--permission` or `--allow-*` in an inherited
  * NODE_OPTIONS is removed from the child's copy: oam reads permission flags from
- * NODE_OPTIONS too and adds them to the ones on its command line, so one left in
- * place would widen the grant without a word.
+ * NODE_OPTIONS too and uses them for every one its command line leaves out (a
+ * list flag on the command line wins; a bare one such as --allow-child-process
+ * is granted from either), so one left in place would widen the grant without a
+ * word.
  *
  * Opt-in, not default. A denied environment variable is ABSENT from process.env
  * rather than throwing, so an under-granted DATABASE_URL would look like "not
@@ -970,6 +972,13 @@ async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
  * nothing is left, so the caller can drop the variable instead of passing an
  * empty one.
  *
+ * A token is judged on the value oam reads, not on its raw text: oam splits
+ * NODE_OPTIONS on whitespace and honours single and double quotes anywhere in
+ * a token, dropping them (split_node_options in oam_cli). Measured on oam
+ * 0.18.0, `"--allow-fs-read=*"`, `'--allow-fs-read=*'` and
+ * `--allow-"fs-read"=*` each widen a `--permission` run exactly as the bare
+ * token does, so a filter on the raw text would let any of them through.
+ *
  * Why: oam 0.18.0 passes a `--permission` parent's grants to every child in
  * NODE_OPTIONS, for any program, and oam-only flags such as `--allow-net` or
  * `--allow-env` there make Node exit 9 before it runs a line ("--allow-net= is
@@ -979,8 +988,29 @@ async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
  */
 function stripPermissionOptions(value) {
   if (value === undefined) return undefined;
-  const tokens = value.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
-  const kept = tokens.filter((t) => !/^--(?:permission|allow-[A-Za-z0-9-]+)(?:=.*)?$/.test(t));
+  const tokens = [];
+  let raw = "";
+  let read = "";
+  let quote = null;
+  for (const ch of value) {
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      else read += ch;
+      raw += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      raw += ch;
+    } else if (/\s/.test(ch)) {
+      if (raw !== "") tokens.push({ raw, read });
+      raw = "";
+      read = "";
+    } else {
+      raw += ch;
+      read += ch;
+    }
+  }
+  if (raw !== "") tokens.push({ raw, read });
+  const kept = tokens.filter((t) => !/^--(?:permission|allow-[A-Za-z0-9-]+)(?:=[\s\S]*)?$/.test(t.read)).map((t) => t.raw);
   return kept.length > 0 ? kept.join(" ") : undefined;
 }
 
@@ -990,7 +1020,9 @@ function stripPermissionOptions(value) {
  * children:
  *   - a Node handoff, which exits 9 on oam-only flags in NODE_OPTIONS;
  *   - the sandboxed oam, which reads permission flags from NODE_OPTIONS as well
- *     as from its argv and ADDS them: measured on oam 0.18.0,
+ *     as from its argv and takes every one argv leaves out (NodeFlags::merged
+ *     in oam_cli: argv's list flags win, the bare ones are ORed): measured on
+ *     oam 0.18.0,
  *     `NODE_OPTIONS=--allow-fs-read=* oam --permission run x.mjs` reads any
  *     file. An inherited NODE_OPTIONS would widen the pinned sandbox past the
  *     one database endpoint without a word.
@@ -1013,10 +1045,18 @@ function withoutPermissionOptions(source) {
  * env cannot stop it, and a Node child exits 9 on the oam-only ones (measured:
  * the same exit with NODE_OPTIONS cleared in the spawn's env). Up to 0.17.1 a
  * child started with none of them, so an older host is not affected.
+ *
+ * oam copies the permission flags in its execArgv whenever the permission
+ * model is on (js/node_compat.js, childProcessEnv), and the model is also on
+ * when `--permission` came from NODE_OPTIONS, which execArgv does not list. So
+ * an execArgv holding only `--allow-*` entries reaches the child too when the
+ * host's NODE_OPTIONS names `--permission` -- and this launcher strips that
+ * from the child's copy, so oam does not see it there and skips the copy.
  */
-function permissionReachesChildren(hostOam, execArgv) {
+function permissionReachesChildren(hostOam, execArgv, nodeOptions) {
   if (!atLeast(parseVersion(hostOam ?? ""), [0, 18, 0])) return false;
-  return execArgv.some((a) => a === "--permission" || a.startsWith("--permission="));
+  if (execArgv.some((a) => a === "--permission" || a.startsWith("--permission="))) return true;
+  return /--permission/.test(nodeOptions ?? "") && execArgv.some((a) => /^--allow-/.test(a));
 }
 
 /**
@@ -1025,7 +1065,7 @@ function permissionReachesChildren(hostOam, execArgv) {
  * is no in-process option left.
  */
 async function handOffToNode(reason) {
-  if (permissionReachesChildren(process.versions.oam, process.execArgv)) {
+  if (permissionReachesChildren(process.versions.oam, process.execArgv, process.env.NODE_OPTIONS)) {
     // oam would append its grants to Node's NODE_OPTIONS, and Node refuses
     // the oam-only ones: the handoff could only end in a cryptic exit 9.
     await errSync(
