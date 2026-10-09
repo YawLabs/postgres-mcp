@@ -706,11 +706,22 @@ describe("launcher: runtime selection", () => {
     // land here, and the note under it says which one it was.
     assert.match(res.stderr, /no usable oam \(0\.18\.0 or newer\) was found/);
     assert.match(res.stderr, /^ {2}OAM_BIN=.*does not exist$/m);
-    assert.match(res.stderr, /oamjs\.org/);
-    // The remedies are the actionable half: an operator who demanded oam and
-    // got an error needs the three ways out, not just the diagnosis.
-    assert.match(res.stderr, /OAM_BIN=\/path\/to\/oam/);
-    assert.match(res.stderr, /POSTGRES_MCP_RUNTIME=node/);
+    // The remedies are the actionable half, and they fit the cause: a missing
+    // OAM_BIN is fixed by pointing it somewhere real, not by reinstalling oam.
+    assert.match(res.stderr, /^Point OAM_BIN at an existing oam binary, or unset it\.$/m);
+    assert.doesNotMatch(res.stderr, /oamjs\.org/);
+    assert.doesNotMatch(res.stderr, /self-update/);
+    assert.match(res.stderr, /^Or use POSTGRES_MCP_RUNTIME=node to run on Node\.$/m);
+  });
+
+  it("POSTGRES_MCP_RUNTIME=oam with no oam at all says to install it", {
+    skip: process.platform === "linux" && process.arch !== "x64" && "oam publishes no build to install here",
+  }, async () => {
+    const res = await runLauncher(["version"], noOamAnywhere({ POSTGRES_MCP_RUNTIME: "oam" }));
+    assert.equal(res.code, 1);
+    assert.equal(res.stdout, "", "nothing may be served");
+    assert.match(res.stderr, /^Install oam from https:\/\/oamjs\.org, or set OAM_BIN=\/path\/to\/oam\.$/m);
+    assert.match(res.stderr, /^Or use POSTGRES_MCP_RUNTIME=node to run on Node\.$/m);
   });
 
   it("passes the argv guard through to the server", async () => {
@@ -1162,7 +1173,7 @@ describe("launcher: sandboxEndpoint() refusals", () => {
     assert.deepEqual(refusal("host=db port=6543 dbname=app"), { code: "not-postgres", hint: "key-value" });
   });
 
-  it("refuses a Unix socket, which oam cannot connect to at all", () => {
+  it("refuses a Unix socket, which the sandbox cannot pin to a host and port", () => {
     // host: null, never the text: on the leading-"/" form the "host" IS the
     // DSN, so there is nothing to echo that could not carry a password. The
     // no-echo test below feeds this branch credentials.
@@ -1293,10 +1304,14 @@ describe("launcher: sandbox refusal messages", () => {
     assert.ok(
       message(" postgres://h.example/app").includes("  it starts with whitespace\n  DATABASE_URL is not shown"),
     );
-    assert.ok(
-      message("postgres:///app", "/tmp").includes("POSTGRES_MCP_RUNTIME=node"),
-      "a socket has a no-sandbox way out",
-    );
+    // A socket has a no-sandbox way out. oam has dialled Unix sockets since
+    // 0.18.0, so the way out is only to drop the sandbox -- not to leave oam,
+    // and the refusal must not blame oam for what the grant cannot express.
+    const socket = message("postgres:///app", "/tmp");
+    assert.ok(socket.includes("unset POSTGRES_MCP_SANDBOX to keep the socket"), socket);
+    assert.ok(!socket.includes("POSTGRES_MCP_RUNTIME=node"), socket);
+    assert.ok(socket.includes("the sandbox can only pin a TCP host and port"), socket);
+    assert.ok(!/oam can only connect/.test(socket), socket);
     // Unsetting the sandbox would not make a bad port work, so it is not offered.
     assert.ok(!message("postgres://h.example:0/app").includes("unset POSTGRES_MCP_SANDBOX"));
     assert.ok(message("postgres://h.example/app?port=abc").includes("the port= parameter in DATABASE_URL"));
@@ -1567,7 +1582,7 @@ const SPAWN_SENTINEL = 97;
 /** A DSN with a password, so a refusal that echoes it is caught. */
 const SANDBOX_DSN = "postgres://u:hunter2@stub-host:6543/db";
 type SpawnStep = "capture" | "throw" | "error" | "real";
-type SpawnRecord = { cmd: string; args: string[]; step: SpawnStep; envKeys: string[] };
+type SpawnRecord = { cmd: string; args: string[]; step: SpawnStep; envKeys: string[]; nodeOptions: string | null };
 
 /**
  * A preload that replaces child_process.spawn inside the launcher, so the
@@ -1589,7 +1604,8 @@ function spawnPreload(...steps: SpawnStep[]): string {
     "childProcess.spawn = function (cmd, args, opts) {",
     "  const step = steps[Math.min(calls++, steps.length - 1)];",
     "  const envKeys = Object.keys(opts?.env ?? {}).filter((k) => /^(pghost|pgport|database_url)$/i.test(k)).sort();",
-    '  spawnLog(2, "SPAWN_ARGV=" + JSON.stringify({ cmd, args, step, envKeys }) + "\\n");',
+    "  const nodeOptions = Object.entries(opts?.env ?? {}).find(([k]) => k.toUpperCase() === 'NODE_OPTIONS')?.[1] ?? null;",
+    '  spawnLog(2, "SPAWN_ARGV=" + JSON.stringify({ cmd, args, step, envKeys, nodeOptions }) + "\\n");',
     `  if (step === "capture") process.exit(${SPAWN_SENTINEL});`,
     '  if (step === "throw") throw new Error("spawn EINVAL (stubbed)");',
     '  if (step === "error") return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
@@ -1875,6 +1891,196 @@ describe("launcher: the sandbox refuses instead of falling back", () => {
     const [spawned] = spawnsOf(run);
     assert.equal(spawned?.args[1], "--allow-net=pg.example:5432");
     assert.deepEqual(spawned?.envKeys, ["DATABASE_URL", "PGHOST"]);
+  });
+});
+
+type RemedyFor = (
+  found: { passedOver: (number[] | null)[]; overrideMissing: boolean; shim: string | null },
+  tail: string,
+  platform?: string,
+  arch?: string,
+) => string[];
+
+describe("launcher: remedyFor()", () => {
+  // The fix for "no usable oam" depends on what was found. An outdated oam is
+  // one `oam self-update` away; sending its owner to the website to reinstall
+  // is the long way round, and the installers now need ssh-keygen 8.1 too.
+  const remedyFor = new Function(
+    `${extractFromLauncher([OAM_MIN_DECL, /function remedyFor\([^)]*\) \{[\s\S]*?\r?\n\}/])}\nreturn remedyFor;`,
+  )() as RemedyFor;
+  const none = { passedOver: [], overrideMissing: false, shim: null };
+  const TAIL = "Or unset POSTGRES_MCP_SANDBOX";
+
+  it("leads with `oam self-update` when an outdated oam was found, and offers no install", () => {
+    const lines = remedyFor({ ...none, passedOver: [[0, 17, 1]] }, TAIL, "win32", "arm64");
+    assert.deepEqual(lines, ["Run `oam self-update` to get oam 0.18.0 or newer", TAIL]);
+  });
+
+  it("asks for a check, not an update, when a binary would not run", () => {
+    const lines = remedyFor({ ...none, passedOver: [null] }, TAIL, "darwin", "arm64");
+    assert.equal(lines.length, 2);
+    assert.match(lines[0], /^Check that each binary named above is an executable oam for this platform/);
+    assert.ok(!lines.join(" ").includes("self-update"));
+  });
+
+  it("names both causes when both were seen, and a missing OAM_BIN on its own", () => {
+    const lines = remedyFor({ passedOver: [[0, 9, 0], null], overrideMissing: true, shim: null }, TAIL, "win32", "x64");
+    assert.equal(lines.length, 4);
+    assert.match(lines[0], /oam self-update/);
+    assert.match(lines[1], /^Check that/);
+    assert.equal(lines[2], "Point OAM_BIN at an existing oam binary, or unset it");
+    assert.equal(lines[3], TAIL);
+  });
+
+  it("says to install only when nothing was found", () => {
+    assert.deepEqual(remedyFor(none, TAIL, "linux", "x64"), [
+      "Install oam from https://oamjs.org, or set OAM_BIN=/path/to/oam",
+      TAIL,
+    ]);
+  });
+
+  it("does not offer an install that cannot exist on Linux off x64", () => {
+    const [first] = remedyFor(none, TAIL, "linux", "arm64");
+    assert.match(first, /^oam publishes no build for linux-arm64, so there is nothing to install here/);
+    assert.ok(!first.includes("oamjs.org"));
+  });
+
+  it("leaves the install line out when a .cmd/.bat shim was found -- its note already says what to do", () => {
+    assert.deepEqual(remedyFor({ ...none, shim: "C:\\bin\\oam.cmd" }, TAIL, "win32", "x64"), [TAIL]);
+  });
+});
+
+describe("launcher: oam's permission flags in NODE_OPTIONS", () => {
+  const { stripPermissionOptions, withoutPermissionOptions, permissionReachesChildren } = new Function(
+    `${extractFromLauncher([
+      OAM_MIN_DECL,
+      /function parseVersion\(text\) \{[\s\S]*?\r?\n\}/,
+      ATLEAST_DECL,
+      /function stripPermissionOptions\(value\) \{[\s\S]*?\r?\n\}/,
+      /function withoutPermissionOptions\(source\) \{[\s\S]*?\r?\n\}/,
+      /function permissionReachesChildren\(hostOam, execArgv, nodeOptions\) \{[\s\S]*?\r?\n\}/,
+    ])}\nreturn { stripPermissionOptions, withoutPermissionOptions, permissionReachesChildren };`,
+  )() as {
+    stripPermissionOptions: (v: string | undefined) => string | undefined;
+    withoutPermissionOptions: (env: Record<string, string | undefined>) => Record<string, string | undefined>;
+    permissionReachesChildren: (hostOam: string | undefined, execArgv: string[], nodeOptions?: string) => boolean;
+  };
+
+  it("removes --permission and every --allow-* token, and keeps the rest as written", () => {
+    assert.equal(
+      stripPermissionOptions(
+        '--max-old-space-size=4096 --permission --allow-net=localhost:5432 --allow-env --allow-fs-read=* --require "C:\\a b\\x.js"',
+      ),
+      '--max-old-space-size=4096 --require "C:\\a b\\x.js"',
+    );
+    assert.equal(stripPermissionOptions("--permission --allow-child-process"), undefined);
+    assert.equal(stripPermissionOptions(undefined), undefined);
+    // Not a permission flag, whatever it looks like.
+    assert.equal(stripPermissionOptions("--allowed-thing --no-warnings"), "--allowed-thing --no-warnings");
+  });
+
+  it("judges a quoted token on the value oam reads, not on its raw text", () => {
+    // oam unquotes single and double quotes anywhere in a token; measured on
+    // 0.18.0, each of these widens a --permission run like the bare flag.
+    for (const spelled of ['"--allow-fs-read=*"', "'--allow-fs-read=*'", '--allow-"fs-read"=*', "'--permission'"]) {
+      assert.equal(stripPermissionOptions(`--no-warnings ${spelled}`), "--no-warnings", spelled);
+    }
+    // A quoted value that is not a permission flag is kept as written, spaces and all.
+    assert.equal(
+      stripPermissionOptions("--require '/a b/--allow-net.js' --allow-net"),
+      "--require '/a b/--allow-net.js'",
+    );
+  });
+
+  it("drops a NODE_OPTIONS that held only permission flags, under any spelling of the name, and nothing else", () => {
+    const out = withoutPermissionOptions({ node_options: "--allow-fs-read=*", PATH: "/bin", OTHER: "--allow-net" });
+    assert.deepEqual(out, { PATH: "/bin", OTHER: "--allow-net" });
+    assert.deepEqual(withoutPermissionOptions({ NODE_OPTIONS: "--no-warnings --permission" }), {
+      NODE_OPTIONS: "--no-warnings",
+    });
+  });
+
+  it("knows only an oam 0.18.0 or newer under --permission pushes its flags onto children", () => {
+    assert.equal(permissionReachesChildren("0.18.0", ["--permission", "--allow-env"]), true);
+    assert.equal(permissionReachesChildren("1.0.0", ["--permission"]), true);
+    // Up to 0.17.1 a child started with none of them.
+    assert.equal(permissionReachesChildren("0.17.1", ["--permission"]), false);
+    assert.equal(permissionReachesChildren("0.18.0", ["--no-warnings"]), false);
+    assert.equal(permissionReachesChildren(undefined, ["--permission"]), false);
+    // --permission from NODE_OPTIONS turns the model on without showing in
+    // execArgv, and oam still copies execArgv's --allow-* entries.
+    assert.equal(permissionReachesChildren("0.18.0", ["--allow-net=db:5432"], "--permission"), true);
+    assert.equal(permissionReachesChildren("0.18.0", ["--allow-net=db:5432"], "--no-warnings"), false);
+    assert.equal(permissionReachesChildren("0.18.0", ["--no-warnings"], "--permission"), false);
+  });
+
+  it("strips them from the sandboxed oam's environment, so they cannot widen the pinned grant", async () => {
+    // Measured on oam 0.18.0: `NODE_OPTIONS=--allow-fs-read=*` beside an argv
+    // `--permission` reads any file. Other NODE_OPTIONS tokens pass through.
+    // Set from the preload, not the spawn env: the Node running the launcher
+    // would refuse to start with an --allow-* and no --permission.
+    const run = await runAsHost(
+      undefined,
+      { POSTGRES_MCP_SANDBOX: "1", DATABASE_URL: SANDBOX_DSN, PGHOST: undefined, PGPORT: undefined },
+      `process.env.NODE_OPTIONS = "--allow-fs-read=* --no-warnings";${spawnPreload("capture")}`,
+    );
+    assert.equal(run.code, SPAWN_SENTINEL, JSON.stringify(run));
+    const [spawned] = spawnsOf(run);
+    assert.deepEqual(spawned?.args, expectedArgv("stub-host:6543"));
+    assert.equal(spawned?.nodeOptions, "--no-warnings");
+  });
+
+  it("refuses a Node handoff from an oam 0.18.0 host under --permission instead of letting Node exit 9", async () => {
+    // execArgv is what oam reports its own process-level flags in; the preload
+    // poses as such a host.
+    const run = await runAsHost(
+      "0.18.0",
+      noOamAnywhere({ POSTGRES_MCP_RUNTIME: "node" }),
+      `Object.defineProperty(process, "execArgv", { value: ["--permission", "--allow-env"] });${spawnPreload("capture")}`,
+    );
+    assert.equal(run.code, 1, JSON.stringify(run));
+    assert.equal(run.stdout, "");
+    assert.match(run.stderr, /this oam runs under --permission, and it passes its --permission and --allow-\* flags/);
+    assert.deepEqual(spawnsOf(run), [], "nothing may be spawned");
+  });
+});
+
+describe("launcher: discoverOamPaths() and OAM_INSTALL_DIR", () => {
+  it("looks in OAM_INSTALL_DIR first, where an oam installed off PATH lives", async () => {
+    const { realpathSync, writeFileSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const discoverOamPaths = new Function(
+      "existsSync",
+      "realpathSync",
+      "homedir",
+      "join",
+      "delimiter",
+      `const isWin = process.platform === "win32"; const exe = isWin ? "oam.exe" : "oam";\n${extractFromLauncher([
+        /function pathKey\(p\) \{[\s\S]*?\r?\n\}/,
+        /function discoverOamPaths\(\) \{[\s\S]*?\r?\n\}/,
+      ])}\nreturn discoverOamPaths;`,
+    )(existsSync, realpathSync, os.homedir, path.join, path.delimiter) as () => string[];
+    const exe = process.platform === "win32" ? "oam.exe" : "oam";
+    const custom = mkdtempSync(join(tmpdir(), "postgres-mcp-oam-install-dir-"));
+    const onPath = mkdtempSync(join(tmpdir(), "postgres-mcp-oam-path-"));
+    writeFileSync(join(custom, exe), "");
+    writeFileSync(join(onPath, exe), "");
+    const saved = { OAM_INSTALL_DIR: process.env.OAM_INSTALL_DIR, PATH: process.env.PATH };
+    try {
+      process.env.PATH = onPath;
+      process.env.OAM_INSTALL_DIR = custom;
+      const found = discoverOamPaths();
+      assert.equal(found[0], join(custom, exe), JSON.stringify(found));
+      assert.ok(found.includes(join(onPath, exe)), JSON.stringify(found));
+      delete process.env.OAM_INSTALL_DIR;
+      assert.ok(!discoverOamPaths().includes(join(custom, exe)), "only found through OAM_INSTALL_DIR");
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 });
 
