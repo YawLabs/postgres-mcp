@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.9] - 2026-10-11
+
 ### Security
 - **`POSTGRES_MCP_SANDBOX=1` no longer lets an inherited `NODE_OPTIONS` widen
   the sandbox.** oam 0.18.0 reads `--permission` and `--allow-*` flags from
