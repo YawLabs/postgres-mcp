@@ -22,8 +22,8 @@ declare const __VERSION__: string | undefined;
 // would crash startup with a hard-coded relative require; walking up finds
 // package.json wherever it actually sits.
 //
-// Reachability: BOTH shipped artifacts (the esbuild npm bundle and the SEA
-// binary) define __VERSION__, so this fallback only runs for a raw `tsc`
+// Reachability: BOTH shipped artifacts (the esbuild npm bundle and the
+// `oam compile` binary) define __VERSION__, so this fallback only runs for a raw `tsc`
 // output -- i.e. local dev. It is deliberately kept rather than deleted:
 // `npm run build` runs tsc first, and dist/*.js is what the test suite
 // imports. Nothing here is exercised by a published package.

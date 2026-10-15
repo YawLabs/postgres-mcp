@@ -55,6 +55,7 @@
     "lint": "node scripts/lint.mjs check src/",
     "lint:fix": "node scripts/lint.mjs check --write src/",
     "check:oam-floor": "node scripts/check-oam-floor.mjs",
+    "build:binary:oam": "node scripts/build-binary-oam.mjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
@@ -64,7 +65,6 @@
     "@types/pg": "^8.20.0",
     "esbuild": "^0.28.0",
     "pg": "^8.23.0",
-    "postject": "^1.0.0-alpha.6",
     "typescript": "^6.0.3",
     "zod": "^4.3.6"
   },
