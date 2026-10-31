@@ -37,10 +37,47 @@ describe("isWritesAllowed", () => {
     assert.equal(isWritesAllowed(), true);
   });
 
-  it("is false for other truthy-looking strings (strict opt-in)", () => {
-    for (const v of ["yes", "y", "on", "TRUE", "True", "0", "false", ""]) {
+  it("trims and ignores case on the two on-values", () => {
+    for (const v of ["1 ", " 1", "TRUE", "True", " true\t"]) {
       process.env.ALLOW_WRITES = v;
-      assert.equal(isWritesAllowed(), false, `ALLOW_WRITES=${JSON.stringify(v)} should be false`);
+      assert.equal(isWritesAllowed(), true, `ALLOW_WRITES=${JSON.stringify(v)} should be true`);
+    }
+  });
+
+  it("is false for other truthy-looking strings (strict opt-in)", () => {
+    const originalErr = console.error;
+    console.error = () => {};
+    try {
+      for (const v of ["yes", "y", "on", "node ", "0", "false", ""]) {
+        process.env.ALLOW_WRITES = v;
+        assert.equal(isWritesAllowed(), false, `ALLOW_WRITES=${JSON.stringify(v)} should be false`);
+      }
+    } finally {
+      console.error = originalErr;
+    }
+  });
+
+  it("warns once on stderr for an unrecognized value, and not for an off one", () => {
+    const originalErr = console.error;
+    const calls: string[] = [];
+    console.error = (msg?: unknown) => {
+      calls.push(String(msg));
+    };
+    try {
+      for (const v of ["0", "false", "OFF", " ", ""]) {
+        process.env.ALLOW_WRITES = v;
+        isWritesAllowed();
+      }
+      assert.deepEqual(calls, []);
+      // A value no other test uses: the warning is once per distinct value.
+      process.env.ALLOW_WRITES = "ture-once";
+      isWritesAllowed();
+      isWritesAllowed();
+      assert.equal(calls.length, 1, JSON.stringify(calls));
+      assert.match(calls[0]!, /ALLOW_WRITES="ture-once" not recognized/);
+      assert.match(calls[0]!, /read-only/);
+    } finally {
+      console.error = originalErr;
     }
   });
 });
@@ -205,6 +242,18 @@ describe("getSslConfig", () => {
     assert.deepEqual(getSslConfig(), { rejectUnauthorized: true });
   });
 
+  it("trims and ignores case", () => {
+    for (const [v, want] of [
+      ["1 ", true],
+      ["TRUE", true],
+      [" False", false],
+      ["0\t", false],
+    ] as const) {
+      process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = v;
+      assert.deepEqual(getSslConfig(), { rejectUnauthorized: want }, JSON.stringify(v));
+    }
+  });
+
   it("returns undefined for unrecognized values (defers to pg driver)", () => {
     // Stub console.error so the warning written by the unrecognized-value
     // path doesn't fill the test output. The warning itself is asserted in
@@ -212,7 +261,7 @@ describe("getSslConfig", () => {
     const originalErr = console.error;
     console.error = () => {};
     try {
-      for (const v of ["yes", "no", "TRUE", "False", "", "maybe"]) {
+      for (const v of ["yes", "no", "node ", "", "maybe"]) {
         process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED = v;
         assert.equal(
           getSslConfig(),

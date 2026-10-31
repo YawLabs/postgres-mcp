@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
@@ -48,6 +48,27 @@ describe("the oam floor is consistent across this repo", () => {
     const r = runChecker(repoRoot);
     assert.equal(r.code, 0, `check-oam-floor reported drift in this repo:\n${r.out}`);
     assert.match(r.out, /no drift/);
+  });
+});
+
+describe("check-oam-floor runs from a linked checkout", () => {
+  it("still checks when argv[1] reaches it through a junction or symlink", () => {
+    // Node realpaths the main module's URL but not argv[1]. The script used to
+    // compare the two with resolve(), so through a link it decided it had been
+    // imported, skipped the check and exited 0 with no output at all. The
+    // fixture drifts, so a run that really checks has to fail.
+    const linkParent = mkdtempSync(join(tmpdir(), "postgres-mcp-floor-link-"));
+    dirs.push(linkParent);
+    const link = join(linkParent, "scripts");
+    symlinkSync(join(repoRoot, "scripts"), link, process.platform === "win32" ? "junction" : "dir");
+    const root = fixture({ readme: "Only oam 0.16.2 or newer is used.\n" });
+    const r = spawnSync(process.execPath, [join(link, "check-oam-floor.mjs"), "--offline", "--root", root], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    assert.match(out, /oam floor \(OAM_MIN in bin\/postgres-mcp\.mjs\): 0\.16\.3/);
+    assert.equal(r.status, 1, out);
   });
 });
 

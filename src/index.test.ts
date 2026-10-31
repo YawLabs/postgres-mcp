@@ -704,7 +704,7 @@ describe("launcher: runtime selection", () => {
     assert.equal(res.stdout, "", "nothing may be served");
     // "usable", with the floor spelled out: absent, too old and unrunnable all
     // land here, and the note under it says which one it was.
-    assert.match(res.stderr, /no usable oam \(0\.18\.0 or newer\) was found/);
+    assert.match(res.stderr, /no usable oam \(0\.19\.1 or newer\) was found/);
     assert.match(res.stderr, /^ {2}OAM_BIN=.*does not exist$/m);
     // The remedies are the actionable half, and they fit the cause: a missing
     // OAM_BIN is fixed by pointing it somewhere real, not by reinstalling oam.
@@ -825,11 +825,11 @@ describe("launcher: runtimePlan()", () => {
     // `auto` and `oam` both have to take the shortcut -- `oam` demands oam, and
     // the host already is one.
     //
-    // 0.18.0 pins the floor as inclusive (it IS the supported release), and
-    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.18.0 as a string, so a
+    // 0.19.1 pins the floor as inclusive (it IS the supported release), and
+    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.19.1 as a string, so a
     // compare over the raw text would treat a newer oam as too old.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.18.0", "0.19.0", "0.100.0", "1.0.0", "0.19.0-dev"]) {
+      for (const hostOam of ["0.19.1", "0.19.2", "0.20.0", "0.100.0", "1.0.0", "0.20.0-dev"]) {
         assert.equal(runtimePlan({ mode, hostOam, sandbox: false }), "in-process", `mode=${mode} hostOam=${hostOam}`);
       }
     }
@@ -841,7 +841,7 @@ describe("launcher: runtimePlan()", () => {
     // asked for -- and the net grant pinned to DATABASE_URL with it -- a
     // security downgrade that no other symptom would reveal.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.18.0", "1.0.0"]) {
+      for (const hostOam of ["0.19.1", "1.0.0"]) {
         assert.equal(runtimePlan({ mode, hostOam, sandbox: true }), "discover", `mode=${mode} hostOam=${hostOam}`);
       }
     }
@@ -850,10 +850,11 @@ describe("launcher: runtimePlan()", () => {
   it("never serves in-process on a host oam below the floor, sandbox or not", () => {
     // Below the floor the host must hand off. Anything older than the latest
     // oam release is not what the server is verified on, and before 0.15.0
-    // the sandbox's port grant was not exact.
+    // the sandbox's port grant was not exact. 0.19.0 and its -dev builds sit
+    // just under the floor.
     for (const mode of ["auto", "oam"]) {
       for (const sandbox of [false, true]) {
-        for (const hostOam of ["0.17.0", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
+        for (const hostOam of ["0.19.0", "0.19.0-dev", "0.18.0", "0.17.0", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
           assert.equal(
             runtimePlan({ mode, hostOam, sandbox }),
             "discover",
@@ -876,7 +877,7 @@ describe("launcher: runtimePlan()", () => {
 
   it("runs POSTGRES_MCP_RUNTIME=node on Node: in-process on a Node host, handed off from any oam host", () => {
     assert.equal(runtimePlan({ mode: "node", hostOam: undefined, sandbox: false }), "in-process");
-    for (const hostOam of ["0.8.2", "0.18.0", "1.0.0", "dev"]) {
+    for (const hostOam of ["0.8.2", "0.19.1", "1.0.0", "dev"]) {
       assert.equal(runtimePlan({ mode: "node", hostOam, sandbox: false }), "handoff-node", `hostOam=${hostOam}`);
     }
   });
@@ -886,7 +887,7 @@ describe("launcher: runtimePlan()", () => {
     // honoured. This used to serve on Node (or hand off to it) and say nothing.
     // The refusal has to come BEFORE the node branch: a plan that checked the
     // mode first would hand a sandboxed request off to Node from an oam host.
-    for (const hostOam of [undefined, "0.8.2", "0.18.0", "1.0.0", "dev"]) {
+    for (const hostOam of [undefined, "0.8.2", "0.19.1", "1.0.0", "dev"]) {
       assert.equal(runtimePlan({ mode: "node", hostOam, sandbox: true }), "refuse-sandbox", `hostOam=${hostOam}`);
     }
   });
@@ -897,24 +898,24 @@ describe("launcher: pickNewest()", () => {
   const at = (path: string, version: number[] | null): Candidate => ({ path, version });
 
   it("pins the floor to the latest oam release", () => {
-    assert.deepEqual(floor, [0, 18, 0]);
+    assert.deepEqual(floor, [0, 19, 1]);
   });
 
   it("takes the newest usable oam, not the first one found", () => {
     // The bug: discovery stopped at the first binary that existed, so an older
     // copy in an earlier location hid a newer one later.
-    const chosen = pickNewest([at("installed", [0, 18, 0]), at("path-a", [0, 19, 0]), at("path-b", [0, 18, 9])]);
+    const chosen = pickNewest([at("installed", [0, 19, 1]), at("path-a", [0, 20, 0]), at("path-b", [0, 19, 9])]);
     assert.equal(chosen?.path, "path-a");
   });
 
   it("compares numerically and keeps search order on a tie", () => {
     assert.equal(pickNewest([at("a", [0, 19, 0]), at("b", [0, 100, 0])])?.path, "b");
-    assert.equal(pickNewest([at("first", [0, 18, 0]), at("second", [0, 18, 0])])?.path, "first");
+    assert.equal(pickNewest([at("first", [0, 19, 1]), at("second", [0, 19, 1])])?.path, "first");
   });
 
   it("skips binaries below the floor or with no readable version", () => {
-    assert.equal(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 18, 0])])?.path, "good");
-    assert.equal(pickNewest([at("old", [0, 17, 0]), at("broken", null)]), null);
+    assert.equal(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 19, 1])])?.path, "good");
+    assert.equal(pickNewest([at("old", [0, 19, 0]), at("broken", null)]), null);
     assert.equal(pickNewest([]), null);
   });
 });
@@ -1682,7 +1683,7 @@ describe("launcher: already hosted on oam", () => {
 
   it("serves in-process instead of spawning a nested oam", async () => {
     for (const overlay of [{}, { POSTGRES_MCP_RUNTIME: "oam" }] as Record<string, string>[]) {
-      const run = await runAsHost("0.18.0", overlay);
+      const run = await runAsHost("0.19.1", overlay);
       assert.equal(servedInProcess(run), true, `${JSON.stringify(overlay)} -> ${JSON.stringify(run)}`);
       assert.match(run.stderr, IN_PROCESS_MARK);
     }
@@ -1692,7 +1693,7 @@ describe("launcher: already hosted on oam", () => {
     // Exact argv, on a Node host and on a supported oam host (which would
     // otherwise serve in-process and drop the sandbox). The flags are
     // process-level: after `run` oam rejects them.
-    for (const hostOam of [undefined, "0.18.0"]) {
+    for (const hostOam of [undefined, "0.19.1"]) {
       const run = await runSandboxed(hostOam);
       assert.equal(run.code, SPAWN_SENTINEL, `hostOam=${hostOam} -> ${JSON.stringify(run)}`);
       const spawns = spawnsOf(run);
@@ -1728,7 +1729,7 @@ describe("launcher: no usable oam", () => {
     assert.equal(run.stdout.trim(), PACKAGE_VERSION, "the Node child must still serve");
     assert.match(
       run.stderr,
-      /this process is oam 0\.9\.0, older than 0\.18\.0, and no newer oam was found; running on .*node/i,
+      /this process is oam 0\.9\.0, older than 0\.19\.1, and no newer oam was found; running on .*node/i,
     );
     // Served by the child, not in the launcher process: argv[1] was never
     // pointed at dist/index.js.
@@ -1744,7 +1745,7 @@ describe("launcher: no usable oam", () => {
   });
 
   it("hands POSTGRES_MCP_RUNTIME=node off to Node even on a supported oam host", async () => {
-    const run = await runAsHost("0.18.0", noOamAnywhere({ POSTGRES_MCP_RUNTIME: "node" }));
+    const run = await runAsHost("0.19.1", noOamAnywhere({ POSTGRES_MCP_RUNTIME: "node" }));
     assert.equal(run.code, 0, JSON.stringify(run));
     assert.equal(run.stdout.trim(), PACKAGE_VERSION);
     assert.match(run.stderr, HANDED_OFF_MARK);
@@ -1788,7 +1789,7 @@ describe("launcher: the sandbox refuses instead of falling back", () => {
   });
 
   it("refuses POSTGRES_MCP_RUNTIME=node, on a Node host and on an oam host", async () => {
-    for (const hostOam of [undefined, "0.18.0"]) {
+    for (const hostOam of [undefined, "0.19.1"]) {
       const run = await runSandboxed(hostOam, { POSTGRES_MCP_RUNTIME: "node" }, "real");
       assertRefused(run, /POSTGRES_MCP_SANDBOX=1 needs oam to apply --permission, but POSTGRES_MCP_RUNTIME=node/);
       assert.deepEqual(spawnsOf(run), [], `hostOam=${hostOam}`);
@@ -1803,8 +1804,8 @@ describe("launcher: the sandbox refuses instead of falling back", () => {
     const rows: [string | undefined, Record<string, string | undefined>, RegExp][] = [
       [undefined, {}, /^ {2}no oam binary was found in the installed locations or on PATH$/m],
       ["0.9.0", { OAM_BIN: NO_OAM }, /^ {2}OAM_BIN=.*does not exist$/m],
-      ["0.18.0", {}, /refusing to start without the sandbox/],
-      ["0.18.0", { POSTGRES_MCP_RUNTIME: "oam" }, /refusing to start without the sandbox/],
+      ["0.19.1", {}, /refusing to start without the sandbox/],
+      ["0.19.1", { POSTGRES_MCP_RUNTIME: "oam" }, /refusing to start without the sandbox/],
     ];
     for (const [hostOam, overlay, detail] of rows) {
       const run = await runSandboxed(
@@ -1820,7 +1821,7 @@ describe("launcher: the sandbox refuses instead of falling back", () => {
       );
       assertRefused(
         run,
-        /needs a freshly launched oam to apply --permission, but no usable oam \(0\.18\.0 or newer\) was found; refusing to start without the sandbox\./,
+        /needs a freshly launched oam to apply --permission, but no usable oam \(0\.19\.1 or newer\) was found; refusing to start without the sandbox\./,
       );
       assert.match(run.stderr, detail, `hostOam=${hostOam} ${JSON.stringify(overlay)}`);
       assert.doesNotMatch(run.stderr, /use POSTGRES_MCP_RUNTIME=node/, "the unsandboxed remedy must not be offered");
@@ -1835,7 +1836,7 @@ describe("launcher: the sandbox refuses instead of falling back", () => {
     const rows: [string | undefined, SpawnStep][] = [
       [undefined, "error"],
       ["0.9.0", "throw"],
-      ["0.18.0", "error"],
+      ["0.19.1", "error"],
     ];
     for (const [hostOam, step] of rows) {
       const run = await runSandboxed(hostOam, {}, step, "capture");
@@ -1913,7 +1914,7 @@ describe("launcher: remedyFor()", () => {
 
   it("leads with `oam self-update` when an outdated oam was found, and offers no install", () => {
     const lines = remedyFor({ ...none, passedOver: [[0, 17, 1]] }, TAIL, "win32", "arm64");
-    assert.deepEqual(lines, ["Run `oam self-update` to get oam 0.18.0 or newer", TAIL]);
+    assert.deepEqual(lines, ["Run `oam self-update` to get oam 0.19.1 or newer", TAIL]);
   });
 
   it("asks for a check, not an update, when a binary would not run", () => {
@@ -1980,8 +1981,9 @@ describe("launcher: oam's permission flags in NODE_OPTIONS", () => {
   });
 
   it("judges a quoted token on the value oam reads, not on its raw text", () => {
-    // oam unquotes single and double quotes anywhere in a token; measured on
-    // 0.18.0, each of these widens a --permission run like the bare flag.
+    // oam unquotes single and double quotes anywhere in a token; first measured
+    // on 0.18.0 and re-measured on 0.19.1, each of these widens a --permission
+    // run like the bare flag.
     for (const spelled of ['"--allow-fs-read=*"', "'--allow-fs-read=*'", '--allow-"fs-read"=*', "'--permission'"]) {
       assert.equal(stripPermissionOptions(`--no-warnings ${spelled}`), "--no-warnings", spelled);
     }
@@ -2000,7 +2002,28 @@ describe("launcher: oam's permission flags in NODE_OPTIONS", () => {
     });
   });
 
-  it("knows only an oam 0.18.0 or newer under --permission pushes its flags onto children", () => {
+  it("strips every --allow-* list flag from NODE_OPTIONS, since oam 0.19.1 adds them to the argv grants", () => {
+    // From oam 0.19.1 (#363) a list flag in NODE_OPTIONS grants its entries on
+    // top of the command line's, so the launcher's own argv cannot crowd one
+    // out: this strip is the only guard. Each list flag, with and without a
+    // value, in both spellings of the name.
+    const lists = ["--allow-fs-read", "--allow-fs-write", "--allow-net", "--allow-env"];
+    for (const key of ["NODE_OPTIONS", "Node_Options"]) {
+      for (const flag of lists) {
+        for (const token of [`${flag}=*`, `${flag}=db:5432,/etc/passwd`, flag]) {
+          assert.deepEqual(
+            withoutPermissionOptions({ [key]: `--no-warnings ${token} --max-old-space-size=64` }),
+            { [key]: "--no-warnings --max-old-space-size=64" },
+            `${key}=${token}`,
+          );
+        }
+      }
+      const all = lists.map((f) => `${f}=*`).join(" ");
+      assert.deepEqual(withoutPermissionOptions({ [key]: all, PATH: "/bin" }), { PATH: "/bin" }, key);
+    }
+  });
+
+  it("knows an oam under --permission pushes its flags onto children from 0.18.0 on, and only then", () => {
     assert.equal(permissionReachesChildren("0.18.0", ["--permission", "--allow-env"]), true);
     assert.equal(permissionReachesChildren("1.0.0", ["--permission"]), true);
     // Up to 0.17.1 a child started with none of them.
@@ -2015,7 +2038,8 @@ describe("launcher: oam's permission flags in NODE_OPTIONS", () => {
   });
 
   it("strips them from the sandboxed oam's environment, so they cannot widen the pinned grant", async () => {
-    // Measured on oam 0.18.0: `NODE_OPTIONS=--allow-fs-read=*` beside an argv
+    // First measured on oam 0.18.0 and re-measured on 0.19.1, where the list
+    // grants are additive: `NODE_OPTIONS=--allow-fs-read=*` beside an argv
     // `--permission` reads any file. Other NODE_OPTIONS tokens pass through.
     // Set from the preload, not the spawn env: the Node running the launcher
     // would refuse to start with an --allow-* and no --permission.

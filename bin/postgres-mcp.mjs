@@ -109,10 +109,11 @@
  * passed to oam in exact case. Filesystem and child-process stay denied; oam does
  * not gate DNS lookups. A `--permission` or `--allow-*` in an inherited
  * NODE_OPTIONS is removed from the child's copy: oam reads permission flags from
- * NODE_OPTIONS too and uses them for every one its command line leaves out (a
- * list flag on the command line wins; a bare one such as --allow-child-process
- * is granted from either), so one left in place would widen the grant without a
- * word.
+ * NODE_OPTIONS too, and from 0.19.1 (#363) a list flag there ADDS its entries to
+ * the command line's rather than yielding to them (a bare one such as
+ * --allow-child-process is granted from either). The launcher's own grants
+ * cannot crowd one out, so removing it is the only guard: one left in place
+ * would widen the grant without a word.
  *
  * Opt-in, not default. A denied environment variable is ABSENT from process.env
  * rather than throwing, so an under-granted DATABASE_URL would look like "not
@@ -121,7 +122,7 @@
  * and friends) -- a hand-written list misses those.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
  * Below 0.9.0 `child_process.execFile` ran its arguments through a SHELL,
  * `exec` accepted `timeout` and ignored it, `spawnSync` truncated at
@@ -158,7 +159,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam this launcher will run on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 18, 0];
+const OAM_MIN = [0, 19, 1];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -974,9 +975,9 @@ async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
  *
  * A token is judged on the value oam reads, not on its raw text: oam splits
  * NODE_OPTIONS on whitespace and honours single and double quotes anywhere in
- * a token, dropping them (split_node_options in oam_cli). Measured on oam
- * 0.18.0, `"--allow-fs-read=*"`, `'--allow-fs-read=*'` and
- * `--allow-"fs-read"=*` each widen a `--permission` run exactly as the bare
+ * a token, dropping them (split_node_options in oam_cli). First measured on
+ * oam 0.18.0 and re-measured on 0.19.1, `"--allow-fs-read=*"`,
+ * `'--allow-fs-read=*'` and `--allow-"fs-read"=*` each widen a `--permission` run exactly as the bare
  * token does, so a filter on the raw text would let any of them through.
  *
  * Why: oam 0.18.0 passes a `--permission` parent's grants to every child in
@@ -1020,12 +1021,14 @@ function stripPermissionOptions(value) {
  * children:
  *   - a Node handoff, which exits 9 on oam-only flags in NODE_OPTIONS;
  *   - the sandboxed oam, which reads permission flags from NODE_OPTIONS as well
- *     as from its argv and takes every one argv leaves out (NodeFlags::merged
- *     in oam_cli: argv's list flags win, the bare ones are ORed): measured on
- *     oam 0.18.0,
- *     `NODE_OPTIONS=--allow-fs-read=* oam --permission run x.mjs` reads any
- *     file. An inherited NODE_OPTIONS would widen the pinned sandbox past the
- *     one database endpoint without a word.
+ *     as from its argv. From oam 0.19.1 (#363) every list flag grants its
+ *     entries from both together, and the bare ones are ORed, so nothing the
+ *     launcher puts on argv can outrank one: stripping it here is the only
+ *     guard. Re-measured on oam 0.19.1, an argv
+ *     `--permission --allow-fs-read=<script> --allow-fs-read=a.txt` beside
+ *     `NODE_OPTIONS=--allow-fs-read=s.txt` reads s.txt as well. An inherited
+ *     NODE_OPTIONS would widen the pinned sandbox past the one database
+ *     endpoint without a word.
  */
 function withoutPermissionOptions(source) {
   const out = { ...source };

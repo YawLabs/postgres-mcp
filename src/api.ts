@@ -3,7 +3,8 @@
  *
  * Config:
  *   - DATABASE_URL                         - postgres connection string (required)
- *   - ALLOW_WRITES                         - set to "1" or "true" to allow DML/DDL (default: read-only)
+ *   - ALLOW_WRITES                         - set to "1" or "true" (any case) to allow DML/DDL (default:
+ *                                            read-only). Anything else stays read-only.
  *   - POSTGRES_STATEMENT_TIMEOUT_MS        - per-statement timeout (default: 30000)
  *   - POSTGRES_CONNECTION_TIMEOUT_MS       - TCP connect timeout (default: 10000). Without
  *                                            this, a dead host hangs until the OS gives up
@@ -107,9 +108,28 @@ export function getPoolMax(): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 5;
 }
 
+/** Raw ALLOW_WRITES values already warned about, so a per-request read warns once. */
+const warnedWritesValues = new Set<string>();
+
+/**
+ * Fail-closed: only "1" or "true" (trimmed, any case) lift the read-only
+ * wrapper. Any other non-empty value that is not a recognised "off" reads as
+ * read-only and gets one stderr line, so a typo such as `ALLOW_WRITES=ture`
+ * does not just look like a server that ignores its config. Not
+ * parseStrictFlag: that one throws, and this is re-read per request.
+ */
 export function isWritesAllowed(): boolean {
-  const v = process.env.ALLOW_WRITES;
-  return v === "1" || v === "true";
+  const raw = process.env.ALLOW_WRITES;
+  if (raw === undefined) return false;
+  const v = raw.trim().toLowerCase();
+  if (v === "1" || v === "true") return true;
+  if (v !== "" && v !== "0" && v !== "false" && v !== "off" && !warnedWritesValues.has(raw)) {
+    warnedWritesValues.add(raw);
+    console.error(
+      `[postgres-mcp] ALLOW_WRITES=${JSON.stringify(raw)} not recognized; expected "1" or "true" to allow writes. Staying read-only.`,
+    );
+  }
+  return false;
 }
 
 export function getApplicationName(): string {
@@ -291,8 +311,9 @@ async function probeServerVersion(client: VersionProbeRunner | undefined): Promi
 export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
   const raw = process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED;
   if (raw === undefined) return undefined;
-  if (raw === "0" || raw === "false") return { rejectUnauthorized: false };
-  if (raw === "1" || raw === "true") return { rejectUnauthorized: true };
+  const v = raw.trim().toLowerCase();
+  if (v === "0" || v === "false") return { rejectUnauthorized: false };
+  if (v === "1" || v === "true") return { rejectUnauthorized: true };
   // Env var IS set but doesn't match a recognized form (e.g. `Flase`, `yes`,
   // empty string). Returning undefined here would silently fall through to
   // pg's default behavior, which is indistinguishable from "env var unset"

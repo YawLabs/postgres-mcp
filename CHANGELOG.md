@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.18.0 to 0.19.1, so the `postgres-mcp` launcher
+  no longer runs the server on an older oam.** 0.19.1 is verified through the
+  launcher with `OAM_BIN` pointing at it and a local PostgreSQL 18.3: an MCP
+  handshake listing all 23 tools and a `pg_readonly` query, under
+  `POSTGRES_MCP_RUNTIME=oam` and again under `POSTGRES_MCP_SANDBOX=1`, with
+  the server process confirmed as that binary (`oam run .../dist/index.js`,
+  and `oam --permission --allow-net=localhost:5432 ... run` for the sandbox).
+  0.19.0 and its -dev builds now sit below the floor.
+- **`ALLOW_WRITES` and `POSTGRES_SSL_REJECT_UNAUTHORIZED` are trimmed and
+  case-insensitive.** `ALLOW_WRITES=TRUE` or `"1 "` now allows writes, where it
+  used to stay read-only without a word. Any value other than `1`, `true` or
+  an off value (`0`, `false`, `off`, empty) still stays read-only, and now
+  says so once on stderr.
+
+### Security
+- **The sandbox's `NODE_OPTIONS` strip is now the only thing keeping an
+  inherited grant out.** From oam 0.19.1 (#363) a `--allow-fs-read`,
+  `--allow-fs-write`, `--allow-net` or `--allow-env` in `NODE_OPTIONS` adds
+  its entries to the command line's instead of yielding to them: re-measured,
+  `NODE_OPTIONS=--allow-fs-read=<file>` beside the launcher's own
+  `--allow-fs-read` list reads that file too. The launcher already removed
+  every such token from the sandboxed oam's environment; the comments and
+  README now say why that is load-bearing, and a unit test pins the strip for
+  each list flag.
+
+### Fixed
+- **`scripts/check-oam-floor.mjs` runs from a junctioned or symlinked
+  checkout.** It decided whether it was the main module by comparing
+  `resolve(process.argv[1])` with its own path, but Node realpaths the main
+  module and not `argv[1]`, so through a link the check was skipped and the
+  script exited 0 with no output -- including from `release.sh`. Both sides
+  are now realpath'd.
+
 ## [0.13.9] - 2026-10-11
 
 ### Security
