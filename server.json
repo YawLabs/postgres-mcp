@@ -9,12 +9,12 @@
     "id": "1217200228"
   },
   "websiteUrl": "https://yaw.sh/mcp-servers/postgres-mcp/",
-  "version": "0.13.11",
+  "version": "0.13.12",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/postgres-mcp",
-      "version": "0.13.11",
+      "version": "0.13.12",
       "transport": {
         "type": "stdio"
       }
