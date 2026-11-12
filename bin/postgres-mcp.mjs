@@ -107,7 +107,13 @@
  * --allow-net is passed at all: every connection is denied and the server reports
  * the missing variable as it does unsandboxed. On Windows the sandboxed names are
  * passed to oam in exact case. Filesystem and child-process stay denied; oam does
- * not gate DNS lookups. A `--permission` or `--allow-*` in an inherited
+ * not gate DNS at all. From oam 0.19.3 (#465) dns.setServers() and Resolver
+ * work under --permission with no net check, so sandboxed code can send a UDP
+ * DNS query, with a name it chooses, to any IP and port: measured on 0.19.5 with
+ * no --allow-net, a query for "secret-payload.example" reached a listener on
+ * 127.0.0.1:53535. The net grant pins TCP connections, not every packet; the
+ * sandbox is not an exfiltration boundary. A `--permission` or `--allow-*` in
+ * an inherited
  * NODE_OPTIONS is removed from the child's copy: oam reads permission flags from
  * NODE_OPTIONS too, and from 0.19.1 (#363) a list flag there ADDS its entries to
  * the command line's rather than yielding to them (a bare one such as
@@ -122,7 +128,7 @@
  * and friends) -- a hand-written list misses those.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.5 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
  * Below 0.9.0 `child_process.execFile` ran its arguments through a SHELL,
  * `exec` accepted `timeout` and ignored it, `spawnSync` truncated at
@@ -159,7 +165,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam this launcher will run on. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 19, 1];
+const OAM_MIN = [0, 19, 5];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -651,15 +657,19 @@ const SANDBOX_ENV = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPP
  * "host:port", or null for no `--allow-net` at all, which denies every
  * connection.
  *
- * These are oam's PROCESS-level flags: they belong before the `run` subcommand,
- * not after it. `oam run --permission file.js` is rejected outright, which is a
- * good failure but only because it is loud -- ordering here is load-bearing.
+ * These are oam's PROCESS-level flags and go before the `run` subcommand. From
+ * oam 0.19.4 (#471) a node-style flag written between `run` and the file is
+ * lifted ahead of it and applied (older oam rejected it), so that spot would
+ * work too; what still matters is that nothing goes AFTER SERVER_ENTRY, where
+ * it would be the script's argument, not a grant. The server's own arguments
+ * follow a `--`, so they are never lifted.
  *
  * A net grant is matched exactly against the "host:port" pg dials (since oam
  * 0.15.0; before that a port was prefix-matched). An entry without a port
  * admits every port on that host, and a comma splits one flag into several
  * entries, which is why sandboxEndpoint refuses a host list rather than pass it
- * through. A repeated flag replaces the earlier one, so each is emitted once.
+ * through. A repeated list flag adds its entries to the earlier ones (oam
+ * 0.19.1, #363), so each is emitted once, holding the whole grant.
  * A denied environment variable is ABSENT from process.env rather than
  * throwing, so the env list is derived from what the bundle actually reads;
  * trimming it produces silent misbehaviour, not a clear denial.
@@ -976,7 +986,7 @@ async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
  * A token is judged on the value oam reads, not on its raw text: oam splits
  * NODE_OPTIONS on whitespace and honours single and double quotes anywhere in
  * a token, dropping them (split_node_options in oam_cli). First measured on
- * oam 0.18.0 and re-measured on 0.19.1, `"--allow-fs-read=*"`,
+ * oam 0.18.0 and re-measured on 0.19.1 and 0.19.5, `"--allow-fs-read=*"`,
  * `'--allow-fs-read=*'` and `--allow-"fs-read"=*` each widen a `--permission` run exactly as the bare
  * token does, so a filter on the raw text would let any of them through.
  *
@@ -1024,7 +1034,7 @@ function stripPermissionOptions(value) {
  *     as from its argv. From oam 0.19.1 (#363) every list flag grants its
  *     entries from both together, and the bare ones are ORed, so nothing the
  *     launcher puts on argv can outrank one: stripping it here is the only
- *     guard. Re-measured on oam 0.19.1, an argv
+ *     guard. Re-measured on oam 0.19.1 and 0.19.5, an argv
  *     `--permission --allow-fs-read=<script> --allow-fs-read=a.txt` beside
  *     `NODE_OPTIONS=--allow-fs-read=s.txt` reads s.txt as well. An inherited
  *     NODE_OPTIONS would widen the pinned sandbox past the one database

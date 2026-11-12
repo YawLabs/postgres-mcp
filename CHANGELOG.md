@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.19.1 to 0.19.5, so the `postgres-mcp` launcher
+  no longer runs the server on an older oam.** 0.19.5 is verified through the
+  launcher with `OAM_BIN` pointing at it and a local PostgreSQL 18.3: an MCP
+  handshake listing all 23 tools and a `pg_readonly` query, under
+  `POSTGRES_MCP_RUNTIME=oam` and again under `POSTGRES_MCP_SANDBOX=1`, with
+  the server process confirmed as that binary (`oam run .../dist/index.js`,
+  and `oam --permission --allow-net=localhost:5432 ... run` for the sandbox).
+  An oam 0.19.4 set as `OAM_BIN` is now passed over for a 0.19.5 when one is
+  installed, and otherwise refused (`RUNTIME=oam`, the sandbox) or replaced by
+  Node (`auto`). The `NODE_OPTIONS` permission-flag measurements behind the
+  launcher's strip were re-run on 0.19.5 and still hold.
+
+### Fixed
+- **The sandbox docs no longer claim network access is limited to the database
+  endpoint.** From oam 0.19.3, `dns.setServers()` works under `--permission`
+  with no net check, so sandboxed code can send DNS queries to any server it
+  names. Measured on 0.19.5 with no `--allow-net`: a query carrying a chosen
+  name reached a listener on an arbitrary local port. The README now says TCP
+  connections are pinned to the one host and port, and that the sandbox is not
+  an exfiltration boundary. Two launcher comments that described oam
+  behavior that has since changed are corrected too: a permission flag written
+  after `run` has been lifted and applied since oam 0.19.4 instead of rejected,
+  and a repeated list flag has added to the earlier grant since 0.19.1 instead
+  of replacing it.
+
 ## [0.13.11] - 2026-11-11
 
 ### Security
