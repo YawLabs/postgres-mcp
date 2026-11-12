@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **The bundled MCP server SDK moves from 2.0.0 to 2.4.0, and zod from 4.4.3
+  to 4.6.7.** This clears GHSA advisories for `@modelcontextprotocol/server`
+  < 2.3.0 (cross-client message delivery on shared HTTP transports; bearer
+  tokens issued for another service accepted) and zod < 4.6.6 (memory
+  exhaustion validating oversized constrained collections). postgres-mcp
+  serves over stdio only and does no bearer auth, so neither SDK issue was
+  reachable here; both packages are bundled into `dist/`, so the fix ships
+  with the next release.
+
 ## [0.13.10] - 2026-10-30
 
 ### Changed
