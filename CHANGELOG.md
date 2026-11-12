@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.11] - 2026-11-11
+
 ### Security
 - **The bundled MCP server SDK moves from 2.0.0 to 2.4.0, and zod from 4.4.3
   to 4.6.7.** This clears GHSA advisories for `@modelcontextprotocol/server`
