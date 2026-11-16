@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.19.5 to 0.20.2, so the `postgres-mcp` launcher
+  no longer runs the server on an older oam.** 0.20.2 is verified through the
+  launcher with `OAM_BIN` pointing at it and a local PostgreSQL 18.3: an MCP
+  handshake listing all 23 tools and a `pg_readonly` query, under
+  `POSTGRES_MCP_RUNTIME=oam`, again under `POSTGRES_MCP_SANDBOX=1`, and with
+  the launcher itself started by `oam run`, each answering with the same tool
+  list and query result as a `POSTGRES_MCP_RUNTIME=node` run. The server
+  process was confirmed as that binary (`oam run .../dist/index.js`, and
+  `oam --permission --allow-net=localhost:5432 ... run` for the sandbox). An
+  oam 0.20.1 set as `OAM_BIN` is now passed over for a 0.20.2 when one is
+  installed, and otherwise refused (`RUNTIME=oam`, the sandbox) or replaced by
+  Node (`auto`). The `NODE_OPTIONS` permission-flag measurements behind the
+  launcher's strip, and the DNS measurement behind the sandbox docs, were
+  re-run on 0.20.2 and still hold. Nothing else changes: the launcher already
+  passed `windowsHide: true` on every spawn, which oam 0.20.2 now honours for
+  GUI children as Node does.
+
 ## [0.13.12] - 2026-11-11
 
 ### Changed
