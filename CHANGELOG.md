@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.13] - 2026-11-15
+
 ### Changed
 - **The oam floor moves from 0.19.5 to 0.20.2, so the `postgres-mcp` launcher
   no longer runs the server on an older oam.** 0.20.2 is verified through the
