@@ -55,6 +55,7 @@
     "lint": "node scripts/lint.mjs check src/",
     "lint:fix": "node scripts/lint.mjs check --write src/",
     "check:oam-floor": "node scripts/check-oam-floor.mjs",
+    "check:yaw-mcp-floor": "node scripts/check-yaw-mcp-floor.mjs",
     "build:binary:oam": "node scripts/build-binary-oam.mjs",
     "prepublishOnly": "npm run build"
   },
