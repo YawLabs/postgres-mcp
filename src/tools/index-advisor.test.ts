@@ -923,6 +923,11 @@ interface StubOptions {
   refuseTerminate?: boolean;
   /** Columns pg_attribute reports for public.users. */
   columns?: string[];
+  /**
+   * Rows pg_stat_statements' ranking query returns, as `{query, calls}`. Empty
+   * by default -- the "installed but nothing recorded" case.
+   */
+  topQueries?: { query: string; calls: string }[];
 }
 
 interface StubSession {
@@ -977,6 +982,7 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     failExplain = false,
     failExplainContaining,
     failBegin = false,
+    topQueries = [],
     failTeardownSavepoint = false,
     failInnerSavepointAt,
     failInnerReleaseAt,
@@ -1278,6 +1284,9 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     if (text.includes("server_version_num")) return Promise.resolve({ rows: [{ v: String(versionNum) }] });
     if (text.includes("extname = 'hypopg'")) return Promise.resolve({ rows: [{ installed: hypopgInstalled }] });
     if (text.includes("extname = 'pg_stat_statements'")) return Promise.resolve({ rows: [{ version: "1.10" }] });
+    if (text.includes("FROM pg_stat_statements") && text.includes("ORDER BY")) {
+      return Promise.resolve({ rows: topQueries });
+    }
     if (text.includes("pg_stat_user_tables")) {
       return Promise.resolve({ rows: [{ schema: "public", table: "users", seq_scan: "500" }] });
     }
@@ -1311,6 +1320,40 @@ describe("pg_index_advisor input guards", () => {
     const result = (await pgIndexAdvisor.handler({ statements: [] })) as { ok: boolean; error?: string };
     assert.equal(result.ok, false);
     assert.match(result.error ?? "", /omit `statements`/);
+  });
+
+  it("refuses a statement that would leave the read-only path, up front", async () => {
+    // The advisor's EXPLAINs never rode api.ts's StatementGuard, so a
+    // session-state function in a workload statement ran during planning.
+    // Checked before the HypoPG probe takes a connection.
+    const result = (await pgIndexAdvisor.handler({
+      statements: ["SELECT set_config('role', 'postgres', false)"],
+    })) as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /only plans read-only statements/);
+    assert.match(result.error ?? "", /set_config/);
+  });
+
+  it("skips a blocked pg_stat_statements row with a warning instead of refusing the call", async () => {
+    // A stale `SET`/`set_config` row in pg_stat_statements used to refuse the
+    // WHOLE call, making the tool unusable on any real database. The caller
+    // did not supply this row, so it is dropped with a warning naming it and
+    // the rest of the workload still runs.
+    const topQueries = [
+      { query: "SET statement_timeout = 0", calls: "500" },
+      { query: "SELECT * FROM users WHERE status = 'active'", calls: "100" },
+    ];
+    await withStubbedServer({ topQueries }, async () => {
+      const result = (await pgIndexAdvisor.handler({})) as {
+        ok: boolean;
+        error?: string;
+        data?: { _warnings?: string[] };
+      };
+      assert.equal(result.ok, true, `expected the call to proceed, got: ${result.error}`);
+      const warning = result.data?._warnings?.find((w) => /only plans read-only statements/.test(w));
+      assert.ok(warning, `no skip warning in ${JSON.stringify(result.data?._warnings)}`);
+      assert.ok(warning.includes("SET statement_timeout"), `warning does not name the row: ${warning}`);
+    });
   });
 });
 
