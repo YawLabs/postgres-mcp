@@ -419,13 +419,25 @@ describe("audit redaction (hash-only mode)", () => {
   it("reports UNKNOWN rather than a value-bearing prefix for a statement that does not start with a word", async () => {
     const lines = captureAudit({ POSTGRES_AUDIT_LOG: "1", POSTGRES_AUDIT_REDACT: "1" });
     await auditQuery(
-      { source: "user", sql: "/* ticket=SECRET-42 */ SELECT 1", paramCount: 0 },
+      { source: "user", sql: "'SECRET-42' || x", paramCount: 0 },
       () => Promise.resolve({ rows: [], rowCount: 0 }),
       (r) => r.rowCount,
     );
     const raw = lines[0]!;
     assert.equal((JSON.parse(raw) as { sqlKeyword: string }).sqlKeyword, "UNKNOWN");
     assert.equal(raw.includes("SECRET-42"), false, "the keyword field must not become a leak channel");
+  });
+
+  it("skips comments, including nested ones, without logging them", async () => {
+    const lines = captureAudit({ POSTGRES_AUDIT_LOG: "1", POSTGRES_AUDIT_REDACT: "1" });
+    await auditQuery(
+      { source: "user", sql: "/* a /* ticket=SECRET-42 */ b */ -- x\n DELETE FROM t", paramCount: 0 },
+      () => Promise.resolve({ rows: [], rowCount: 0 }),
+      (r) => r.rowCount,
+    );
+    const raw = lines[0]!;
+    assert.equal((JSON.parse(raw) as { sqlKeyword: string }).sqlKeyword, "DELETE");
+    assert.equal(raw.includes("SECRET-42"), false, "a comment must not reach the log");
   });
 });
 
@@ -791,12 +803,18 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
     // What went out: the transaction and the hook savepoint, then the
     // rollback -- never the EXPLAIN, and never a teardown for state that was
     // not created.
-    assert.deepEqual(client.statements, ["BEGIN READ ONLY", "SAVEPOINT __pgmcp_hooks", "ROLLBACK"]);
+    assert.deepEqual(client.statements, [
+      "BEGIN READ ONLY",
+      "SELECT pg_backend_pid() AS pid",
+      "SAVEPOINT __pgmcp_hooks",
+      "ROLLBACK",
+      "DISCARD ALL",
+    ]);
     assert.equal(teardownRan, false);
     assert.deepEqual(
       client.releases,
-      [{ discard: undefined, after: 3 }],
-      "released once, after the ROLLBACK, kept: a clean rollback leaves nothing behind",
+      [{ discard: undefined, after: 5 }],
+      "released once, after the ROLLBACK and session reset, kept: nothing is left behind",
     );
   });
 
@@ -816,7 +834,7 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
       client.statements.some((s) => s.includes(sql)),
       "sanity: this time the statement was sent",
     );
-    assert.equal(client.statements.at(-1), "ROLLBACK");
+    assert.deepEqual(client.statements.slice(-2), ["ROLLBACK", "DISCARD ALL"]);
     assert.deepEqual(client.releases, [{ discard: undefined, after: client.statements.length }]);
   });
 
@@ -829,7 +847,7 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
     assert.equal(entry.ok, true);
     assert.equal(entry.rows, 0);
     assert.equal(entry.sql, sql);
-    assert.equal(client.statements.at(-1), "ROLLBACK");
+    assert.deepEqual(client.statements.slice(-2), ["ROLLBACK", "DISCARD ALL"]);
     assert.deepEqual(client.releases, [{ discard: undefined, after: client.statements.length }]);
   });
 
@@ -841,7 +859,7 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
     const { entry } = onlyLine();
     assert.equal(entry.ok, true);
     assert.equal(client.statements[0], "BEGIN");
-    assert.equal(client.statements.at(-1), "COMMIT");
+    assert.deepEqual(client.statements.slice(-2), ["COMMIT", "DISCARD ALL"]);
     // `after` equal to the statement count is what ties the release to a
     // point past the COMMIT; a release moved inside the audited span would
     // record a smaller number.

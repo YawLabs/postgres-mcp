@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { isWritesAllowed, shutdown } from "./api.js";
 import { wrapToolHandler } from "./mcp-wrapper.js";
+import { runRolePreflight } from "./preflight.js";
 import { adminTools } from "./tools/admin.js";
 import { explainTools } from "./tools/explain.js";
 import { healthTools } from "./tools/health.js";
@@ -184,8 +185,15 @@ serveStdio(createServer, {
 });
 
 // Startup banner on stderr - stdio MCP protocol uses stdout, so stderr is free for logs.
-const writesNote = isWritesAllowed() ? "writes ENABLED" : "read-only";
+// It describes the transaction wrapper only. What the role can do is a separate
+// question, answered by the check below, so this must not claim "read-only".
+const writesAllowed = isWritesAllowed();
+const writesNote = writesAllowed
+  ? "writes ENABLED"
+  : "read-only transactions; the database role is the real boundary, checking it";
 console.error(`@yawlabs/postgres-mcp v${version} ready (${allTools.length} tools, ${writesNote})`);
+// Not awaited: serving must not wait on the database. It never rejects.
+void runRolePreflight(writesAllowed);
 
 // Clean shutdown: release pool connections when the transport closes.
 // SIGINT, SIGTERM, and stdin 'end' can all fire near-simultaneously (e.g. a

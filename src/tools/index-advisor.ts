@@ -8,6 +8,7 @@ import {
   TERMINATE_OWN_BACKEND_SQL,
   withSharedClient,
 } from "../api.js";
+import { assertReadOnlyStatement, GuardError } from "../sql-guard.js";
 import { warningsField } from "./output.js";
 import { identSchema } from "./params.js";
 import { compareVersions } from "./stats.js";
@@ -1210,6 +1211,34 @@ export const indexAdvisorTools = [
         };
       }
 
+      // Shared by both refusal points (caller-supplied statements and the
+      // pg_stat_statements workload below): returns the refusal to hand back,
+      // or null when every statement passed the guard. A non-GuardError
+      // escapes -- a bug in the guard itself, not a blocked statement.
+      const refuseBlocked = (sqls: string[]): { ok: false; error: string } | null => {
+        for (const sql of sqls) {
+          try {
+            assertReadOnlyStatement(sql);
+          } catch (err) {
+            if (err instanceof GuardError) {
+              return { ok: false, error: `pg_index_advisor only plans read-only statements: ${err.message}` };
+            }
+            throw err;
+          }
+        }
+        return null;
+      };
+
+      // The advisor's read-only path never rides api.ts's StatementGuard, so
+      // caller-supplied SQL reaching the EXPLAINs below was unchecked:
+      // `EXPLAIN (...)` wraps anything, and session-state and file functions
+      // run during planning. Refused BEFORE anything touches a connection, so
+      // the refusal is the answer even on a server with no DATABASE_URL yet.
+      if (providedStatements) {
+        const refusal = refuseBlocked(providedStatements);
+        if (refusal) return refusal;
+      }
+
       const warnings: string[] = [];
       const serverVersion = await getServerVersionNum();
       const skipScanAvailable = serverVersion >= PG18;
@@ -1236,7 +1265,9 @@ export const indexAdvisorTools = [
 
       // ─── Workload ───
 
-      const workload: WorkloadStatement[] = [];
+      // `let` because the read-only guard below may drop blocked rows from the
+      // pg_stat_statements half of it.
+      let workload: WorkloadStatement[] = [];
       if (providedStatements) {
         for (const sql of providedStatements) workload.push({ sql, weight: 1, calls: "1" });
       } else {
@@ -1288,6 +1319,34 @@ export const indexAdvisorTools = [
           };
         }
       }
+
+      // Same check for this workload (caller-supplied statements were already
+      // refused up front), but a stale `SET`/`set_config` row that
+      // pg_stat_statements kept must not refuse the WHOLE call and make the
+      // tool unusable: a blocked row is dropped with a warning naming it and
+      // the rest of the workload proceeds. Refusing everything here would also
+      // punish the caller for a row they did not supply.
+      const keptWorkload: WorkloadStatement[] = [];
+      for (const s of workload) {
+        const refusal = refuseBlocked([s.sql]);
+        if (refusal) {
+          warnings.push(
+            `skipped a workload statement that would leave the read-only path (${refusal.error}): ` +
+              preview(s.sql, 120),
+          );
+          continue;
+        }
+        keptWorkload.push(s);
+      }
+      if (keptWorkload.length === 0) {
+        return {
+          ok: false,
+          error:
+            "No statement in the pg_stat_statements workload passed the read-only guard, so there is " +
+            `nothing to analyze. Reasons: ${warnings.join(" | ")}`,
+        };
+      }
+      workload = keptWorkload;
 
       // Sequential-scan counts order the candidate list when the budget cannot
       // cover everything: the table postgres is reading end-to-end is where an

@@ -10,6 +10,12 @@
  *                                            this, a dead host hangs until the OS gives up
  *                                            (~2 minutes on most platforms).
  *   - POSTGRES_MAX_ROWS                    - max rows returned by pg_query (default: 1000)
+ *   - POSTGRES_MAX_RESULT_BYTES            - cap on bytes received for one user statement's result
+ *                                            (default: 16 MiB). Over it the call fails and the
+ *                                            connection is closed.
+ *   - POSTGRES_QUERY_DEADLINE_MS           - client-side limit on one user-SQL call (default:
+ *                                            statement timeout + 5000). Over it the backend is
+ *                                            terminated and the connection closed.
  *   - POSTGRES_POOL_MAX                    - max pool connections (default: 5). Set to 1 for
  *                                            single-threaded backends (pglite-socket, PgBouncer
  *                                            transaction mode) that can't handle concurrent queries.
@@ -44,11 +50,14 @@
  *   User-provided SQL runs in a `BEGIN READ ONLY` transaction by default, so
  *   postgres itself rejects any write. Enable writes via ALLOW_WRITES=1 - the
  *   tool handlers also surface this hint in their descriptions/errors so an
- *   LLM doesn't blindly retry a blocked write.
+ *   LLM doesn't blindly retry a blocked write. Read-only paths also refuse
+ *   statements that would step around that transaction (sql-guard.ts). None of
+ *   this contains a privileged role: the DATABASE_URL role is the real boundary.
  */
 
 import pg from "pg";
 import { auditQuery, initAudit } from "./audit.js";
+import { assertReadOnlyStatement, GuardError } from "./sql-guard.js";
 
 // Open the audit sink at module load rather than lazily on the first query: a
 // POSTGRES_AUDIT_LOG_FILE that cannot be opened has to kill the process at
@@ -106,6 +115,45 @@ export function getPoolMax(): number {
   if (!raw) return 5;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 5;
+}
+
+/** Raw values of the limits below already warned about, so a per-call read warns once. */
+const warnedLimitValues = new Set<string>();
+
+/**
+ * A positive integer from the environment. An unusable value keeps the default
+ * and says so on stderr: these are safety limits, so a typo must neither remove
+ * one nor pass unnoticed.
+ */
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (raw.trim() !== "" && Number.isFinite(parsed) && parsed >= 1) return Math.floor(parsed);
+  const key = `${name}=${raw}`;
+  if (!warnedLimitValues.has(key)) {
+    warnedLimitValues.add(key);
+    console.error(
+      `[postgres-mcp] ${name}=${JSON.stringify(raw)} is not a positive integer; using the default of ${fallback}.`,
+    );
+  }
+  return fallback;
+}
+
+export const DEFAULT_MAX_RESULT_BYTES = 16 * 1024 * 1024;
+
+/** Most bytes one user statement's result may put on the wire to this process. */
+export function getMaxResultBytes(): number {
+  return positiveIntEnv("POSTGRES_MAX_RESULT_BYTES", DEFAULT_MAX_RESULT_BYTES);
+}
+
+/**
+ * Client-side limit on one user-SQL call. It sits past the statement timeout so
+ * the server's own, gentler timeout normally fires first; this one is for a
+ * statement that outlives it, such as a function catching `query_canceled`.
+ */
+export function getQueryDeadlineMs(): number {
+  return positiveIntEnv("POSTGRES_QUERY_DEADLINE_MS", getStatementTimeoutMs() + 5_000);
 }
 
 /** Raw ALLOW_WRITES values already warned about, so a per-request read warns once. */
@@ -326,6 +374,22 @@ export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
   return undefined;
 }
 
+/** Connection settings shared by the pool and the out-of-band terminate connection. */
+function connectionConfig(): pg.ClientConfig {
+  const ssl = getSslConfig();
+  return {
+    connectionString: getDatabaseUrl(),
+    // Identify this server in pg_stat_activity. Without it, agent traffic is
+    // anonymous to whoever is watching the database -- while pg_health itself
+    // reports application_name for every OTHER session. See getApplicationName
+    // for why a DSN-supplied application_name still wins.
+    application_name: getApplicationName(),
+    statement_timeout: getStatementTimeoutMs(),
+    connectionTimeoutMillis: getConnectionTimeoutMs(),
+    ...(ssl ? { ssl } : {}),
+  };
+}
+
 /**
  * Returns the singleton pool, creating it on first call.
  *
@@ -345,22 +409,13 @@ export function getSslConfig(): { rejectUnauthorized: boolean } | undefined {
  */
 export function getPool(): pg.Pool {
   if (pool) return pool;
-  const ssl = getSslConfig();
   pool = new pg.Pool({
-    connectionString: getDatabaseUrl(),
-    // Identify this server in pg_stat_activity. Without it, agent traffic is
-    // anonymous to whoever is watching the database -- while pg_health itself
-    // reports application_name for every OTHER session. See getApplicationName
-    // for why a DSN-supplied application_name still wins.
-    application_name: getApplicationName(),
-    statement_timeout: getStatementTimeoutMs(),
-    connectionTimeoutMillis: getConnectionTimeoutMs(),
+    ...connectionConfig(),
     max: getPoolMax(),
     // MCP sessions can have minutes-long gaps between tool calls. A short
     // idleTimeout forces a reconnect on every tool call. 60s keeps the pool
     // warm without holding connections indefinitely.
     idleTimeoutMillis: 60_000,
-    ...(ssl ? { ssl } : {}),
   });
   // pg's Pool emits 'error' for idle client failures. Log to stderr so the
   // stdio MCP protocol channel (stdout) stays clean.
@@ -467,6 +522,8 @@ export interface ApiResponse<T = unknown> {
 
 export function formatPgError(err: unknown): string {
   if (!(err instanceof Error)) return String(err);
+  // This server's own refusals are already complete sentences.
+  if (err instanceof GuardError) return err.message;
 
   const errObj = err as Error & { code?: string; detail?: string; hint?: string };
   const parts: string[] = [err.message];
@@ -528,8 +585,9 @@ function isNotCursorable(err: unknown): boolean {
  * Not every statement is cursorable -- DECLARE only takes a SELECT-shaped
  * statement. We wrap the attempt in a SAVEPOINT so a DECLARE failure doesn't
  * abort the outer transaction; on the fallback path we execute the SQL
- * directly, accepting that those statements never produce a runaway result
- * set anyway (DDL returns no rows, DML without RETURNING returns no rows).
+ * directly. Those statements are not row-bounded (`... RETURNING` can return
+ * any number of rows), so {@link StatementGuard}'s byte limit is what bounds
+ * them, and it also covers a few very wide rows on the cursor path.
  */
 async function runUserQueryBounded(
   client: pg.PoolClient,
@@ -793,18 +851,19 @@ export interface Checkout {
   /** Hand the connection back, or destroy it when a reason is given. */
   release: (discard?: Error) => void;
   /**
-   * Tell the listener this process is about to end the backend itself, so the
-   * socket closing afterwards is reported as that and not as a surprise.
+   * Tell the listener this process is about to end the connection itself, so
+   * the socket closing afterwards is reported as that and not as a surprise.
+   * `action` finishes "connection closed after this process ...".
    */
-  expectClose: () => void;
+  expectClose: (action?: string) => void;
 }
 
 export async function acquireClient(): Promise<Checkout> {
   const client = await getPool().connect();
-  let closeExpected = false;
+  let closeAction: string | undefined;
   const onError = (err: Error): void => {
-    if (closeExpected) {
-      console.error(`[postgres-mcp] connection closed after this process terminated its own backend: ${err.message}`);
+    if (closeAction !== undefined) {
+      console.error(`[postgres-mcp] connection closed after this process ${closeAction}: ${err.message}`);
       return;
     }
     console.error(`[postgres-mcp] connection error on a checked-out client: ${err.message}`);
@@ -812,8 +871,8 @@ export async function acquireClient(): Promise<Checkout> {
   client.on("error", onError);
   return {
     client,
-    expectClose: () => {
-      closeExpected = true;
+    expectClose: (action = "terminated its own backend") => {
+      closeAction = action;
     },
     release: (discard) => {
       if (discard) console.error(`[postgres-mcp] discarding pooled connection: ${discard.message}`);
@@ -888,6 +947,203 @@ async function terminateOwnBackend(
     const code = sqlState(err);
     if (code === "57P01" || code === undefined) return { terminated: true };
     return { terminated: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Clears what a ROLLBACK leaves on a session: prepared statements, session
+ * advisory locks, LISTEN registrations, temp tables, and committed SET / SET
+ * ROLE from a write call. The next call must not inherit any of it from a pooled
+ * connection. Settings from the startup packet (statement_timeout,
+ * application_name) are the session defaults, so they survive.
+ *
+ * It cannot run inside a transaction, so behind a transaction-mode pooler it may
+ * reach a different backend from the one just used. That is harmless, but it
+ * does not clean the original: configure `server_reset_query_always = 1` there
+ * (see the README). PgBouncer behaviour here is reasoned from its documentation
+ * and has not been tested.
+ */
+export const SESSION_RESET_SQL = "DISCARD ALL";
+
+/** Why the connection must be destroyed, when the reset failed. */
+async function resetSession(client: pg.PoolClient): Promise<Error | undefined> {
+  try {
+    await client.query(SESSION_RESET_SQL);
+    return undefined;
+  } catch (err) {
+    return new Error(`session reset failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+const RESULT_TOO_LARGE_CODE = "PGMCP_RESULT_TOO_LARGE";
+const DEADLINE_CODE = "PGMCP_DEADLINE";
+
+/** Upper bound on each step of the out-of-band terminate. */
+const TERMINATE_TIMEOUT_MS = 5_000;
+
+/** The guard gave up on this statement and the connection is gone. */
+class StatementAbortError extends GuardError {}
+
+/**
+ * End a backend from a separate connection. Not from the pool: when a deadline
+ * fires the pool may be exhausted by exactly the statements being timed out.
+ * The pid comes from inside the transaction, so behind a pooler it names the
+ * real backend; `client.processID` would be the pooler's. A role may always
+ * terminate its own sessions.
+ */
+async function terminateBackend(pid: number): Promise<boolean> {
+  const sql = "SELECT pg_terminate_backend($1) AS terminated";
+  let client: pg.Client | undefined;
+  try {
+    client = new pg.Client({
+      ...connectionConfig(),
+      connectionTimeoutMillis: Math.min(getConnectionTimeoutMs(), TERMINATE_TIMEOUT_MS),
+      query_timeout: TERMINATE_TIMEOUT_MS,
+    });
+    // A socket error here must not become an uncaught 'error' event.
+    client.on("error", () => {});
+    const connected = client;
+    await connected.connect();
+    const res = await auditQuery(
+      { source: "internal", sql, paramCount: 1 },
+      () => connected.query<{ terminated: boolean }>(sql, [pid]),
+      (r) => r.rowCount ?? r.rows.length,
+    );
+    return res.rows[0]?.terminated === true;
+  } catch (err) {
+    console.error(
+      `[postgres-mcp] could not terminate backend ${pid}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  } finally {
+    client?.end().catch(() => {});
+  }
+}
+
+/** The socket under a pg client; absent on test doubles. */
+interface ClientSocket {
+  on(event: "data", fn: (chunk: Buffer) => void): unknown;
+  removeListener(event: "data", fn: (chunk: Buffer) => void): unknown;
+  destroy(): unknown;
+}
+
+/**
+ * Limits on one user-SQL call that hold whatever the statement does:
+ *
+ *   - a deadline, because `statement_timeout` is a server setting that a
+ *     function catching `query_canceled` can outlive. It terminates the backend,
+ *     since closing the socket alone leaves a busy backend running.
+ *   - a byte limit counted on the socket, because node-pg assembles a whole row
+ *     in memory before anything above it sees the row: only the raw stream can
+ *     stop a result that is still arriving, on the cursor path and the direct
+ *     one alike.
+ *
+ * Either one ends with the socket destroyed, which also rolls the transaction
+ * back server-side.
+ */
+class StatementGuard {
+  abortError: StatementAbortError | undefined;
+  readonly aborted: Promise<never>;
+  private rejectAborted: (err: Error) => void = () => {};
+  private backendPid: number | undefined;
+  private stopped = false;
+  private deadlineFired = false;
+  private readonly timer: ReturnType<typeof setTimeout>;
+  private dataListener: ((chunk: Buffer) => void) | undefined;
+
+  constructor(
+    private readonly checkout: Checkout,
+    private readonly deadlineMs: number,
+  ) {
+    this.aborted = new Promise<never>((_, reject) => {
+      this.rejectAborted = reject;
+    });
+    this.aborted.catch(() => {});
+    this.timer = setTimeout(() => void this.onDeadline(), deadlineMs);
+  }
+
+  private socket(): ClientSocket | undefined {
+    return (this.checkout.client as unknown as { connection?: { stream?: ClientSocket } }).connection?.stream;
+  }
+
+  /** Must run inside the transaction, where a pooler keeps the backend pinned. */
+  async identifyBackend(): Promise<void> {
+    const res = await this.checkout.client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+    const pid = Number(res?.rows?.[0]?.pid);
+    this.backendPid = Number.isInteger(pid) && pid > 0 ? pid : undefined;
+  }
+
+  limitResultBytes(maxBytes: number): void {
+    const socket = this.socket();
+    if (!socket) return;
+    let received = 0;
+    this.dataListener = (chunk) => {
+      received += chunk.length;
+      if (received > maxBytes) {
+        this.abort(
+          new StatementAbortError(
+            `Result exceeded POSTGRES_MAX_RESULT_BYTES (${maxBytes} bytes), so the statement was stopped, its ` +
+              "transaction rolled back and the connection closed. Select fewer or narrower columns, or add a " +
+              "LIMIT. If you need more, raise POSTGRES_MAX_RESULT_BYTES in the MCP server env.",
+            RESULT_TOO_LARGE_CODE,
+          ),
+        );
+      }
+    };
+    socket.on("data", this.dataListener);
+  }
+
+  private async onDeadline(): Promise<void> {
+    if (this.stopped || this.deadlineFired || this.abortError) return;
+    this.deadlineFired = true;
+    const pid = this.backendPid;
+    const terminated = pid !== undefined && (await terminateBackend(pid));
+    const outcome = terminated
+      ? `backend ${pid} was terminated`
+      : pid === undefined
+        ? "its backend could not be identified and may keep running until the server stops it"
+        : `backend ${pid} could NOT be terminated and may keep running until the server stops it`;
+    this.abort(
+      new StatementAbortError(
+        `Query exceeded the ${this.deadlineMs} ms client-side deadline: ${outcome}, and the connection was closed. ` +
+          "Narrow the query, or raise POSTGRES_STATEMENT_TIMEOUT_MS and POSTGRES_QUERY_DEADLINE_MS in the MCP server env.",
+        DEADLINE_CODE,
+      ),
+    );
+  }
+
+  private abort(err: StatementAbortError): void {
+    if (this.stopped || this.abortError) return;
+    this.abortError = err;
+    this.checkout.expectClose("stopped a statement over its limit");
+    this.socket()?.destroy();
+    this.rejectAborted(err);
+  }
+
+  stop(): void {
+    this.stopped = true;
+    clearTimeout(this.timer);
+    if (this.dataListener) this.socket()?.removeListener("data", this.dataListener);
+    this.dataListener = undefined;
+  }
+}
+
+/**
+ * Run `body` under a {@link StatementGuard}. An abort wins the race even if the
+ * driver never settles the query in flight, and is what the caller sees in
+ * place of the connection error that the abort itself causes.
+ */
+async function runGuarded<T>(checkout: Checkout, body: (guard: StatementGuard) => Promise<T>): Promise<T> {
+  const guard = new StatementGuard(checkout, getQueryDeadlineMs());
+  const work = body(guard);
+  // After an abort nobody is left to observe the rejection this will produce.
+  work.catch(() => {});
+  try {
+    return await Promise.race([work, guard.aborted]);
+  } catch (err) {
+    throw guard.abortError ?? err;
+  } finally {
+    guard.stop();
   }
 }
 
@@ -990,6 +1246,8 @@ async function finishTransaction(
     }
   }
   await attempt("ROLLBACK", () => client.query("ROLLBACK"));
+  // Only on a clean finish: any failure above already destroys the connection.
+  if (failure === undefined) await attempt("session reset", () => client.query(SESSION_RESET_SQL));
   return { discard: failure, connectionEnded: connectionEnded() };
 }
 
@@ -1006,32 +1264,42 @@ async function runUserSqlInTransaction(
   sql: string,
   params: unknown[],
   hooks: RunHooks,
+  readOnly: boolean,
 ): Promise<ApiResponse<QueryResult>> {
   const maxRows = getMaxRows();
+  const maxBytes = getMaxResultBytes();
   const state = { began: false, hookSavepoint: false };
   // Assigned inside the audited span, so it is still undefined when the pool
   // refused a connection: nothing to finish or release then.
   let checkout: Checkout | undefined;
   let outcome: { result: pg.QueryResult; viaCursor: boolean } | undefined;
   let failed: ApiResponse<QueryResult> | undefined;
+  let aborted: StatementAbortError | undefined;
   try {
     // The checkout and the transaction setup sit INSIDE the audited span; see
     // auditUserStatement for why. Whatever fails in here is the statement's
     // one `ok: false` line.
     outcome = await auditUserStatement(sql, params, async () => {
+      // Inside the audited span, so a refused statement leaves its line too.
+      if (readOnly) assertReadOnlyStatement(sql);
       checkout = await acquireClient();
       const { client } = checkout;
-      await client.query(begin);
-      state.began = true;
-      if (hooks.teardown) {
-        await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
-        state.hookSavepoint = true;
-      }
-      if (hooks.setup) await hooks.setup(client);
-      return runUserQueryBounded(client, sql, params, maxRows);
+      return runGuarded(checkout, async (guard) => {
+        await client.query(begin);
+        state.began = true;
+        await guard.identifyBackend();
+        if (hooks.teardown) {
+          await client.query(`SAVEPOINT ${HOOK_SAVEPOINT}`);
+          state.hookSavepoint = true;
+        }
+        if (hooks.setup) await hooks.setup(client);
+        guard.limitResultBytes(maxBytes);
+        return runUserQueryBounded(client, sql, params, maxRows);
+      });
     });
   } catch (err) {
     failed = { ok: false, error: formatPgError(err) };
+    aborted = err instanceof StatementAbortError ? err : undefined;
   }
   // No connection: the pool refused one, or DATABASE_URL is unset. Returned
   // like every other failure, as runInternal returns its own. It propagated
@@ -1039,6 +1307,11 @@ async function runUserSqlInTransaction(
   // shaped both into the same error envelope.
   if (checkout === undefined) return failed ?? { ok: false, error: "no connection" };
   const { client, release } = checkout;
+  // The guard already closed this connection; there is nothing to finish on it.
+  if (aborted) {
+    release(aborted);
+    return failed ?? { ok: false, error: aborted.message };
+  }
   const finished = await finishTransaction(checkout, state, hooks);
   try {
     if (failed || !outcome) return failed ?? { ok: false, error: "no result" };
@@ -1056,7 +1329,7 @@ export async function runReadOnly(
   params: unknown[] = [],
   hooks: RunHooks = {},
 ): Promise<ApiResponse<QueryResult>> {
-  return runUserSqlInTransaction("BEGIN READ ONLY", sql, params, hooks);
+  return runUserSqlInTransaction("BEGIN READ ONLY", sql, params, hooks, true);
 }
 
 /** Run user-provided SQL in a read-write transaction. Requires ALLOW_WRITES=1. */
@@ -1068,22 +1341,31 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
     };
   }
   const maxRows = getMaxRows();
+  const maxBytes = getMaxResultBytes();
   // Assigned inside the audited span (see runUserSqlInTransaction), so a
   // refused connection leaves it undefined: nothing to roll back or release.
   let checkout: Checkout | undefined;
+  // Set when this connection must not go back to the pool.
+  let discard: Error | undefined;
   try {
     const { client, result, viaCursor } = await auditUserStatement(sql, params, async () => {
       checkout = await acquireClient();
       const { client } = checkout;
-      await client.query("BEGIN");
-      const bounded = await runUserQueryBounded(client, sql, params, maxRows);
-      return { client, ...bounded };
+      return runGuarded(checkout, async (guard) => {
+        await client.query("BEGIN");
+        await guard.identifyBackend();
+        guard.limitResultBytes(maxBytes);
+        const bounded = await runUserQueryBounded(client, sql, params, maxRows);
+        return { client, ...bounded };
+      });
     });
     await client.query("COMMIT");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
-    if (checkout !== undefined) {
+    if (err instanceof StatementAbortError) {
+      discard = err;
+    } else if (checkout !== undefined) {
       try {
         await checkout.client.query("ROLLBACK");
       } catch {
@@ -1092,7 +1374,12 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
     }
     return { ok: false, error: formatPgError(err) };
   } finally {
-    checkout?.release();
+    if (checkout !== undefined) {
+      // A committed SET ROLE would otherwise reach the next call on this
+      // connection, read-only ones included.
+      discard ??= await resetSession(checkout.client);
+      checkout.release(discard);
+    }
   }
 }
 
@@ -1114,7 +1401,7 @@ export async function runReadWriteRollback(
       error: "Write blocked: ALLOW_WRITES is not set. Set ALLOW_WRITES=1 in the MCP server env to enable DML/DDL.",
     };
   }
-  return runUserSqlInTransaction("BEGIN", sql, params, hooks);
+  return runUserSqlInTransaction("BEGIN", sql, params, hooks, false);
 }
 
 /**

@@ -38,6 +38,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { closeSync, fstatSync, openSync, writeSync } from "node:fs";
+import { leadingKeyword } from "./sql-guard.js";
 
 /**
  * `internal` marks catalog/introspection SQL this server composes itself;
@@ -234,14 +235,15 @@ export function runWithAuditTool<T>(tool: string, fn: () => Promise<T>): Promise
 }
 
 /**
- * First keyword of the statement, for the redacted mode. Deliberately letters
- * only: a value-bearing prefix (a leading literal, a comment carrying part of
- * the payload) must not slip into the log through this field, so anything that
- * does not start with a bare word reports UNKNOWN.
+ * First word of the statement, for the redacted mode. It is a label for
+ * grouping lines and NOT a classification: `SELECT dblink_exec(...)` logs
+ * SELECT whatever it deleted, and a line's `ok` says only that the statement
+ * returned without error. Comments are skipped and never logged. Deliberately
+ * letters only: a value-bearing prefix must not slip into the log through this
+ * field, so anything that does not start with a bare word reports UNKNOWN.
  */
 function firstKeyword(sql: string): string {
-  const keyword = /^[\s(]*([A-Za-z]+)/.exec(sql)?.[1];
-  return keyword === undefined ? "UNKNOWN" : keyword.toUpperCase();
+  return /^[A-Z]+/.exec(leadingKeyword(sql) ?? "")?.[0] ?? "UNKNOWN";
 }
 
 function sqlFields(sql: string): Record<string, string> {
