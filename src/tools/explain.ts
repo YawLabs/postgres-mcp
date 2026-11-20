@@ -14,6 +14,7 @@ import {
   runReadOnly,
   runReadWriteRollback,
 } from "../api.js";
+import { leadingKeyword } from "../sql-guard.js";
 import { identSchema, paramsArray } from "./params.js";
 
 // EXPLAIN's SERIALIZE is an enum, not a boolean: it picks how far the executor
@@ -337,12 +338,26 @@ export const explainTools = [
       // LLMs often pass pre-wrapped SQL like "EXPLAIN ANALYZE SELECT ..." which
       // would become "EXPLAIN (ANALYZE) EXPLAIN ANALYZE SELECT ..." below -
       // a syntax error. Reject with a clear hint so the next call is correct.
-      if (/^\s*EXPLAIN\b/i.test(sql)) {
+      const leading = leadingKeyword(sql);
+      if (leading === "EXPLAIN") {
         return {
           ok: false,
           error:
             "The `sql` parameter should be the query to explain, not an EXPLAIN statement. " +
             "Use the `analyze` and `format` parameters on this tool instead of prefixing the SQL.",
+        };
+      }
+
+      // `ANALYZE SELECT ...` pasted after a bare EXPLAIN IS `EXPLAIN ANALYZE`,
+      // and would execute the statement with `analyze: false`. The option list
+      // built below makes that a syntax error anyway; this says why.
+      if (leading === "ANALYZE" || leading === "ANALYSE" || leading === "VERBOSE") {
+        return {
+          ok: false,
+          error:
+            `The \`sql\` parameter starts with ${leading}, which is an EXPLAIN option and not part of the query. ` +
+            "Pass only the query, and use this tool's `analyze: true` (which executes the statement) or " +
+            "`verbose: true` parameter.",
         };
       }
 
@@ -493,7 +508,11 @@ export const explainTools = [
       if (!timing) flags.push("TIMING OFF");
       if (serialize !== undefined) flags.push(`SERIALIZE ${serialize.toUpperCase()}`);
       if (format === "json") flags.push("FORMAT JSON");
-      const explainSql = flags.length > 0 ? `EXPLAIN (${flags.join(", ")}) ${sql}` : `EXPLAIN ${sql}`;
+      // Never a bare `EXPLAIN <sql>`: there the grammar accepts ANALYZE as the
+      // next word, so caller text could switch execution on. After an option
+      // list only a statement can follow.
+      if (flags.length === 0) flags.push("ANALYZE FALSE");
+      const explainSql = `EXPLAIN (${flags.join(", ")}) ${sql}`;
 
       const hooks: RunHooks = hypoIndexes.length > 0 ? buildHypopgHooks(hypoIndexes) : {};
 
@@ -518,7 +537,10 @@ export const explainTools = [
         }
       }
 
-      // EXPLAIN without ANALYZE is always safe (parse + plan, no execution).
+      // Without ANALYZE the statement is parsed and planned, not executed; the
+      // option list above is what keeps caller text from changing that. Planning
+      // can still evaluate IMMUTABLE functions on constants, so this is "does
+      // not run the statement", not "runs no code".
       // EXPLAIN ANALYZE actually executes the statement; when writes are
       // allowed, route through the rollback variant so the plan comes back
       // but any write the user asked to analyze does not persist. Without

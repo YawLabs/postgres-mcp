@@ -1,0 +1,173 @@
+/**
+ * Startup check of what the DATABASE_URL role can actually do.
+ *
+ * `BEGIN READ ONLY` limits one transaction; it says nothing about the role. A
+ * superuser under that wrapper can still reach the filesystem and other
+ * sessions, so calling the server "read-only" without looking at the role
+ * overstates it. This reports; it never refuses to start, because local
+ * development against a superuser is common and legitimate. Every finding goes
+ * to stderr (stdout is the MCP channel).
+ */
+
+import { type ApiResponse, formatPgError, runInternal, userSchemaFilter } from "./api.js";
+
+/** Predefined roles that reach past table data. */
+const DANGEROUS_ROLES = [
+  "pg_execute_server_program",
+  "pg_read_server_files",
+  "pg_write_server_files",
+  "pg_write_all_data",
+  "pg_signal_backend",
+];
+
+/** Functions worth naming when this role may execute them. */
+const RISKY_FUNCTIONS = [
+  "dblink",
+  "dblink_connect",
+  "dblink_connect_u",
+  "dblink_exec",
+  "dblink_send_query",
+  "lo_export",
+  "lo_import",
+  "pg_read_binary_file",
+  "pg_read_file",
+];
+
+const sqlList = (items: string[]): string => items.map((i) => `'${i}'`).join(", ");
+
+/**
+ * One statement, so one audit line. `pg_has_role(..., 'SET')` exists from
+ * PostgreSQL 16; before that membership is what allows SET ROLE. The privilege
+ * name is a runtime value, so the CASE works on every version.
+ */
+export const ROLE_PREFLIGHT_SQL = `
+WITH me AS (SELECT r.* FROM pg_catalog.pg_roles r WHERE r.rolname = current_user),
+priv AS (
+  SELECT CASE WHEN current_setting('server_version_num')::int >= 160000 THEN 'SET' ELSE 'MEMBER' END AS name
+)
+SELECT
+  me.rolname::text AS role,
+  me.rolsuper AS superuser,
+  me.rolcreaterole AS create_role,
+  me.rolcreatedb AS create_db,
+  me.rolreplication AS replication,
+  me.rolbypassrls AS bypass_rls,
+  ARRAY(
+    SELECT r.rolname::text FROM pg_catalog.pg_roles r
+    WHERE r.rolname IN (${sqlList(DANGEROUS_ROLES)}) AND pg_catalog.pg_has_role(r.oid, 'MEMBER')
+    ORDER BY 1
+  ) AS dangerous_memberships,
+  ARRAY(
+    SELECT r.rolname::text FROM pg_catalog.pg_roles r, priv
+    WHERE r.oid <> me.oid AND left(r.rolname, 3) <> 'pg_' AND pg_catalog.pg_has_role(r.oid, priv.name)
+    ORDER BY 1 LIMIT 20
+  ) AS settable_roles,
+  EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles r, priv
+    WHERE r.oid <> me.oid AND r.rolsuper AND pg_catalog.pg_has_role(r.oid, priv.name)
+  ) AS can_set_superuser,
+  ARRAY(
+    SELECT DISTINCT p.proname::text FROM pg_catalog.pg_proc p
+    WHERE p.proname IN (${sqlList(RISKY_FUNCTIONS)}) AND pg_catalog.has_function_privilege(p.oid, 'EXECUTE')
+    ORDER BY 1
+  ) AS risky_functions,
+  EXISTS (
+    SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p') AND ${userSchemaFilter("n.nspname")}
+      AND pg_catalog.has_table_privilege(c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')
+  ) AS can_write_tables
+FROM me`;
+
+export interface RoleFacts {
+  role: string;
+  superuser: boolean;
+  create_role: boolean;
+  create_db: boolean;
+  replication: boolean;
+  bypass_rls: boolean;
+  dangerous_memberships: string[];
+  settable_roles: string[];
+  can_set_superuser: boolean;
+  risky_functions: string[];
+  can_write_tables: boolean;
+}
+
+/** What is wrong with this role for an agent, one finding per entry. */
+export function analyzeRole(facts: RoleFacts, writesAllowed: boolean): string[] {
+  const findings: string[] = [];
+  if (facts.superuser) {
+    findings.push("is a SUPERUSER: it can run server programs, read server files and bypass every permission check");
+  }
+  if (facts.can_set_superuser) findings.push("can SET ROLE to a superuser");
+  if (facts.dangerous_memberships.length > 0) {
+    findings.push(`is a member of ${facts.dangerous_memberships.join(", ")}`);
+  }
+  if (!facts.superuser && facts.settable_roles.length > 0) {
+    findings.push(`can SET ROLE to ${facts.settable_roles.join(", ")}`);
+  }
+  const attributes = [
+    facts.create_role && "CREATEROLE",
+    facts.create_db && "CREATEDB",
+    facts.replication && "REPLICATION",
+    facts.bypass_rls && "BYPASSRLS",
+  ].filter((a): a is string => typeof a === "string");
+  if (!facts.superuser && attributes.length > 0) findings.push(`has ${attributes.join(", ")}`);
+  if (!facts.superuser && facts.risky_functions.length > 0) {
+    findings.push(`can execute ${facts.risky_functions.join(", ")}`);
+  }
+  if (!writesAllowed && !facts.superuser && facts.can_write_tables) {
+    findings.push(
+      "holds write privileges on tables, which only the transaction wrapper is holding back (dblink or a " +
+        "SECURITY DEFINER function can step outside it)",
+    );
+  }
+  return findings;
+}
+
+type RoleQuery = (sql: string) => Promise<ApiResponse<RoleFacts[]>>;
+
+/**
+ * Log the verdict on stderr. Never throws and never blocks startup: an
+ * unreachable database is reported here and again by the first tool call.
+ * `log` and `query` are injectable for tests.
+ */
+export async function runRolePreflight(
+  writesAllowed: boolean,
+  log: (line: string) => void = (line) => console.error(line),
+  query: RoleQuery = (sql) => runInternal<RoleFacts & Record<string, unknown>>(sql),
+): Promise<void> {
+  const unverified = (why: string): void =>
+    log(`[postgres-mcp] role check skipped (${why}). What this server can do is unverified: it depends on the role.`);
+  if (!process.env.DATABASE_URL?.trim()) {
+    unverified("DATABASE_URL is not set");
+    return;
+  }
+  let facts: RoleFacts | undefined;
+  try {
+    const res = await query(ROLE_PREFLIGHT_SQL);
+    if (!res.ok) {
+      unverified(res.error ?? "the check failed");
+      return;
+    }
+    facts = res.data?.[0];
+  } catch (err) {
+    unverified(formatPgError(err));
+    return;
+  }
+  if (!facts) {
+    unverified("current_user was not found in pg_roles");
+    return;
+  }
+  const findings = analyzeRole(facts, writesAllowed);
+  if (findings.length === 0) {
+    log(`[postgres-mcp] role check: "${facts.role}" has none of the elevated attributes or grants checked for.`);
+    return;
+  }
+  log(`[postgres-mcp] WARNING: this server is NOT effectively read-only. Role "${facts.role}":`);
+  for (const finding of findings) log(`[postgres-mcp] WARNING:   - ${finding}`);
+  log(
+    "[postgres-mcp] WARNING: BEGIN READ ONLY and the statement checks do not contain this role. Fine for local " +
+      'development; for anything else connect as a least-privilege role (README, "Configuring access"), and do not ' +
+      "auto-allow pg_readonly until you have.",
+  );
+}

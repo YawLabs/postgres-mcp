@@ -104,6 +104,29 @@ const lists = () => ({
   alwaysPrompt: listedNames(gatingLine("Always prompt")),
 });
 
+describe("README and tool text do not oversell read-only", () => {
+  const pgReadonly = queryTools.find((t) => t.name === "pg_readonly");
+
+  it("makes auto-allow conditional on a least-privilege role", () => {
+    assert.match(readme, /auto-allowable only once `DATABASE_URL` is a least-privilege role/);
+    assert.doesNotMatch(readme, /the one to auto-allow/);
+  });
+
+  it("says plainly what the server cannot enforce", () => {
+    assert.match(readme, /What this server cannot enforce/);
+    assert.match(readme, /An agent that also has a shell/);
+  });
+
+  it("gives role setup guidance", () => {
+    assert.match(readme, /ALTER ROLE mcp_reader NOSUPERUSER/);
+  });
+
+  it("pg_readonly's description names the role as the boundary", () => {
+    assert.match(pgReadonly?.description ?? "", /NOT a security boundary/);
+    assert.match(pgReadonly?.description ?? "", /do not auto-allow this tool unless that role is least-privilege/);
+  });
+});
+
 describe("README per-tool gating lists", () => {
   it("parse to a plausible number of names, so a reworded line cannot make this test vacuous", () => {
     const { autoAllow, alwaysPrompt } = lists();

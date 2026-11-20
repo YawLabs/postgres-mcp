@@ -150,8 +150,12 @@ describe("CLI: MCP stdio handshake with no args", () => {
     try {
       const banner = await waitForBanner(child);
       assert.match(banner, /@yawlabs\/postgres-mcp v\d+\.\d+\.\d+ ready/, `unexpected banner: ${banner}`);
-      // The banner states the write posture; ALLOW_WRITES is unset here.
-      assert.match(banner, /read-only/);
+      // The banner states the write posture; ALLOW_WRITES is unset here. It
+      // describes the transactions, and must not call the server read-only:
+      // that depends on the role.
+      assert.match(banner, /read-only transactions/);
+      assert.match(banner, /role is the real boundary/);
+      assert.doesNotMatch(banner, /, read-only\)/);
 
       const initialize = await rpc(child, {
         jsonrpc: "2.0",
