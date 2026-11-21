@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   role setup guidance. The audit `sqlKeyword` skips comments and is documented as a label, not a classification.
 
 ### Changed
+- **The oam floor moves from 0.20.2 to 0.21.1, so the `postgres-mcp` launcher no longer runs the server on an older
+  oam.** Verified on oam 0.21.1 with a local PostgreSQL 18: an MCP handshake (23 tools) and a `pg_readonly` query
+  answered identically in four modes -- `node dist/index.js`, `POSTGRES_MCP_RUNTIME=oam` through the launcher,
+  `POSTGRES_MCP_SANDBOX=1` through the launcher, and the launcher hosted by `oam run` -- and the real-oam sandbox
+  integration lane passes (handshake + `select 1` under `--permission`, the pinned port admitted, the adjacent port
+  refused with `ERR_ACCESS_DENIED`). An `OAM_BIN` on 0.21.0 is named and passed over for the installed 0.21.1, and
+  refused (`RUNTIME=oam`, nothing else available) with the `oam self-update` remedy.
 - **Breaking:** on read-only paths the statements and functions listed above now fail instead of running.
 - **Breaking:** a result over `POSTGRES_MAX_RESULT_BYTES` fails rather than returning; raise the variable if needed.
 - **Breaking:** session state set by one call, including `SET` or temp tables committed with `ALLOW_WRITES=1`, is gone by
