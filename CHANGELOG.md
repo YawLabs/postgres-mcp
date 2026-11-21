@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-21
+
 ### Changed
 - The Yaw MCP floor moves from 1.1.13 to 1.1.16, so the README's "Tested with" claim names the release the suite was
   re-run on. Re-tested with `@yawlabs/mcp-compliance` 0.20.4 -- the range `@yawlabs/mcp@1.1.16` pins (unchanged from
