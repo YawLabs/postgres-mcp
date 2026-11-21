@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-21
+
 ### Security
 - **`pg_explain` no longer executes a statement when `analyze` is false.** `sql: "ANALYZE SELECT ..."` became
   `EXPLAIN ANALYZE SELECT ...` and ran. Such input is refused, and the statement is always sent after an option list
