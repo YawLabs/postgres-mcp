@@ -47,7 +47,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The Yaw MCP release this server is tested with. Bump both together. */
-export const YAW_MCP_MIN = "1.1.13";
+export const YAW_MCP_MIN = "1.1.16";
 /** The @yawlabs/mcp-compliance range @yawlabs/mcp YAW_MCP_MIN pins. */
 export const YAW_MCP_COMPLIANCE_RANGE = "^0.20.4";
 

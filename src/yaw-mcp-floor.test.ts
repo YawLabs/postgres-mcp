@@ -46,7 +46,7 @@ describe("the Yaw MCP floor is consistent across this repo", () => {
 
 describe("check-yaw-mcp-floor catches drift", () => {
   it("passes a tree with the pinned range and a current claim", () => {
-    const root = fixture({ compliance: "^0.20.4", readme: "Tested with Yaw MCP 1.1.13 or newer.\n" });
+    const root = fixture({ compliance: "^0.20.4", readme: "Tested with Yaw MCP 1.1.16 or newer.\n" });
     const r = runChecker(root);
     assert.equal(r.code, 0, r.out);
   });
@@ -59,7 +59,7 @@ describe("check-yaw-mcp-floor catches drift", () => {
   });
 
   it("does not require the devDependency at all", () => {
-    const r = runChecker(fixture({ readme: "Tested with Yaw MCP 1.1.13 or newer.\n" }));
+    const r = runChecker(fixture({ readme: "Tested with Yaw MCP 1.1.16 or newer.\n" }));
     assert.equal(r.code, 0, r.out);
   });
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The Yaw MCP floor moves from 1.1.13 to 1.1.16, so the README's "Tested with" claim names the release the suite was
+  re-run on. Re-tested with `@yawlabs/mcp-compliance` 0.20.4 -- the range `@yawlabs/mcp@1.1.16` pins (unchanged from
+  1.1.13, `^0.20.4`) -- against the published `0.14.0` over stdio: grade **A**, 59/60 with all 21 required tests
+  passing, spec auto-detected as 2026-07-28. The one non-required failure is `security-tool-cross-reference` (tool
+  descriptions naming each other, intentional here). Documentation and floor constants only; nothing runtime reads the
+  floor.
+
 ## [0.14.0] - 2026-11-21
 
 ### Security

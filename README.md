@@ -2,7 +2,7 @@
 
 [![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=Postgres&command=npx&args=-y%2C%40yawlabs%2Fpostgres-mcp&description=Query%20PostgreSQL%20-%20schema%20introspection%2C%20EXPLAIN%20plans%2C%20health%20diagnostics%2C%20read-only%20by%20default&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fpostgres-mcp)
 
-One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Tested with Yaw MCP 1.1.13 or newer. Or install manually below.
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Tested with Yaw MCP 1.1.16 or newer. Or install manually below.
 
 [![npm version](https://img.shields.io/npm/v/@yawlabs/postgres-mcp)](https://www.npmjs.com/package/@yawlabs/postgres-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
