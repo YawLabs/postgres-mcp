@@ -38,6 +38,30 @@ describe("pg_explain EXPLAIN-prefix guard", () => {
   });
 });
 
+describe("pg_explain EXPLAIN-option-prefix guard", () => {
+  // `ANALYZE SELECT ...` after a bare EXPLAIN is EXPLAIN ANALYZE: without
+  // this refusal and the always-present option list, it would EXECUTE the
+  // statement while analyze: false. These are the unit-level twins of the
+  // security.integration.test.ts cases (which need a live database).
+  for (const sql of [
+    "ANALYZE SELECT 1",
+    "ANALYSE SELECT 1",
+    "VERBOSE SELECT 1",
+    // leadingKeyword skips comments, so a commented-out option is caught too.
+    "-- see the plan\nANALYZE SELECT 1",
+  ]) {
+    it(`refuses ${JSON.stringify(sql)} as an option prefix`, async () => {
+      const result = (await pgExplain.handler({
+        sql,
+        analyze: false,
+        format: "text",
+      })) as { ok: boolean; error?: string };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /is an EXPLAIN option and not part of the query/);
+    });
+  }
+});
+
 describe("pg_explain hypothetical_indexes identifier validation", () => {
   // Validation runs as a pre-flight before the handler touches the DB, so
   // these tests don't need a live postgres -- they ride on the fast unit path.
@@ -879,8 +903,10 @@ describe("pg_explain text-plan truncation notice", () => {
 describe("pg_explain HypoPG teardown order (stubbed)", () => {
   // Statement indexes of the three teardown steps, or -1 when a step was not
   // sent. `ROLLBACK` is matched exactly: `ROLLBACK TO SAVEPOINT` contains it.
+  // The session reset always follows the ROLLBACK; it has its own tests in
+  // security.test.ts, and these are about what happens before it.
   function teardownOrder(session: StubSession) {
-    const sqls = session.statements.map((s) => s.sql);
+    const sqls = session.statements.map((s) => s.sql).filter((s) => s !== "DISCARD ALL");
     return {
       hookSavepoint: sqls.indexOf("SAVEPOINT __pgmcp_hooks"),
       restore: sqls.indexOf("ROLLBACK TO SAVEPOINT __pgmcp_hooks"),
@@ -972,7 +998,7 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
             0,
             "a backend was terminated over a transient",
           );
-          assert.equal(sqls.indexOf("ROLLBACK"), sqls.length - 1);
+          assert.equal(sqls.indexOf("ROLLBACK"), sqls.length - 2);
           assert.deepEqual(session.releases, [undefined], "a clean connection was discarded");
           // The line names what failed the first time, or an operator cannot
           // tell a cancel from a permission problem that happened to pass.
@@ -1274,7 +1300,7 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
           0,
           "a clean backend was terminated",
         );
-        assert.equal(sqls.at(-1), "ROLLBACK");
+        assert.deepEqual(sqls.slice(-2), ["ROLLBACK", "DISCARD ALL"]);
         assert.deepEqual(session.releases, [undefined], "a clean connection was discarded");
       },
       undefined,
@@ -1364,7 +1390,7 @@ describe("pg_explain HypoPG teardown order (stubbed)", () => {
         const sqls = session.statements.map((s) => s.sql);
         assert.equal(sqls.filter((s) => s.includes("hypopg_reset")).length, 0, "teardown ran with nothing to undo");
         assert.equal(sqls.filter((s) => s.startsWith("ROLLBACK TO")).length, 0);
-        assert.equal(sqls.indexOf("ROLLBACK"), sqls.length - 1);
+        assert.equal(sqls.indexOf("ROLLBACK"), sqls.length - 2);
         assert.deepEqual(session.releases, [undefined], "a clean connection was discarded");
       },
       undefined,

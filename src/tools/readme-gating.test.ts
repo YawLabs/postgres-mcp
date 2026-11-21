@@ -104,6 +104,57 @@ const lists = () => ({
   alwaysPrompt: listedNames(gatingLine("Always prompt")),
 });
 
+describe("README and tool text do not oversell read-only", () => {
+  const pgReadonly = queryTools.find((t) => t.name === "pg_readonly");
+
+  it("makes auto-allow conditional on a least-privilege role", () => {
+    // The condition, not one wording of it: the README has phrased it both as
+    // "least-privilege role" and as "its safety comes from the role", and a
+    // test pinning either string breaks on a harmless rewording while an
+    // oversell phrased differently slips through. A sentence carries the
+    // condition when it names the role requirement in any of these forms.
+    const condition = /least-privilege|safety comes from the role|only with a least-privilege role|unless that role is/;
+
+    // (a) The gating section's Auto-allow entry lists pg_readonly and carries
+    // the condition right there, so the entry itself cannot read as a blanket
+    // permission to auto-allow it.
+    const autoAllow = gatingLine("Auto-allow");
+    assert.match(autoAllow, /pg_readonly/, "the Auto-allow line no longer lists pg_readonly");
+    assert.match(
+      autoAllow,
+      condition,
+      `the Auto-allow line lists pg_readonly without a least-privilege condition: ${autoAllow}`,
+    );
+
+    // (b) Same concept everywhere else: no sentence may pair auto-allowability
+    // of pg_readonly with a role condition absent. Scanned sentence by
+    // sentence, so an oversell worded differently still fails.
+    for (const sentence of readme.split(/(?<=[.!?])\s+/)) {
+      if (/auto-allow/i.test(sentence) && /pg_readonly/.test(sentence)) {
+        assert.match(
+          sentence,
+          condition,
+          `auto-allow sentence for pg_readonly without a least-privilege condition: ${sentence}`,
+        );
+      }
+    }
+  });
+
+  it("says plainly what the server cannot enforce", () => {
+    assert.match(readme, /What this server cannot enforce/);
+    assert.match(readme, /An agent that also has a shell/);
+  });
+
+  it("gives role setup guidance", () => {
+    assert.match(readme, /ALTER ROLE mcp_reader NOSUPERUSER/);
+  });
+
+  it("pg_readonly's description names the role as the boundary", () => {
+    assert.match(pgReadonly?.description ?? "", /NOT a security boundary/);
+    assert.match(pgReadonly?.description ?? "", /do not auto-allow this tool unless that role is least-privilege/);
+  });
+});
+
 describe("README per-tool gating lists", () => {
   it("parse to a plausible number of names, so a reworded line cannot make this test vacuous", () => {
     const { autoAllow, alwaysPrompt } = lists();

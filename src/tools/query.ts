@@ -54,31 +54,27 @@ export const queryTools = [
   {
     name: "pg_readonly",
     description:
-      "Run a SQL statement with no persistent data changes. Always executes inside a " +
-      "`BEGIN READ ONLY` transaction regardless of `ALLOW_WRITES`, so postgres itself rejects " +
-      "any INSERT/UPDATE/DELETE/DDL and the transaction is always rolled back. " +
-      "Use this whenever the goal is to read - SELECT, EXPLAIN, SHOW, VALUES, WITH ... SELECT, " +
-      "etc. Scope caveat for hosts that auto-allow this tool: `READ ONLY` constrains writes to " +
-      "the DATABASE, not every side effect. Functions whose effect is outside the table data - " +
-      "`pg_cancel_backend` / `pg_terminate_backend`, `pg_read_file`, `lo_export`, " +
-      "`COPY ... TO PROGRAM` - are NOT blocked here and are NOT behind the `ALLOW_WRITES` gate " +
-      "that `pg_kill` sits behind. They still require the privileges the `DATABASE_URL` role " +
-      "holds, so a least-privileged role (e.g. `pg_read_all_data`) is what actually bounds " +
-      "this tool. Use `params` for parameterized queries to avoid SQL injection. " +
+      "Run one SQL statement inside a `BEGIN READ ONLY` transaction that is always rolled back, " +
+      "regardless of `ALLOW_WRITES`. Postgres rejects INSERT/UPDATE/DELETE/DDL there. Use this " +
+      "to read: SELECT, WITH ... SELECT, VALUES, TABLE, SHOW, EXPLAIN. Statements that escape or " +
+      "reshape the transaction are refused (SET, RESET, DO, CALL, PREPARE, EXECUTE, COPY, LOCK, " +
+      "transaction control and similar), as are calls to known out-of-transaction functions " +
+      "(`dblink*`, `set_config`, `pg_read_file`, `lo_export`, `pg_terminate_backend`, ...). " +
+      "These checks are best-effort and are NOT a security boundary: a function wrapper gets " +
+      "past them, and a function can write through its own connection. The `DATABASE_URL` role " +
+      "is the boundary, so do not auto-allow this tool unless that role is least-privilege. " +
+      "Use `params` for parameterized queries to avoid SQL injection. " +
       "Params can be strings, numbers, booleans, null, arrays (for postgres arrays / ANY), or " +
       "objects (for json/jsonb columns). Large result sets are truncated to POSTGRES_MAX_ROWS " +
-      "(default 1000) with a `truncated: true` flag.",
-    // DELIBERATE, do not "fix" to match the caveat in the description above.
-    // `BEGIN READ ONLY` does not block side-effecting functions
-    // (pg_terminate_backend, pg_read_file, COPY ... TO PROGRAM), so these
-    // hints are arguably too generous, and a review pass will keep noticing
-    // that. The decision is to keep them: staying in the host auto-allow class
-    // is the entire reason pg_readonly exists as a separate tool from
-    // pg_query, and the DATABASE_URL role -- not the transaction mode -- is
-    // the control that actually bounds this tool. The description and the
-    // README carry the caveat; a least-privileged role is the enforcement.
-    // Flipping these to destructive would move pg_readonly to "always prompt"
-    // in every existing host config for a bound the role already provides.
+      "(default 1000) with a `truncated: true` flag; a result over POSTGRES_MAX_RESULT_BYTES " +
+      "fails instead, and a call past POSTGRES_QUERY_DEADLINE_MS has its backend terminated.",
+    // readOnlyHint states what this tool is FOR and what it enforces at the
+    // transaction level. It is not a guarantee: with a privileged role a call
+    // can still have effects outside the transaction (dblink, a SECURITY DEFINER
+    // function). A host that auto-allows on this hint is safe only when the
+    // DATABASE_URL role is least-privilege, which the description and README
+    // say, and which the startup role check warns about. It stays true because
+    // flipping it would misdescribe the tool under the role it is meant for.
     annotations: {
       title: "Run read-only SQL",
       readOnlyHint: true,
@@ -105,12 +101,14 @@ export const queryTools = [
       "`pg_read_all_data`), which makes writes server-rejected regardless of any env var. " +
       "`ALLOW_WRITES=1` is a secondary belt-and-braces gate - it lifts the in-server " +
       "`BEGIN READ ONLY` wrapper, but it cannot grant privileges the role lacks. Useful for " +
-      "managed databases where creating a second role is awkward. For read-only access where " +
-      "you want the guarantee in the tool name, prefer `pg_readonly`. Use `params` for " +
+      "managed databases where creating a second role is awkward. Without `ALLOW_WRITES` this " +
+      "applies the same statement checks as `pg_readonly`, which stays read-only whatever the " +
+      "flag says. Use `params` for " +
       "parameterized queries to avoid SQL injection. Params can be strings, numbers, booleans, " +
       "null, arrays (for postgres arrays / ANY), or objects (for json/jsonb columns). Dates and " +
       "UUIDs can be passed as ISO strings. Large result sets are truncated to " +
-      "POSTGRES_MAX_ROWS (default 1000) with a `truncated: true` flag.",
+      "POSTGRES_MAX_ROWS (default 1000) with a `truncated: true` flag; a result over " +
+      "POSTGRES_MAX_RESULT_BYTES fails instead. Session state does not carry over between calls.",
     annotations: {
       title: "Run SQL query",
       readOnlyHint: false, // conditionally destructive based on role + ALLOW_WRITES

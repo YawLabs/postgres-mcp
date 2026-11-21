@@ -7,7 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`pg_explain` no longer executes a statement when `analyze` is false.** `sql: "ANALYZE SELECT ..."` became
+  `EXPLAIN ANALYZE SELECT ...` and ran. Such input is refused, and the statement is always sent after an option list
+  (`EXPLAIN (ANALYZE FALSE) ...`), where the grammar accepts only a statement.
+- **Note:** `pg_explain` with `analyze: true` and `ALLOW_WRITES=1` runs the statement without the read-only keyword
+  guard, inside an always-rolled-back transaction (intentional; the writes do not persist).
+- **Read-only paths refuse statements that step around `BEGIN READ ONLY`**, by leading keyword after skipping
+  whitespace, nested comments and statement separators: `SET`, `RESET`, `DO`, `CALL`, `PREPARE`, `EXECUTE`,
+  `DEALLOCATE`, `LOAD`, `DISCARD`, `COPY`, `LOCK`, `VACUUM`, `ANALYZE`, `CLUSTER`, `REINDEX`, `CHECKPOINT`, `LISTEN`,
+  `UNLISTEN`, `NOTIFY`, cursor commands and transaction control. Direct calls to `dblink*`, `set_config`,
+  `pg_terminate_backend`, `pg_cancel_backend`, server-file functions, `lo_import`/`lo_export`, `query_to_xml*`,
+  `ts_stat` and `ts_rewrite` are refused too. A leading `;` used to end the scan with no keyword at all, so
+  `; SET ROLE x` -- which postgres parses as one statement -- passed untouched. These checks are best-effort; the
+  `DATABASE_URL` role remains the boundary.
+- **`pg_index_advisor` runs the same read-only guard.** Its `EXPLAIN`s never rode the statement guard the query tools
+  use, so a workload statement containing `set_config` or `dblink_exec` was planned anyway (planning runs
+  session-state and file functions). Caller-supplied statements are checked once, up front, and refused before a
+  connection is taken; rows read from `pg_stat_statements` are checked after loading, and a blocked row is dropped
+  with a warning instead of refusing the whole call.
+- **Results are bounded in bytes** by `POSTGRES_MAX_RESULT_BYTES` (default 16 MiB), counted on the socket so it covers
+  wide rows and statements that cannot use the row-cap cursor.
+- **A client-side deadline** (`POSTGRES_QUERY_DEADLINE_MS`, default statement timeout + 5 s) terminates a backend that
+  outlives `statement_timeout`.
+- **Session state no longer survives a call**: every user-SQL call ends with `DISCARD ALL` on its connection.
+- **Startup role check**: the server reports superuser, risky attributes and memberships, `SET ROLE` reach, table write
+  privileges and `dblink_connect_u`/server-file function access on stderr, and the banner no longer says "read-only". It warns
+  and keeps running.
+- The README and `pg_readonly` description no longer recommend auto-allowing without a least-privilege role, and add
+  role setup guidance. The audit `sqlKeyword` skips comments and is documented as a label, not a classification.
+
 ### Changed
+- **Breaking:** on read-only paths the statements and functions listed above now fail instead of running.
+- **Breaking:** a result over `POSTGRES_MAX_RESULT_BYTES` fails rather than returning; raise the variable if needed.
+- **Breaking:** session state set by one call, including `SET` or temp tables committed with `ALLOW_WRITES=1`, is gone by
+  the next call, even with `POSTGRES_POOL_MAX=1`.
+- **Breaking:** the startup banner text changed, audit `sql` for a plain `pg_explain` now reads
+  `EXPLAIN (ANALYZE FALSE) ...`, and redacted `sqlKeyword` reports the first word after a leading comment instead of
+  `UNKNOWN`.
 - The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs`
   (`npm run check:yaw-mcp-floor`) fails on drift between `YAW_MCP_MIN` 1.1.13 and
   the README's "Yaw MCP 1.1.13 or newer" (and, if one is ever added, a
