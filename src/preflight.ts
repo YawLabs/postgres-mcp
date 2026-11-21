@@ -20,18 +20,20 @@ const DANGEROUS_ROLES = [
   "pg_signal_backend",
 ];
 
-/** Functions worth naming when this role may execute them. */
-const RISKY_FUNCTIONS = [
-  "dblink",
-  "dblink_connect",
-  "dblink_connect_u",
-  "dblink_exec",
-  "dblink_send_query",
-  "lo_export",
-  "lo_import",
-  "pg_read_binary_file",
-  "pg_read_file",
-];
+/**
+ * Functions worth naming when this role may execute them. Plain dblink
+ * (`dblink`, `dblink_connect`, `dblink_exec`, `dblink_send_query`) is deliberately
+ * absent: the contrib extension grants EXECUTE on all of them to PUBLIC by
+ * default, so `has_function_privilege(..., 'EXECUTE')` is true for EVERY role --
+ * including the README's blessed least-privilege one -- and the check would warn
+ * on the recommended config, making the clean verdict unreachable on any
+ * database with dblink installed (a warning that always fires trains users to
+ * ignore warnings). `dblink_connect_u` is the exception: it is denied to PUBLIC
+ * by default (measured: public_exec = f), so seeing it still is a real finding.
+ * The call-level risk of plain dblink is covered by the statement guard
+ * (src/sql-guard.ts), which refuses direct dblink* calls outright.
+ */
+const RISKY_FUNCTIONS = ["dblink_connect_u", "lo_export", "lo_import", "pg_read_binary_file", "pg_read_file"];
 
 const sqlList = (items: string[]): string => items.map((i) => `'${i}'`).join(", ");
 
@@ -58,10 +60,19 @@ SELECT
     ORDER BY 1
   ) AS dangerous_memberships,
   ARRAY(
+    -- Predefined roles (pg_monitor, pg_read_all_data, ...) stay in: they only
+    -- matter when INHERIT is off, but then SET reach into them is exactly the
+    -- risk. LIMIT 20 caps the list; settable_count is computed over the FULL set
+    -- (no LIMIT) so analyzeRole can flag truncation instead of printing 20 names
+    -- that read as complete.
     SELECT r.rolname::text FROM pg_catalog.pg_roles r, priv
-    WHERE r.oid <> me.oid AND left(r.rolname, 3) <> 'pg_' AND pg_catalog.pg_has_role(r.oid, priv.name)
+    WHERE r.oid <> me.oid AND pg_catalog.pg_has_role(r.oid, priv.name)
     ORDER BY 1 LIMIT 20
   ) AS settable_roles,
+  (
+    SELECT count(*)::int FROM pg_catalog.pg_roles r, priv
+    WHERE r.oid <> me.oid AND pg_catalog.pg_has_role(r.oid, priv.name)
+  ) AS settable_count,
   EXISTS (
     SELECT 1 FROM pg_catalog.pg_roles r, priv
     WHERE r.oid <> me.oid AND r.rolsuper AND pg_catalog.pg_has_role(r.oid, priv.name)
@@ -87,6 +98,8 @@ export interface RoleFacts {
   bypass_rls: boolean;
   dangerous_memberships: string[];
   settable_roles: string[];
+  /** Full count before LIMIT 20; exceeds settable_roles.length when truncated. */
+  settable_count: number;
   can_set_superuser: boolean;
   risky_functions: string[];
   can_write_tables: boolean;
@@ -103,7 +116,11 @@ export function analyzeRole(facts: RoleFacts, writesAllowed: boolean): string[] 
     findings.push(`is a member of ${facts.dangerous_memberships.join(", ")}`);
   }
   if (!facts.superuser && facts.settable_roles.length > 0) {
-    findings.push(`can SET ROLE to ${facts.settable_roles.join(", ")}`);
+    // The SQL lists at most 20 (LIMIT 20); settable_count is the untruncated
+    // total, so say how many were elided rather than implying the list is whole.
+    const omitted = facts.settable_count - facts.settable_roles.length;
+    const more = omitted > 0 ? ` (and ${omitted} more)` : "";
+    findings.push(`can SET ROLE to ${facts.settable_roles.join(", ")}${more}`);
   }
   const attributes = [
     facts.create_role && "CREATEROLE",

@@ -123,7 +123,7 @@ GRANT pg_read_all_data TO mcp_reader;
 
 Point `DATABASE_URL` at `mcp_reader`. Postgres then rejects writes, DDL and privilege changes regardless of `ALLOW_WRITES`. `pg_read_all_data` reads **every** table, so grant `SELECT` on specific tables instead if some hold data the agent should not see.
 
-Then check what else the role can reach. The server does this at startup and prints a `WARNING` on stderr for each problem it finds: superuser, `CREATEROLE`/`CREATEDB`/`REPLICATION`/`BYPASSRLS`, membership of `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files`, `pg_write_all_data` or `pg_signal_backend`, roles it can `SET ROLE` to, table write privileges, and `EXECUTE` on `dblink` or server-file functions. It warns and keeps running, so local development against a superuser still works. Clear the warnings with:
+Then check what else the role can reach. The server does this at startup and prints a `WARNING` on stderr for each problem it finds: superuser, `CREATEROLE`/`CREATEDB`/`REPLICATION`/`BYPASSRLS`, membership of `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files`, `pg_write_all_data` or `pg_signal_backend`, roles it can `SET ROLE` to, table write privileges, and `EXECUTE` on `dblink_connect_u` or server-file functions (plain `dblink` functions are not named: postgres grants them to PUBLIC by default, so every role would trip that warning; the statement checks refuse the calls anyway). It warns and keeps running, so local development against a superuser still works. Clear the warnings with:
 
 ```sql
 ALTER ROLE mcp_reader NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
@@ -131,7 +131,7 @@ ALTER ROLE mcp_reader SET default_transaction_read_only = on;
 ALTER ROLE mcp_reader SET statement_timeout = '30s';
 -- Remove anything the check named, for example:
 REVOKE some_owner_role FROM mcp_reader;
-REVOKE EXECUTE ON FUNCTION dblink_exec(text, text) FROM PUBLIC; -- and the other dblink functions, if installed
+REVOKE EXECUTE ON FUNCTION dblink_connect_u(text) FROM PUBLIC; -- if dblink is installed and its warning fired
 ```
 
 <a id="what-this-server-cannot-enforce"></a>**What this server cannot enforce.** Its checks are guard rails for a well-meaning agent, not a sandbox:
@@ -161,7 +161,7 @@ Tools split across two classes. **Treat the first list as auto-allowable only on
 
 The split follows each tool's `readOnlyHint` annotation, and Claude Code's `permissions` block and mcp.hosting's per-tool toggle both honor it. The hint describes what a tool is meant to do; it cannot promise what the connected role is able to do.
 
-> **What `READ ONLY` does and does not cover.** A `BEGIN READ ONLY` transaction blocks writes through *this session* -- INSERT/UPDATE/DELETE, DDL, `nextval`/`setval`. It does not stop effects outside it. On read-only paths the server therefore refuses `SET`, `RESET`, `DO`, `CALL`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, `LOAD`, `DISCARD`, `COPY`, `LOCK`, `VACUUM`, `ANALYZE`, `CLUSTER`, `REINDEX`, `CHECKPOINT`, `LISTEN`, `NOTIFY`, cursor commands and transaction control by leading keyword, plus direct calls to `dblink*`, `set_config`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_read_file` and similar server-file functions, `lo_import`/`lo_export`, `query_to_xml` and `ts_stat`. Those checks are cheap and bypassable ([what they cannot do](#what-this-server-cannot-enforce)), and with `ALLOW_WRITES=1` `pg_query` skips them. **The role is the control that bounds this tool.**
+> **What `READ ONLY` does and does not cover.** A `BEGIN READ ONLY` transaction blocks writes through *this session* -- INSERT/UPDATE/DELETE, DDL, `nextval`/`setval`. It does not stop effects outside it. On read-only paths the server therefore refuses `SET`, `RESET`, `DO`, `CALL`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, `LOAD`, `DISCARD`, `COPY`, `LOCK`, `VACUUM`, `ANALYZE`, `CLUSTER`, `REINDEX`, `CHECKPOINT`, `LISTEN`, `UNLISTEN`, `NOTIFY`, cursor commands and transaction control by leading keyword, plus direct calls to `dblink*`, `set_config`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_read_file` and similar server-file functions, `lo_import`/`lo_export`, `query_to_xml` and `ts_stat`/`ts_rewrite`. Those checks are cheap and bypassable ([what they cannot do](#what-this-server-cannot-enforce)), and with `ALLOW_WRITES=1` `pg_query` skips them. **The role is the control that bounds this tool.**
 
 **`ALLOW_WRITES` as defense-in-depth:**
 
@@ -227,7 +227,7 @@ All env vars are read from the MCP server's environment:
 | `POSTGRES_STATEMENT_TIMEOUT_MS` | `30000` | Per-statement timeout. |
 | `POSTGRES_CONNECTION_TIMEOUT_MS` | `10000` | TCP connect timeout. Without this, a dead host hangs until the OS gives up (~2 minutes). |
 | `POSTGRES_MAX_ROWS` | `1000` | Cap on rows returned by `pg_query`. |
-| `POSTGRES_MAX_RESULT_BYTES` | `16777216` (16 MiB) | Most bytes one statement's result may send to this process. Over it the call **fails** (it is not truncated), the transaction rolls back and the connection closes. Counted on the socket, so it also bounds `... RETURNING`, `EXPLAIN`, `SHOW` and very wide rows. |
+| `POSTGRES_MAX_RESULT_BYTES` | `16777216` (16 MiB) | Most bytes one statement's result may send to this process. Over it the call **fails** (it is not truncated), the transaction rolls back and the connection closes. Counted on the socket, so it also bounds `... RETURNING`, `EXPLAIN`, `SHOW` and very wide rows. The count includes the cursor wrapper's own protocol traffic (`SAVEPOINT`/`DECLARE`/`FETCH`/`CLOSE`), a few KB past the row bytes, so size a very tight cap with that allowance. |
 | `POSTGRES_QUERY_DEADLINE_MS` | statement timeout + `5000` | Client-side limit on one SQL call. Backstop for a statement that outlives `statement_timeout`, such as a function catching `query_canceled`: the backend is terminated from a separate connection and the call fails. |
 | `POSTGRES_POOL_MAX` | `5` | Max pool connections. Set to `1` for single-threaded backends (pglite-socket, PgBouncer transaction mode). After every SQL call the connection runs `DISCARD ALL`, so prepared statements, advisory locks, temp tables and session settings do not carry over. Behind PgBouncer in transaction mode that can reach a different backend; set `server_reset_query = DISCARD ALL` and `server_reset_query_always = 1` there (reasoned from PgBouncer's documentation, not tested). |
 | `POSTGRES_SSL_REJECT_UNAUTHORIZED` | unset | Set to `false` (or `0`; case-insensitive) to skip TLS cert verification (for managed DBs using private-CA certs). Connection is still encrypted. |
@@ -385,7 +385,7 @@ PostgreSQL's own logging is the complete server-side record: `log_statement = 'a
 
 **`canceling statement due to statement timeout`** - A single query exceeded `POSTGRES_STATEMENT_TIMEOUT_MS` (default 30s). Increase it, narrow the query with `WHERE`, or add an index. This is working as designed -- the timeout exists so a runaway query cannot hang the agent.
 
-**`Blocked in read-only mode: ...`** - The statement or function is refused on read-only paths ([list](#per-tool-gating-in-the-host)). Rewrite it as a plain read; put settings on the role (`ALTER ROLE ... SET ...`) or in `DATABASE_URL`, since session state does not carry between calls.
+**`Blocked in read-only mode: ...`** - The statement or function is refused on read-only paths ([list](#per-tool-gating-in-the-host)). Rewrite it as a plain read; put settings on the role (`ALTER ROLE ... SET ...`) or in `DATABASE_URL`, since session state does not carry between calls. On `pg_index_advisor`, a blocked row read from `pg_stat_statements` is skipped with a `_warnings` entry and the call still succeeds -- you cannot rewrite a row the database recorded, so no action is needed.
 
 **`Result exceeded POSTGRES_MAX_RESULT_BYTES`** - Select fewer or narrower columns, add a `LIMIT`, or raise the variable.
 

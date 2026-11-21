@@ -23,15 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DATABASE_URL` role remains the boundary.
 - **`pg_index_advisor` runs the same read-only guard.** Its `EXPLAIN`s never rode the statement guard the query tools
   use, so a workload statement containing `set_config` or `dblink_exec` was planned anyway (planning runs
-  session-state and file functions). Every statement is checked once, up front, and the call is refused before a
-  connection is taken.
+  session-state and file functions). Caller-supplied statements are checked once, up front, and refused before a
+  connection is taken; rows read from `pg_stat_statements` are checked after loading, and a blocked row is dropped
+  with a warning instead of refusing the whole call.
 - **Results are bounded in bytes** by `POSTGRES_MAX_RESULT_BYTES` (default 16 MiB), counted on the socket so it covers
   wide rows and statements that cannot use the row-cap cursor.
 - **A client-side deadline** (`POSTGRES_QUERY_DEADLINE_MS`, default statement timeout + 5 s) terminates a backend that
   outlives `statement_timeout`.
 - **Session state no longer survives a call**: every user-SQL call ends with `DISCARD ALL` on its connection.
 - **Startup role check**: the server reports superuser, risky attributes and memberships, `SET ROLE` reach, table write
-  privileges and `dblink`/server-file function access on stderr, and the banner no longer says "read-only". It warns
+  privileges and `dblink_connect_u`/server-file function access on stderr, and the banner no longer says "read-only". It warns
   and keeps running.
 - The README and `pg_readonly` description no longer recommend auto-allowing without a least-privilege role, and add
   role setup guidance. The audit `sqlKeyword` skips comments and is documented as a label, not a classification.

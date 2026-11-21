@@ -38,6 +38,30 @@ describe("pg_explain EXPLAIN-prefix guard", () => {
   });
 });
 
+describe("pg_explain EXPLAIN-option-prefix guard", () => {
+  // `ANALYZE SELECT ...` after a bare EXPLAIN is EXPLAIN ANALYZE: without
+  // this refusal and the always-present option list, it would EXECUTE the
+  // statement while analyze: false. These are the unit-level twins of the
+  // security.integration.test.ts cases (which need a live database).
+  for (const sql of [
+    "ANALYZE SELECT 1",
+    "ANALYSE SELECT 1",
+    "VERBOSE SELECT 1",
+    // leadingKeyword skips comments, so a commented-out option is caught too.
+    "-- see the plan\nANALYZE SELECT 1",
+  ]) {
+    it(`refuses ${JSON.stringify(sql)} as an option prefix`, async () => {
+      const result = (await pgExplain.handler({
+        sql,
+        analyze: false,
+        format: "text",
+      })) as { ok: boolean; error?: string };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /is an EXPLAIN option and not part of the query/);
+    });
+  }
+});
+
 describe("pg_explain hypothetical_indexes identifier validation", () => {
   // Validation runs as a pre-flight before the handler touches the DB, so
   // these tests don't need a live postgres -- they ride on the fast unit path.

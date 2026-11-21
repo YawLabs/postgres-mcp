@@ -1320,14 +1320,18 @@ export const indexAdvisorTools = [
         }
       }
 
-      // Same check for this workload (caller-supplied statements were already
-      // refused up front), but a stale `SET`/`set_config` row that
-      // pg_stat_statements kept must not refuse the WHOLE call and make the
-      // tool unusable: a blocked row is dropped with a warning naming it and
-      // the rest of the workload proceeds. Refusing everything here would also
-      // punish the caller for a row they did not supply.
+      // The pg_stat_statements rows only: caller-supplied statements were
+      // already refused up front by the same guard, so re-checking them here
+      // would run it twice on the same text. What this pass does cover: a stale
+      // `SET`/`set_config` row that pg_stat_statements kept must not refuse the
+      // WHOLE call and make the tool unusable -- a blocked row is dropped with
+      // a warning naming it and the rest of the workload proceeds. Refusing
+      // everything here would also punish the caller for a row they did not
+      // supply.
+      const fromPgStat = providedStatements === undefined;
+      const statRows: WorkloadStatement[] = fromPgStat ? workload : [];
       const keptWorkload: WorkloadStatement[] = [];
-      for (const s of workload) {
+      for (const s of statRows) {
         const refusal = refuseBlocked([s.sql]);
         if (refusal) {
           warnings.push(
@@ -1338,15 +1342,20 @@ export const indexAdvisorTools = [
         }
         keptWorkload.push(s);
       }
-      if (keptWorkload.length === 0) {
-        return {
-          ok: false,
-          error:
-            "No statement in the pg_stat_statements workload passed the read-only guard, so there is " +
-            `nothing to analyze. Reasons: ${warnings.join(" | ")}`,
-        };
+      // Only reachable on the pg_stat_statements path: a provided workload that
+      // got here passed the up-front refusal, and this loop never touched it,
+      // so keptWorkload there holds nothing and the workload itself stands.
+      if (fromPgStat) {
+        if (keptWorkload.length === 0) {
+          return {
+            ok: false,
+            error:
+              "No statement in the pg_stat_statements workload passed the read-only guard, so there is " +
+              `nothing to analyze. Reasons: ${warnings.join(" | ")}`,
+          };
+        }
+        workload = keptWorkload;
       }
-      workload = keptWorkload;
 
       // Sequential-scan counts order the candidate list when the budget cannot
       // cover everything: the table postgres is reading end-to-end is where an

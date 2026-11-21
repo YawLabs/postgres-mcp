@@ -1325,20 +1325,26 @@ describe("pg_index_advisor input guards", () => {
   it("refuses a statement that would leave the read-only path, up front", async () => {
     // The advisor's EXPLAINs never rode api.ts's StatementGuard, so a
     // session-state function in a workload statement ran during planning.
-    // Checked before the HypoPG probe takes a connection.
-    const result = (await pgIndexAdvisor.handler({
-      statements: ["SELECT set_config('role', 'postgres', false)"],
-    })) as { ok: boolean; error?: string };
-    assert.equal(result.ok, false);
-    assert.match(result.error ?? "", /only plans read-only statements/);
-    assert.match(result.error ?? "", /set_config/);
+    // Checked before ANYTHING touches the server: the stub answers every query
+    // happily, so a refusal that still issued statements would pass the error
+    // assertions below -- the zero-statement check is what pins the ordering.
+    await withStubbedServer({}, async (session) => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT set_config('role', 'postgres', false)"],
+      })) as { ok: boolean; error?: string };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /only plans read-only statements/);
+      assert.match(result.error ?? "", /set_config/);
+      assert.equal(session.statements.length, 0, `refusal issued: ${JSON.stringify(session.texts())}`);
+    });
   });
 
   it("skips a blocked pg_stat_statements row with a warning instead of refusing the call", async () => {
     // A stale `SET`/`set_config` row in pg_stat_statements used to refuse the
     // WHOLE call, making the tool unusable on any real database. The caller
     // did not supply this row, so it is dropped with a warning naming it and
-    // the rest of the workload still runs.
+    // the rest of the workload still runs -- and dropped means dropped: not
+    // planned, not reported in `statements`, its weight out of the baseline.
     const topQueries = [
       { query: "SET statement_timeout = 0", calls: "500" },
       { query: "SELECT * FROM users WHERE status = 'active'", calls: "100" },
@@ -1347,12 +1353,26 @@ describe("pg_index_advisor input guards", () => {
       const result = (await pgIndexAdvisor.handler({})) as {
         ok: boolean;
         error?: string;
-        data?: { _warnings?: string[] };
+        data?: {
+          _warnings?: string[];
+          statements?: { sql: string; calls: string; baseline_cost: number | null; planned: boolean }[];
+          baseline_workload_cost?: number;
+        };
       };
       assert.equal(result.ok, true, `expected the call to proceed, got: ${result.error}`);
       const warning = result.data?._warnings?.find((w) => /only plans read-only statements/.test(w));
       assert.ok(warning, `no skip warning in ${JSON.stringify(result.data?._warnings)}`);
       assert.ok(warning.includes("SET statement_timeout"), `warning does not name the row: ${warning}`);
+
+      const reported = result.data?.statements ?? [];
+      assert.equal(reported.length, 1, `blocked row still in the workload: ${JSON.stringify(reported)}`);
+      assert.ok(
+        !reported.some((s) => s.sql.includes("SET statement_timeout")),
+        `planned statements include the blocked row: ${JSON.stringify(reported)}`,
+      );
+      // Stub baseline cost is 1000; only the 100-call row survives. Had the
+      // 500-call SET row been kept, its weight alone would add 500_000 here.
+      assert.equal(result.data?.baseline_workload_cost, 100_000);
     });
   });
 });

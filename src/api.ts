@@ -120,16 +120,24 @@ export function getPoolMax(): number {
 /** Raw values of the limits below already warned about, so a per-call read warns once. */
 const warnedLimitValues = new Set<string>();
 
+/** 2^31 - 1: the largest delay setTimeout fires at instead of coercing to 1 ms. */
+const MAX_LIMIT_VALUE = 2_147_483_647;
+
 /**
  * A positive integer from the environment. An unusable value keeps the default
  * and says so on stderr: these are safety limits, so a typo must neither remove
- * one nor pass unnoticed.
+ * one nor pass unnoticed. The upper bound matters for the deadline: setTimeout
+ * coerces a delay over 2^31-1 to 1 ms (after a TimeoutOverflowWarning), so a
+ * large POSTGRES_QUERY_DEADLINE_MS would kill every statement instantly
+ * instead of never firing.
  */
 function positiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
   const parsed = Number(raw);
-  if (raw.trim() !== "" && Number.isFinite(parsed) && parsed >= 1) return Math.floor(parsed);
+  if (raw.trim() !== "" && Number.isFinite(parsed) && parsed >= 1 && parsed <= MAX_LIMIT_VALUE) {
+    return Math.floor(parsed);
+  }
   const key = `${name}=${raw}`;
   if (!warnedLimitValues.has(key)) {
     warnedLimitValues.add(key);
@@ -990,8 +998,13 @@ class StatementAbortError extends GuardError {}
  * The pid comes from inside the transaction, so behind a pooler it names the
  * real backend; `client.processID` would be the pooler's. A role may always
  * terminate its own sessions.
+ *
+ * `stillWanted` is checked after the connect: by then the guarded statement
+ * may have settled, put the connection back in the pool and been borrowed by
+ * a concurrent call -- sending the terminate then would kill an innocent
+ * query. It returns false when the terminate was skipped for that reason.
  */
-async function terminateBackend(pid: number): Promise<boolean> {
+async function terminateBackend(pid: number, stillWanted: () => boolean = () => true): Promise<boolean> {
   const sql = "SELECT pg_terminate_backend($1) AS terminated";
   let client: pg.Client | undefined;
   try {
@@ -1004,6 +1017,7 @@ async function terminateBackend(pid: number): Promise<boolean> {
     client.on("error", () => {});
     const connected = client;
     await connected.connect();
+    if (!stillWanted()) return false;
     const res = await auditQuery(
       { source: "internal", sql, paramCount: 1 },
       () => connected.query<{ terminated: boolean }>(sql, [pid]),
@@ -1050,6 +1064,13 @@ class StatementGuard {
   private deadlineFired = false;
   private readonly timer: ReturnType<typeof setTimeout>;
   private dataListener: ((chunk: Buffer) => void) | undefined;
+  /**
+   * Resolves once the deadline path has finished reporting what happened to
+   * its backend. Always resolved for aborts that need no out-of-band report
+   * (byte limit, or no deadline fired), so awaiting it is a no-op there.
+   */
+  private outcomeDone: Promise<void> = Promise.resolve();
+  private finishOutcome: () => void = () => {};
 
   constructor(
     private readonly checkout: Checkout,
@@ -1059,6 +1080,11 @@ class StatementGuard {
       this.rejectAborted = reject;
     });
     this.aborted.catch(() => {});
+    // Deliberately NOT unref'd: an unref'd deadline never fires when nothing
+    // else holds the event loop, and the guard would then never abort. Holding
+    // the loop open past shutdown is not a risk in practice -- index.ts exits
+    // via process.exit right after shutdown() -- so a pending timer cannot keep
+    // the process alive.
     this.timer = setTimeout(() => void this.onDeadline(), deadlineMs);
   }
 
@@ -1096,28 +1122,59 @@ class StatementGuard {
   private async onDeadline(): Promise<void> {
     if (this.stopped || this.deadlineFired || this.abortError) return;
     this.deadlineFired = true;
-    const pid = this.backendPid;
-    const terminated = pid !== undefined && (await terminateBackend(pid));
-    const outcome = terminated
-      ? `backend ${pid} was terminated`
-      : pid === undefined
-        ? "its backend could not be identified and may keep running until the server stops it"
-        : `backend ${pid} could NOT be terminated and may keep running until the server stops it`;
-    this.abort(
-      new StatementAbortError(
-        `Query exceeded the ${this.deadlineMs} ms client-side deadline: ${outcome}, and the connection was closed. ` +
-          "Narrow the query, or raise POSTGRES_STATEMENT_TIMEOUT_MS and POSTGRES_QUERY_DEADLINE_MS in the MCP server env.",
-        DEADLINE_CODE,
-      ),
+    // Assigned before abort() below, so runGuarded's catch -- which can only
+    // observe abortError from this point on -- always awaits the real one.
+    this.outcomeDone = new Promise<void>((resolve) => {
+      this.finishOutcome = resolve;
+    });
+    // Close the socket BEFORE waiting on the out-of-band terminate: the
+    // destroy is what stops an oversized result from buffering here and the
+    // statement from working server-side, and the terminate round trip can
+    // take seconds. Only the reporting of the outcome waits for it, which is
+    // why the rejection is deferred to the end -- runGuarded's catch awaits
+    // outcomeDone first, so the message is final before anyone reads it.
+    // A local, not this.abortError: the top-of-function guard narrows the
+    // field to undefined for the rest of this method.
+    const deadlineError = new StatementAbortError(
+      `Query exceeded the ${this.deadlineMs} ms client-side deadline, and the connection was closed. ` +
+        "Narrow the query, or raise POSTGRES_STATEMENT_TIMEOUT_MS and POSTGRES_QUERY_DEADLINE_MS in the MCP server env.",
+      DEADLINE_CODE,
     );
+    this.abort(deadlineError, false);
+    const pid = this.backendPid;
+    try {
+      // Still-wanted check: `stopped` means runGuarded already finished and
+      // released the checkout, so this pid's backend is back in circulation
+      // and a terminate could land on an innocent query. Today the deferred
+      // rejection below keeps runGuarded blocked for exactly this round trip,
+      // so the check cannot fire -- it is the invariant that lets the order
+      // above (destroy first, report later) survive a future refactor.
+      const terminated = pid !== undefined && (await terminateBackend(pid, () => !this.stopped));
+      const outcome = terminated
+        ? `backend ${pid} was terminated`
+        : pid === undefined
+          ? "its backend could not be identified and may keep running until the server stops it"
+          : `backend ${pid} could NOT be terminated and may keep running until the server stops it`;
+      deadlineError.message =
+        `Query exceeded the ${this.deadlineMs} ms client-side deadline: ${outcome}, and the connection was closed. ` +
+        "Narrow the query, or raise POSTGRES_STATEMENT_TIMEOUT_MS and POSTGRES_QUERY_DEADLINE_MS in the MCP server env.";
+    } finally {
+      if (!this.stopped) this.rejectAborted(deadlineError);
+      this.finishOutcome();
+    }
   }
 
-  private abort(err: StatementAbortError): void {
+  private abort(err: StatementAbortError, reject = true): void {
     if (this.stopped || this.abortError) return;
     this.abortError = err;
     this.checkout.expectClose("stopped a statement over its limit");
     this.socket()?.destroy();
-    this.rejectAborted(err);
+    if (reject) this.rejectAborted(err);
+  }
+
+  /** Wait for a deadline's out-of-band report before its error is handed on. */
+  async outcomeReported(): Promise<void> {
+    await this.outcomeDone;
   }
 
   stop(): void {
@@ -1141,6 +1198,11 @@ async function runGuarded<T>(checkout: Checkout, body: (guard: StatementGuard) =
   try {
     return await Promise.race([work, guard.aborted]);
   } catch (err) {
+    // The socket error the abort itself causes usually settles `work` first,
+    // so branch on the abort, not on which promise won. A deadline defers its
+    // rejection until the out-of-band terminate has reported (onDeadline);
+    // only then is the message final. No abort: the caller's own error.
+    if (guard.abortError !== undefined) await guard.outcomeReported();
     throw guard.abortError ?? err;
   } finally {
     guard.stop();

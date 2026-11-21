@@ -336,6 +336,40 @@ describe("user SQL limits (fake client)", () => {
       assert.deepEqual(calls, []);
       assert.equal(client.socket.destroyed, false);
     });
+
+    it("closes the socket without waiting on the terminate, but holds the checkout until it finishes", async () => {
+      process.env.POSTGRES_QUERY_DEADLINE_MS = "20";
+      let openTerminateConnect: (() => void) | undefined;
+      const calls = stubTerminator({
+        connect: () =>
+          new Promise<void>((resolve) => {
+            openTerminateConnect = resolve;
+          }),
+      });
+      const client = stuck();
+      use(client);
+      let settled = false;
+      const res = runReadOnly("SELECT stubborn()").then((r) => {
+        settled = true;
+        return r;
+      });
+      // The deadline fires ~20 ms in; the out-of-band terminate's connect then
+      // hangs. The abort must not wait on it...
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(client.socket.destroyed, true, "the socket is closed without waiting for the terminate");
+      // ...but nothing may be released while that terminate is in flight:
+      // a released backend is back in the pool, and pg_terminate_backend then
+      // lands on whatever concurrent call borrowed it.
+      assert.equal(settled, false, "the caller waits for the outcome report before finishing");
+      assert.deepEqual(client.releases, [], "the checkout must stay held until the terminate round trip ends");
+      assert.deepEqual(calls, [], "no terminate has been sent while its connect is pending");
+      openTerminateConnect?.();
+      const done = await res;
+      assert.match(done.error ?? "", /20 ms client-side deadline/);
+      assert.match(done.error ?? "", /backend 4242 was terminated/);
+      assert.deepEqual(calls, [{ sql: "SELECT pg_terminate_backend($1) AS terminated", params: [BACKEND_PID] }]);
+      assert.equal(client.releases.length, 1, "released exactly once, after the outcome was reported");
+    });
   });
 
   describe("limit configuration", () => {
@@ -355,11 +389,25 @@ describe("user SQL limits (fake client)", () => {
       console.error = (msg?: unknown) => {
         logged.push(String(msg));
       };
-      for (const bad of ["lots", "0", "-1", ""]) {
+      for (const bad of ["lots", "0", "-1", "", "1e10"]) {
         process.env.POSTGRES_MAX_RESULT_BYTES = bad;
         assert.equal(getMaxResultBytes(), DEFAULT_MAX_RESULT_BYTES, JSON.stringify(bad));
       }
       assert.ok(logged.some((l) => /POSTGRES_MAX_RESULT_BYTES="lots" is not a positive integer/.test(l)));
+      assert.ok(
+        logged.some((l) => /POSTGRES_MAX_RESULT_BYTES="1e10" is not a positive integer/.test(l)),
+        "over 2^31-1 must warn: setTimeout would coerce such a deadline to 1 ms",
+      );
+    });
+
+    it("falls back when the deadline would overflow setTimeout", () => {
+      const logged: string[] = [];
+      console.error = (msg?: unknown) => {
+        logged.push(String(msg));
+      };
+      process.env.POSTGRES_QUERY_DEADLINE_MS = "9999999999";
+      assert.equal(getQueryDeadlineMs(), 35_000);
+      assert.ok(logged.some((l) => /POSTGRES_QUERY_DEADLINE_MS="9999999999" is not a positive integer/.test(l)));
     });
   });
 });
