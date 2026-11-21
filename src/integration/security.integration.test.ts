@@ -86,8 +86,10 @@ describe("integration: security limits", { skip: !integrationEnabled() }, () => 
       assert.equal(res.ok, false, sql);
       assert.ok(Date.now() - started < 2_000, "the statement ran");
     }
-    // The second layer on its own: postgres refuses these after an option list.
-    const direct = await runReadOnly("EXPLAIN (ANALYZE FALSE) ANALYZE SELECT 1");
+    // The second layer on its own: postgres refuses ANALYZE after ANY option
+    // list, which is the property the tool relies on (it now always sends
+    // `EXPLAIN (COSTS ON) ...` as the filler).
+    const direct = await runReadOnly("EXPLAIN (COSTS ON) ANALYZE SELECT 1");
     assert.equal(direct.ok, false);
     assert.match(direct.error ?? "", /42601/);
   });

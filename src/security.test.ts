@@ -157,7 +157,29 @@ describe("user SQL limits (fake client)", () => {
       use(client);
       const res = (await pgExplain.handler({ sql: "SELECT 1" })) as { ok: boolean };
       assert.equal(res.ok, true);
-      assert.ok(client.statements.some((s) => s.endsWith("EXPLAIN (ANALYZE FALSE) SELECT 1")));
+      assert.ok(client.statements.some((s) => s.endsWith("EXPLAIN (COSTS ON) SELECT 1")));
+    });
+
+    it("the filler option is COSTS ON, never an analyze key (hypopg bails on any analyze option)", async () => {
+      // The security fix needs SOME option list so caller text cannot read as
+      // an EXPLAIN option. The first choice, `(ANALYZE FALSE)`, silently broke
+      // hypothetical_indexes: hypopg's hypo_is_simple_explain() returns false
+      // on ANY `analyze` key regardless of value, so it never injected the
+      // index and the plan never flipped. This pins the fix: the filler must
+      // carry no analyze key. COSTS ON is hypopg-safe (measured: it injects)
+      // and still 42601 after a would-be execution attempt (measured).
+      const client = makeClient((sql) =>
+        sql.startsWith("FETCH") ? { rows: [{ "QUERY PLAN": "Result" }], fields: [], rowCount: 1 } : undefined,
+      );
+      use(client);
+      await pgExplain.handler({ sql: "SELECT 1" });
+      // The statement may ride inside the row-cap cursor's DECLARE wrapper, so
+      // find the EXPLAIN anywhere in the sent text and read its option list.
+      const sent = client.statements.find((s) => s.includes("EXPLAIN ("));
+      assert.ok(sent, `no EXPLAIN sent: ${JSON.stringify(client.statements)}`);
+      const optionList = /EXPLAIN \(([^)]*)\)/.exec(sent)?.[1];
+      assert.equal(optionList, "COSTS ON", `filler must be EXPLAIN (COSTS ON), got: ${sent}`);
+      assert.doesNotMatch(optionList ?? "", /ANALYZE/i, `option list must carry no analyze key: ${sent}`);
     });
   });
 

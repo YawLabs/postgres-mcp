@@ -511,7 +511,20 @@ export const explainTools = [
       // Never a bare `EXPLAIN <sql>`: there the grammar accepts ANALYZE as the
       // next word, so caller text could switch execution on. After an option
       // list only a statement can follow.
-      if (flags.length === 0) flags.push("ANALYZE FALSE");
+      //
+      // The filler must NOT be `ANALYZE FALSE`, even though it reads clearer:
+      // hypopg's hypo_is_simple_explain() walks the option list and bails on
+      // ANY `analyze` key regardless of value, so `(ANALYZE FALSE)` made it
+      // skip index injection entirely and hypothetical_indexes silently
+      // stopped flipping plans (measured on 15/17/18: bare EXPLAIN and
+      // `(COSTS ON)` inject, `(ANALYZE FALSE)` does not; upstream hypopg.c,
+      // the `strcmp(opt->defname, "analyze")` check). COSTS ON is the default
+      // value of an option hypopg does not inspect, so it satisfies the
+      // grammar (still 42601 for `EXPLAIN (COSTS ON) ANALYZE SELECT 1`,
+      // measured) with no plan effect. Note it only lands when no other flag
+      // is present: `costs: false` emits COSTS OFF first, and hypopg skips
+      // COSTS OFF plans upstream (pre-existing, unrelated to this filler).
+      if (flags.length === 0) flags.push("COSTS ON");
       const explainSql = `EXPLAIN (${flags.join(", ")}) ${sql}`;
 
       const hooks: RunHooks = hypoIndexes.length > 0 ? buildHypopgHooks(hypoIndexes) : {};

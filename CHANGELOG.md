@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **`pg_explain` no longer executes a statement when `analyze` is false.** `sql: "ANALYZE SELECT ..."` became
   `EXPLAIN ANALYZE SELECT ...` and ran. Such input is refused, and the statement is always sent after an option list
-  (`EXPLAIN (ANALYZE FALSE) ...`), where the grammar accepts only a statement.
+  (`EXPLAIN (COSTS ON) ...`), where the grammar accepts only a statement.
 - **Note:** `pg_explain` with `analyze: true` and `ALLOW_WRITES=1` runs the statement without the read-only keyword
   guard, inside an always-rolled-back transaction (intentional; the writes do not persist).
 - **Read-only paths refuse statements that step around `BEGIN READ ONLY`**, by leading keyword after skipping
@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** session state set by one call, including `SET` or temp tables committed with `ALLOW_WRITES=1`, is gone by
   the next call, even with `POSTGRES_POOL_MAX=1`.
 - **Breaking:** the startup banner text changed, audit `sql` for a plain `pg_explain` now reads
-  `EXPLAIN (ANALYZE FALSE) ...`, and redacted `sqlKeyword` reports the first word after a leading comment instead of
+  `EXPLAIN (COSTS ON) ...`, and redacted `sqlKeyword` reports the first word after a leading comment instead of
   `UNKNOWN`.
 - The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs`
   (`npm run check:yaw-mcp-floor`) fails on drift between `YAW_MCP_MIN` 1.1.13 and
