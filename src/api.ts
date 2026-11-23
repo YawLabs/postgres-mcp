@@ -56,17 +56,14 @@
  */
 
 import pg from "pg";
-import { auditQuery, initAudit } from "./audit.js";
+import { auditQuery } from "./audit.js";
 import { assertReadOnlyStatement, GuardError } from "./sql-guard.js";
 
-// Open the audit sink at module load rather than lazily on the first query: a
-// POSTGRES_AUDIT_LOG_FILE that cannot be opened has to kill the process at
-// startup, while the operator is still watching, instead of surfacing as one
-// failed tool call much later -- or never, if no query is ever run. index.ts
-// imports this module before the transport connects, so module load is
-// startup. The call is idempotent, so tool modules importing api.ts do not
-// re-open the sink.
-initAudit();
+// The audit sink is NOT opened here. index.ts calls initAudit() on its
+// server-start path, after the `version` / usage subcommands have exited:
+// opening it at this module's load made `postgres-mcp version` validate the
+// audit env and create the audit file, so a bad audit variable broke a command
+// that serves nothing. Until initAudit() runs, auditQuery is a pass-through.
 
 // pg 8.14+ supports `queryMode: 'extended'` on QueryConfig to force the
 // extended query protocol even when `values` is empty. @types/pg has not yet
@@ -89,36 +86,49 @@ function getDatabaseUrl(): string {
   return url;
 }
 
-export function getStatementTimeoutMs(): number {
-  const raw = process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
-  if (!raw) return 30_000;
+/** Raw values of the limits below already warned about, so a per-call read warns once. */
+const warnedLimitValues = new Set<string>();
+
+/** One stderr line per distinct `name=raw`: a limit that is re-read per call must not flood. */
+function warnLimitOnce(name: string, raw: string, problem: string, fallback: number): void {
+  const key = `${name}=${raw}`;
+  if (warnedLimitValues.has(key)) return;
+  warnedLimitValues.add(key);
+  console.error(`[postgres-mcp] ${name}=${JSON.stringify(raw)} ${problem}; using the default of ${fallback}.`);
+}
+
+/**
+ * A positive number from the environment, unfloored, with no upper bound: the
+ * older settings' accepted values, kept as they were (a fractional timeout is
+ * valid, and a fractional count is floored by its caller). Any set value
+ * outside that -- empty, `30s`, `10k`, 0, a negative -- keeps the default as
+ * before, and now says so on stderr like positiveIntEnv. 0 in particular does
+ * NOT mean "no timeout" here, as it would to PostgreSQL; it means the default.
+ */
+function positiveNumberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+  if (raw.trim() !== "" && Number.isFinite(parsed) && parsed > 0) return parsed;
+  warnLimitOnce(name, raw, "is not a positive number", fallback);
+  return fallback;
+}
+
+export function getStatementTimeoutMs(): number {
+  return positiveNumberEnv("POSTGRES_STATEMENT_TIMEOUT_MS", 30_000);
 }
 
 export function getConnectionTimeoutMs(): number {
-  const raw = process.env.POSTGRES_CONNECTION_TIMEOUT_MS;
-  if (!raw) return 10_000;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+  return positiveNumberEnv("POSTGRES_CONNECTION_TIMEOUT_MS", 10_000);
 }
 
 export function getMaxRows(): number {
-  const raw = process.env.POSTGRES_MAX_ROWS;
-  if (!raw) return 1000;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1000;
+  return Math.floor(positiveNumberEnv("POSTGRES_MAX_ROWS", 1000));
 }
 
 export function getPoolMax(): number {
-  const raw = process.env.POSTGRES_POOL_MAX;
-  if (!raw) return 5;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 5;
+  return Math.floor(positiveNumberEnv("POSTGRES_POOL_MAX", 5));
 }
-
-/** Raw values of the limits below already warned about, so a per-call read warns once. */
-const warnedLimitValues = new Set<string>();
 
 /** 2^31 - 1: the largest delay setTimeout fires at instead of coercing to 1 ms. */
 const MAX_LIMIT_VALUE = 2_147_483_647;
@@ -138,13 +148,7 @@ function positiveIntEnv(name: string, fallback: number): number {
   if (raw.trim() !== "" && Number.isFinite(parsed) && parsed >= 1 && parsed <= MAX_LIMIT_VALUE) {
     return Math.floor(parsed);
   }
-  const key = `${name}=${raw}`;
-  if (!warnedLimitValues.has(key)) {
-    warnedLimitValues.add(key);
-    console.error(
-      `[postgres-mcp] ${name}=${JSON.stringify(raw)} is not a positive integer; using the default of ${fallback}.`,
-    );
-  }
+  warnLimitOnce(name, raw, `is not a positive integer up to ${MAX_LIMIT_VALUE}`, fallback);
   return fallback;
 }
 
@@ -159,9 +163,14 @@ export function getMaxResultBytes(): number {
  * Client-side limit on one user-SQL call. It sits past the statement timeout so
  * the server's own, gentler timeout normally fires first; this one is for a
  * statement that outlives it, such as a function catching `query_canceled`.
+ *
+ * The derived default is clamped like the env value: the statement timeout has
+ * no upper bound of its own, and one within 5 s of 2^31-1 (PostgreSQL's own
+ * maximum is a natural "unlimited") would otherwise hand setTimeout a delay it
+ * coerces to 1 ms.
  */
 export function getQueryDeadlineMs(): number {
-  return positiveIntEnv("POSTGRES_QUERY_DEADLINE_MS", getStatementTimeoutMs() + 5_000);
+  return positiveIntEnv("POSTGRES_QUERY_DEADLINE_MS", Math.min(getStatementTimeoutMs() + 5_000, MAX_LIMIT_VALUE));
 }
 
 /** Raw ALLOW_WRITES values already warned about, so a per-request read warns once. */
@@ -460,6 +469,12 @@ export interface QueryResult {
    */
   command?: string;
   truncated?: boolean;
+  /**
+   * Present only when two or more result columns share a name. `rows` are
+   * objects keyed by column name, so each row then holds only the LAST such
+   * column while `fields` still lists them all; see {@link toQueryResult}.
+   */
+  _warnings?: string[];
 }
 
 // pg_type oid -> typname. Bootstrapped on first user query, then miss-filled
@@ -528,16 +543,50 @@ export interface ApiResponse<T = unknown> {
   error?: string;
 }
 
+/**
+ * The text of a thrown value. `err.message` alone is not it: Node rejects a
+ * connect to a name with several addresses (`localhost` on a dual-stack host)
+ * with an AggregateError whose own message is EMPTY and whose per-address
+ * failures sit in `errors`, and node-pg hands that through unchanged -- so a
+ * refused connection read as "Error: " with nothing after it.
+ */
+export function errorMessage(err: unknown): string {
+  const text = ownOrNestedMessage(err);
+  if (text !== "" || !(err instanceof Error)) return text;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === "string" && code !== "" ? code : err.name;
+}
+
+/** An error's message, else its nested errors' distinct messages; "" when none says anything. */
+function ownOrNestedMessage(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  if (err.message !== "") return err.message;
+  const nested = (err as { errors?: unknown }).errors;
+  if (!Array.isArray(nested)) return "";
+  return [...new Set(nested.map(ownOrNestedMessage).filter((m) => m !== ""))].join("; ");
+}
+
 export function formatPgError(err: unknown): string {
   if (!(err instanceof Error)) return String(err);
   // This server's own refusals are already complete sentences.
   if (err instanceof GuardError) return err.message;
 
   const errObj = err as Error & { code?: string; detail?: string; hint?: string };
-  const parts: string[] = [err.message];
+  const parts: string[] = [errorMessage(err)];
   if (errObj.code) parts.push(`(code: ${errObj.code})`);
   if (errObj.detail) parts.push(`detail: ${errObj.detail}`);
   if (errObj.hint) parts.push(`hint: ${errObj.hint}`);
+
+  // SQLSTATE 25001: the statement refuses to run inside a transaction block
+  // (VACUUM, CREATE INDEX CONCURRENTLY, CREATE DATABASE, ALTER SYSTEM, ...).
+  // Every user-SQL runner here opens one, ALLOW_WRITES or not, so no retry
+  // through this server can succeed; say so instead of leaving the raw error.
+  if (errObj.code === "25001") {
+    parts.push(
+      "-- this server runs every statement inside a transaction block, with or without ALLOW_WRITES, " +
+        "so it cannot run this one. Run it outside this server (psql, a migration tool).",
+    );
+  }
 
   // Read-only enforcement: postgres returns SQLSTATE 25006 for writes inside
   // a READ ONLY transaction. Rewrite that to something the LLM can act on.
@@ -722,7 +771,7 @@ export async function safeResolveTypeNames(
   try {
     return await resolveTypeNames(client, [...new Set(fields.map((f) => f.dataTypeID))]);
   } catch (err) {
-    console.error(`[postgres-mcp] type-name resolution failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`[postgres-mcp] type-name resolution failed: ${errorMessage(err)}`);
     return {};
   }
 }
@@ -731,7 +780,15 @@ export async function safeResolveTypeNames(
 // FETCH tag / rewrite rowCount" the silent fallback for any future call site
 // that forgets to pass it, which is exactly the bug this parameter exists to
 // prevent.
-function toQueryResult(
+//
+// Columns sharing a name (`SELECT a.id, b.id ...`, two unaliased `count(*)`)
+// get a `_warnings` entry: node-pg builds each row as an object keyed by column
+// name, so the later column has already overwritten the earlier one by the time
+// the rows reach this function, and `fields` listing both is the only trace.
+// The values are gone, so the honest answer is to say so and how to get them.
+//
+// Exported only for unit-test access, like safeResolveTypeNames.
+export function toQueryResult(
   result: pg.QueryResult,
   maxRows: number,
   typeNames: Record<number, string>,
@@ -739,6 +796,9 @@ function toQueryResult(
 ): QueryResult {
   const truncated = result.rows.length > maxRows;
   const rows = truncated ? result.rows.slice(0, maxRows) : result.rows;
+  const seen = new Set<string>();
+  const repeated = new Set<string>();
+  for (const f of result.fields) (seen.has(f.name) ? repeated : seen).add(f.name);
   return {
     rows,
     // Cursor path only: we deliberately FETCH maxRows + 1 to detect
@@ -762,20 +822,18 @@ function toQueryResult(
     // there describes the FETCH, not the user's statement.
     ...(viaCursor ? {} : { command: result.command }),
     ...(truncated ? { truncated: true } : {}),
+    ...(repeated.size > 0
+      ? {
+          _warnings: [
+            `Result columns share a name (${[...repeated].map((n) => JSON.stringify(n)).join(", ")}), so each row ` +
+              "holds only the LAST column of that name; the earlier ones are missing from `rows` although " +
+              "`fields` lists them. Give each column a distinct alias (AS ...) and re-run to get every value.",
+          ],
+        }
+      : {}),
   };
 }
 
-/**
- * Run user-provided SQL in a READ ONLY transaction. Always rolls back.
- *
- * The user SQL is sent with `queryMode: 'extended'` so pg uses the extended
- * query protocol unconditionally (even when `params` is an empty array).
- * The extended protocol limits a request to a single statement, which blocks
- * the stacked-query injection pattern that defeated the archived reference
- * server -- payloads like `COMMIT; DROP SCHEMA x CASCADE;` would otherwise
- * end the READ ONLY transaction mid-stream and run DDL in autocommit.
- * See: https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/
- */
 /**
  * Optional in-transaction hooks. `setup` runs after BEGIN, before user SQL.
  * `teardown` runs in `finally` (always executed) so it can clean up
@@ -1386,6 +1444,17 @@ async function runUserSqlInTransaction(
   }
 }
 
+/**
+ * Run user-provided SQL in a READ ONLY transaction. Always rolls back.
+ *
+ * The user SQL is sent with `queryMode: 'extended'` so pg uses the extended
+ * query protocol unconditionally (even when `params` is an empty array).
+ * The extended protocol limits a request to a single statement, which blocks
+ * the stacked-query injection pattern that defeated the archived reference
+ * server -- payloads like `COMMIT; DROP SCHEMA x CASCADE;` would otherwise
+ * end the READ ONLY transaction mid-stream and run DDL in autocommit.
+ * See: https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/
+ */
 export async function runReadOnly(
   sql: string,
   params: unknown[] = [],
@@ -1394,7 +1463,18 @@ export async function runReadOnly(
   return runUserSqlInTransaction("BEGIN READ ONLY", sql, params, hooks, true);
 }
 
-/** Run user-provided SQL in a read-write transaction. Requires ALLOW_WRITES=1. */
+/**
+ * Run user-provided SQL in a read-write transaction. Requires ALLOW_WRITES=1.
+ *
+ * There is no autocommit path: the statement always runs after `BEGIN` and a
+ * savepoint, so one that refuses a transaction block (VACUUM, CREATE INDEX
+ * CONCURRENTLY, CREATE DATABASE, ALTER SYSTEM) fails with 25001 here too.
+ * formatPgError says so.
+ *
+ * The COMMIT is inside the audited span: it is what decides whether the write
+ * happened, and a failure there (a deferred constraint's 23503, a 40001) has
+ * to be the statement's `ok: false` line, not follow an `ok: true` one.
+ */
 export async function runReadWrite(sql: string, params: unknown[] = []): Promise<ApiResponse<QueryResult>> {
   if (!isWritesAllowed()) {
     return {
@@ -1413,15 +1493,15 @@ export async function runReadWrite(sql: string, params: unknown[] = []): Promise
     const { client, result, viaCursor } = await auditUserStatement(sql, params, async () => {
       checkout = await acquireClient();
       const { client } = checkout;
-      return runGuarded(checkout, async (guard) => {
+      const bounded = await runGuarded(checkout, async (guard) => {
         await client.query("BEGIN");
         await guard.identifyBackend();
         guard.limitResultBytes(maxBytes);
-        const bounded = await runUserQueryBounded(client, sql, params, maxRows);
-        return { client, ...bounded };
+        return runUserQueryBounded(client, sql, params, maxRows);
       });
+      await client.query("COMMIT");
+      return { client, ...bounded };
     });
-    await client.query("COMMIT");
     const typeNames = await safeResolveTypeNames(client, result.fields);
     return { ok: true, data: toQueryResult(result, maxRows, typeNames, viaCursor) };
   } catch (err) {
@@ -1491,38 +1571,6 @@ export async function runInternal<T extends pg.QueryResultRow = pg.QueryResultRo
 }
 
 /**
- * Run multiple internal queries on a single shared connection. Use this in
- * place of `Promise.all([runInternal(...), runInternal(...), ...])` whenever
- * a handler issues 3+ catalog queries -- otherwise one tool call's fan-out
- * can saturate the pool (default max 5) and starve concurrent calls. The
- * client is shared, so queries inside the callback serialize naturally even
- * when called via `Promise.all`.
- *
- * Behavior note: connect failures (pool exhausted, bad DATABASE_URL) propagate
- * as exceptions out of the runner and out of this helper, whereas
- * `runInternal` and the user-SQL runners catch the same failures and return
- * `{ok: false}`. The MCP wrapper in index.ts handles both shapes, but don't
- * assume drop-in equivalence between the two. The exception is what keeps a
- * caller's per-statement `{ok: false}` handling -- pg_health's independent
- * checks, "never an early return" -- from reporting an outage as a degraded
- * answer.
- *
- * Audit note (#42): the connection is checked out by the FIRST statement the
- * callback runs, inside that statement's audited step, not on entry. A pool
- * that refuses it then leaves that statement's `ok: false` line, as
- * runInternal leaves one for the statement it was about to run. Checked out
- * on entry, a refused connection wrote nothing, for the seven tools whose
- * first database access is this helper -- or whose first is the version
- * probe, which the cache skips once it has answered, so an outage that began
- * mid-session left no trace of pg_describe_table, pg_health, pg_advisor,
- * pg_replication_status, pg_seq_scan_tables, pg_unused_indexes or
- * pg_io_stats being called. One refused connection is one line: statements
- * waiting on the same checkout (a `Promise.all` fan-out), or issued after it
- * failed, fail with the same error and write nothing. The callback itself
- * now starts before a connection exists; every caller composes SQL there
- * and nothing else.
- */
-/**
  * Per-call options for {@link withSharedClient}'s runner.
  *
  * `extended` forces the EXTENDED query protocol even when `params` is empty.
@@ -1577,6 +1625,38 @@ export interface SharedClientControls {
  */
 export type SharedRunnerResult<R> = ApiResponse<R[]> & { serverError?: boolean; code?: string };
 
+/**
+ * Run multiple internal queries on a single shared connection. Use this in
+ * place of `Promise.all([runInternal(...), runInternal(...), ...])` whenever
+ * a handler issues 3+ catalog queries -- otherwise one tool call's fan-out
+ * can saturate the pool (default max 5) and starve concurrent calls. The
+ * client is shared, so queries inside the callback serialize naturally even
+ * when called via `Promise.all`.
+ *
+ * Behavior note: connect failures (pool exhausted, bad DATABASE_URL) propagate
+ * as exceptions out of the runner and out of this helper, whereas
+ * `runInternal` and the user-SQL runners catch the same failures and return
+ * `{ok: false}`. The MCP wrapper (mcp-wrapper.ts) handles both shapes, but don't
+ * assume drop-in equivalence between the two. The exception is what keeps a
+ * caller's per-statement `{ok: false}` handling -- pg_health's independent
+ * checks, "never an early return" -- from reporting an outage as a degraded
+ * answer.
+ *
+ * Audit note (#42): the connection is checked out by the FIRST statement the
+ * callback runs, inside that statement's audited step, not on entry. A pool
+ * that refuses it then leaves that statement's `ok: false` line, as
+ * runInternal leaves one for the statement it was about to run. Checked out
+ * on entry, a refused connection wrote nothing, for the seven tools whose
+ * first database access is this helper -- or whose first is the version
+ * probe, which the cache skips once it has answered, so an outage that began
+ * mid-session left no trace of pg_describe_table, pg_health, pg_advisor,
+ * pg_replication_status, pg_seq_scan_tables, pg_unused_indexes or
+ * pg_io_stats being called. One refused connection is one line: statements
+ * waiting on the same checkout (a `Promise.all` fan-out), or issued after it
+ * failed, fail with the same error and write nothing. The callback itself
+ * now starts before a connection exists; every caller composes SQL there
+ * and nothing else.
+ */
 export async function withSharedClient<T>(
   fn: (
     runOnClient: <R extends pg.QueryResultRow = pg.QueryResultRow>(

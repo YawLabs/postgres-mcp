@@ -4,6 +4,7 @@ import { writeSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { isWritesAllowed, shutdown } from "./api.js";
+import { initAudit } from "./audit.js";
 import { wrapToolHandler } from "./mcp-wrapper.js";
 import { runRolePreflight } from "./preflight.js";
 import { adminTools } from "./tools/admin.js";
@@ -59,6 +60,19 @@ if (subcommand === "version" || subcommand === "--version") {
   process.exit(0);
 }
 
+const USAGE =
+  `Usage:\n` +
+  `  postgres-mcp            start the MCP server on stdio\n` +
+  `  postgres-mcp version    print the version and exit\n`;
+
+// The flag a human tries first. It used to fall through with the other dash
+// flags and start the server, which then sat waiting on stdin. writeSync for
+// the reason given below; fd 1 is free here because nothing is served.
+if (subcommand === "--help" || subcommand === "-h") {
+  writeSync(1, USAGE);
+  process.exit(0);
+}
+
 // Reject an unrecognized bare subcommand instead of silently falling through
 // to the stdio server. `postgres-mcp doctor` used to print nothing and hang
 // looking like a crash, because the server was sitting there waiting for MCP
@@ -74,10 +88,7 @@ if (subcommand !== undefined && !subcommand.startsWith("-")) {
     ? `postgres-mcp: connection strings are not accepted as an argument.\n` +
       `Set DATABASE_URL in the MCP server env instead:\n` +
       `  "env": { "DATABASE_URL": "postgres://..." }\n`
-    : `postgres-mcp: unknown subcommand '${subcommand}'\n` +
-      `Usage:\n` +
-      `  postgres-mcp            start the MCP server on stdio\n` +
-      `  postgres-mcp version    print the version and exit\n`;
+    : `postgres-mcp: unknown subcommand '${subcommand}'\n${USAGE}`;
   // writeSync, not process.stderr.write: stderr is ASYNCHRONOUS for TTYs and
   // pipes on Windows, and process.exit() truncates pending async writes -- so
   // the usage text could be cut off exactly where a human reads it. Setting
@@ -87,7 +98,38 @@ if (subcommand !== undefined && !subcommand.startsWith("-")) {
   process.exit(1);
 }
 
+// POSTGRES_MCP_SANDBOX is applied by the launcher (bin/postgres-mcp.mjs), which
+// spawns a fresh oam under --permission. This file started any other way --
+// `node dist/index.js`, `npm start`, the `oam compile` binary -- has no
+// launcher in front of it, and used to serve unsandboxed without a word for an
+// operator who had asked for the sandbox. So seeing the variable here, set to
+// anything but an explicit off, means no sandbox was applied: the launcher
+// never serves in-process or hands off to Node while it is on, and the
+// sandboxed child cannot see it (the launcher drops it, and it is not in the
+// --allow-env list, so oam strips it too). The vocabulary is the launcher's
+// parseSandboxSetting: trimmed, case-insensitive, only an ABSENT variable is
+// unset, and an unrecognized or empty value stops the server rather than
+// reading as off.
+const sandboxRaw = process.env.POSTGRES_MCP_SANDBOX;
+if (sandboxRaw !== undefined && !["0", "false", "off"].includes(sandboxRaw.trim().toLowerCase())) {
+  writeSync(
+    2,
+    `postgres-mcp: POSTGRES_MCP_SANDBOX=${JSON.stringify(sandboxRaw)} is set, but the server was started without its launcher, which is what applies the sandbox; refusing to start without the sandbox.\n` +
+      `Start it through the package's bin (npx @yawlabs/postgres-mcp, or node bin/postgres-mcp.mjs) to run sandboxed, or unset POSTGRES_MCP_SANDBOX (or set it to 0) to run without the sandbox.\n`,
+  );
+  process.exit(1);
+}
+
 // ─── No subcommand - start the MCP server ───
+
+// Open the audit sink here, before anything is served, rather than lazily on
+// the first query: a bad POSTGRES_AUDIT_* value or a POSTGRES_AUDIT_LOG_FILE
+// that cannot be opened has to kill the process at startup, while the operator
+// is still watching, instead of surfacing as one failed tool call much later --
+// or never, if no query is ever run. It throws, so the process exits non-zero
+// before serveStdio below. Not at api.ts's module load: that ran it for
+// `version` and the usage error too, which serve nothing.
+initAudit();
 
 const allTools = [
   ...queryTools,

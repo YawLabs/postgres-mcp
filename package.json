@@ -46,11 +46,10 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc && node build.mjs",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc && node build.mjs",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "test": "npm run build && node scripts/run-tests.mjs dist",
-    "test:ci": "npm run test",
     "test:integration": "npm run build && node scripts/run-tests.mjs dist --integration",
     "lint": "node scripts/lint.mjs check src/",
     "lint:fix": "node scripts/lint.mjs check --write src/",

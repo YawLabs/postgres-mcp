@@ -78,8 +78,10 @@ const BLOCKED_KEYWORDS: ReadonlySet<string> = new Set([
 /**
  * Functions whose effect lands outside the transaction, or that run SQL from a
  * string where neither check here can see it. Matched only as a call, so a
- * column or table with one of these names still works. `dblink*` is handled
- * separately because the family is open-ended.
+ * column or table with one of these names still works -- unless it is written
+ * after a dot, because `(arg).fn` is a call too (see findBlockedFunction).
+ * `dblink*` and `pg_stat_reset*` are handled separately because those families
+ * are open-ended.
  */
 const BLOCKED_FUNCTIONS: ReadonlySet<string> = new Set([
   // Changes role or timeouts without the SET keyword.
@@ -100,16 +102,39 @@ const BLOCKED_FUNCTIONS: ReadonlySet<string> = new Set([
   "pg_create_restore_point",
   "pg_logical_emit_message",
   "pg_switch_wal",
+  // Other effects a rollback does not undo: promotion, discarded statistics,
+  // and replication slots created, dropped, advanced or consumed.
+  "pg_copy_logical_replication_slot",
+  "pg_copy_physical_replication_slot",
+  "pg_create_logical_replication_slot",
+  "pg_create_physical_replication_slot",
+  "pg_drop_replication_slot",
+  "pg_logical_slot_get_binary_changes",
+  "pg_logical_slot_get_changes",
+  "pg_promote",
+  "pg_replication_slot_advance",
+  "pg_stat_statements_reset",
+  "pg_sync_replication_slots",
   // Execute SQL passed as text, which would hide any of the above in a string.
+  // connectby and crosstab* (tablefunc) and xpath_table (xml2) are
+  // PUBLIC-executable wherever their extension is installed.
+  "connectby",
+  "crosstab",
+  "crosstab2",
+  "crosstab3",
+  "crosstab4",
   "query_to_xml",
   "query_to_xml_and_xmlschema",
   "query_to_xmlschema",
   "ts_rewrite",
   "ts_stat",
+  "xpath_table",
 ]);
 
 function isBlockedFunction(name: string): boolean {
-  return BLOCKED_FUNCTIONS.has(name) || name === "dblink" || name.startsWith("dblink_");
+  return (
+    BLOCKED_FUNCTIONS.has(name) || name === "dblink" || name.startsWith("dblink_") || name.startsWith("pg_stat_reset")
+  );
 }
 
 function isSpace(ch: string): boolean {
@@ -188,7 +213,35 @@ export function leadingKeyword(sql: string): string | null {
   return sql.slice(i, wordEnd(sql, i)).toUpperCase();
 }
 
-/** Index just past a string body starting at `start`, the opening quote consumed. */
+/**
+ * Index of the quote that continues a string literal closed just before
+ * `start`, or -1. PostgreSQL joins two literals separated only by whitespace
+ * holding a newline (line comments allowed, block comments not), and reads the
+ * second segment in the FIRST one's mode: after `E'a'`, a backslash-quote on
+ * the next line is an escaped quote, not the end of a one-backslash string
+ * (measured on PG18). The newline is not required here: without one the server
+ * reports a syntax error, so how that text is read cannot matter.
+ */
+function continuationQuote(sql: string, start: number): number {
+  let i = start;
+  while (i < sql.length) {
+    const ch = sql[i] as string;
+    if (isSpace(ch)) {
+      i++;
+    } else if (ch === "-" && sql[i + 1] === "-") {
+      i += 2;
+      while (i < sql.length && sql[i] !== "\n" && sql[i] !== "\r") i++;
+    } else {
+      break;
+    }
+  }
+  return sql[i] === "'" ? i : -1;
+}
+
+/**
+ * Index just past a string literal whose body starts at `start`, the opening
+ * quote consumed. Continuation segments are part of the literal.
+ */
 function skipString(sql: string, start: number, backslashEscapes: boolean): number {
   let i = start;
   while (i < sql.length) {
@@ -196,8 +249,13 @@ function skipString(sql: string, start: number, backslashEscapes: boolean): numb
     if (backslashEscapes && ch === "\\") {
       i += 2;
     } else if (ch === "'") {
-      if (sql[i + 1] !== "'") return i + 1;
-      i += 2;
+      if (sql[i + 1] === "'") {
+        i += 2;
+      } else {
+        const next = continuationQuote(sql, i + 1);
+        if (next === -1) return i + 1;
+        i = next + 1;
+      }
     } else {
       i++;
     }
@@ -237,24 +295,37 @@ function readQuoted(sql: string, start: number): { end: number; name: string } {
 /**
  * The first blocked function this statement calls, or null. String literals,
  * dollar quotes and comments are skipped, so naming one in a filter value is
- * fine. A `U&"..."` identifier followed by `(` is refused outright: its escapes
- * can spell any name.
+ * fine.
  *
- * Assumes standard_conforming_strings=on, the default since PostgreSQL 9.1.
+ * A name counts as a call when `(` follows it, and also when it follows a dot:
+ * PostgreSQL runs `(arg).fn` as `fn(arg)`, for a scalar argument too (measured
+ * on PG18: `SELECT (123).pg_cancel_backend` signals). The cost is refusing a
+ * qualified column that happens to carry a blocked name.
+ *
+ * A `U&"..."` identifier is refused outright when it is called either way or
+ * carries a `UESCAPE` clause: its escapes can spell any name, and the clause
+ * sits between the name and the parenthesis.
+ *
+ * Assumes standard_conforming_strings=on, the default since PostgreSQL 9.1;
+ * the startup role check (src/preflight.ts) warns when it is off.
  */
 export function findBlockedFunction(sql: string): string | null {
   const calledAfter = (end: number): boolean => sql[skipTrivia(sql, end)] === "(";
+  // Whether the previous token was a `.`, making this one an attribute-notation call.
+  let afterDot = false;
   let i = 0;
   while (i < sql.length) {
     i = skipTrivia(sql, i);
     const ch = sql[i];
     if (ch === undefined) break;
+    const viaDot = afterDot;
+    afterDot = false;
     if (ch === "'") {
       i = skipString(sql, i + 1, false);
     } else if (ch === '"') {
       const { end, name } = readQuoted(sql, i + 1);
       const lowered = name.toLowerCase();
-      if (calledAfter(end) && isBlockedFunction(lowered)) return lowered;
+      if ((viaDot || calledAfter(end)) && isBlockedFunction(lowered)) return lowered;
       i = end;
     } else if (ch === "$") {
       const tag = dollarTag(sql, i);
@@ -270,17 +341,20 @@ export function findBlockedFunction(sql: string): string | null {
       const next = sql[end];
       if (word === "u" && next === "&" && sql[end + 1] === '"') {
         const quoted = readQuoted(sql, end + 2);
-        if (calledAfter(quoted.end)) return `U&"${quoted.name}"`;
+        const after = skipTrivia(sql, quoted.end);
+        const uescape = sql.slice(after, wordEnd(sql, after)).toLowerCase() === "uescape";
+        if (viaDot || uescape || sql[after] === "(") return `U&"${quoted.name}"`;
         i = quoted.end;
       } else if (word === "u" && next === "&" && sql[end + 1] === "'") {
         i = skipString(sql, end + 2, false);
       } else if (next === "'" && (word === "e" || word === "b" || word === "x" || word === "n")) {
         i = skipString(sql, end + 1, word === "e");
       } else {
-        if (calledAfter(end) && isBlockedFunction(word)) return word;
+        if ((viaDot || calledAfter(end)) && isBlockedFunction(word)) return word;
         i = end;
       }
     } else {
+      afterDot = ch === ".";
       i++;
     }
   }
@@ -294,12 +368,18 @@ export function findBlockedFunction(sql: string): string | null {
 export function assertReadOnlyStatement(sql: string): void {
   const keyword = leadingKeyword(sql);
   if (keyword !== null && BLOCKED_KEYWORDS.has(keyword)) {
+    // pg_query always opens a transaction, and VACUUM is refused inside one
+    // (25001), so sending the agent there would trade this error for another.
+    const instead =
+      keyword === "VACUUM"
+        ? "VACUUM cannot run through this server: `pg_query` always opens a transaction, and PostgreSQL refuses " +
+          "VACUUM inside one. Run it with psql or a maintenance job."
+        : "To run this statement deliberately, use `pg_query` with ALLOW_WRITES=1, or a migration tool.";
     throw new GuardError(
       `Blocked in read-only mode: \`${keyword}\` statements can change session state, leave the read-only ` +
         "transaction, or bypass the row cap and timeout, so they are not run here. Send a SELECT, WITH, VALUES, " +
         "TABLE, SHOW or EXPLAIN. For a setting the agent needs on every call, configure it on the role " +
-        "(`ALTER ROLE ... SET ...`) or in DATABASE_URL. To run this statement deliberately, use `pg_query` with " +
-        "ALLOW_WRITES=1, or a migration tool.",
+        `(\`ALTER ROLE ... SET ...\`) or in DATABASE_URL. ${instead}`,
       BLOCKED_CODE,
     );
   }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { z } from "zod";
 import { adminTools } from "./admin.js";
@@ -14,18 +15,32 @@ import { statsTools } from "./stats.js";
 // invisible to every structural check below -- duplicate names, the pg_ prefix,
 // annotations, and whether inputSchema even parses. pg_io_stats shipped with
 // zero coverage of any kind because ioTools was added to index.ts and not here.
-const allTools = [
-  ...queryTools,
-  ...schemaTools,
-  ...explainTools,
-  ...indexAdvisorTools,
-  ...healthTools,
-  ...statsTools,
-  ...ioTools,
-  ...adminTools,
-];
+// Keyed by the module's export name so the first test below can hold this list
+// against the spreads index.ts actually registers.
+const toolModules = {
+  queryTools,
+  schemaTools,
+  explainTools,
+  indexAdvisorTools,
+  healthTools,
+  statsTools,
+  ioTools,
+  adminTools,
+};
+const allTools = Object.values(toolModules).flat();
 
 describe("Tool definitions", () => {
+  it("covers exactly the tool modules index.ts registers, in the same order", () => {
+    // index.ts cannot be imported (it starts the server), so read it as text.
+    // Runs from dist/tools/, two levels below the repo root.
+    const indexSrc = readFileSync(new URL("../../src/index.ts", import.meta.url), "utf8");
+    const block = /const allTools = \[([^\]]*)\];/.exec(indexSrc)?.[1];
+    assert.ok(block !== undefined, "index.ts no longer declares `const allTools = [...]`");
+    const registered = [...block.matchAll(/\.\.\.(\w+)/g)].map((m) => m[1]);
+    assert.ok(registered.length > 0, "no ...xxxTools spreads found in index.ts's allTools");
+    assert.deepEqual(Object.keys(toolModules), registered);
+  });
+
   it("should have no duplicate tool names", () => {
     const names = allTools.map((t) => t.name);
     const unique = new Set(names);
@@ -125,18 +140,19 @@ describe("Tool definitions", () => {
         // Build a per-field sample. We use the public Zod constructor
         // names (instanceof z.ZodString, etc.) rather than reading
         // _def internals, which is brittle across Zod majors (4.x moved
-        // _def.typeName to _def.type and dropped .values). Optional
-        // fields are filled with a placeholder too; safeParse will
-        // reject a value that doesn't match the inner type either way.
+        // _def.typeName to _def.type and dropped .values). Only REQUIRED
+        // fields get a placeholder: optional and `.default(...)` fields
+        // (isOptional() is true for both) are left unset, so this proves
+        // the schema parses with its defaults -- it does not probe the
+        // bounds on a defaulted field such as pg_top_queries.limit.
         //
-        // Number defaults are tricky: the schema may constrain min > 0
-        // (e.g. pg_kill.pid has int().min(1), pg_top_queries.limit has
-        // int().min(1)) or accept [0, 1] (e.g. pg_advisor.seqExhaustionThreshold,
-        // pg_table_bloat.minDeadRatio). Use 1 as a default; it's valid
-        // for min(1)+ but rejected by `min(0).max(1)` fields. For those,
-        // 0.5 is the safer pick. We try 1 first, then 0.5, then 0, and
-        // accept whichever the schema accepts. (The test asserts success;
-        // if all three reject, the schema is broken.)
+        // Number placeholders are tricky: a required field may constrain
+        // min > 0 (e.g. pg_kill.pid has int().min(1)) or accept only
+        // [0, 1]. Use 1 as a default; it's valid for min(1)+ but rejected
+        // by `min(0).max(1)` fields. For those, 0.5 is the safer pick. We
+        // try 1 first, then 0.5, then 0, and accept whichever the schema
+        // accepts. (The test asserts success; if all three reject, the
+        // schema is broken.)
         const sample: Record<string, unknown> = {};
         for (const name of fieldNames) {
           const field = shape[name];

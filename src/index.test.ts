@@ -2,19 +2,22 @@
  * Process-level tests for the CLI entrypoint.
  *
  * index.ts is the one module the suite cannot import: it calls
- * `server.connect(transport)` at the top level, so importing it would start a
+ * `serveStdio()` at the top level, so importing it would start a
  * stdio server inside the test runner. That left it with ZERO coverage --
  * including the argv handling that runs BEFORE the server starts, where a bad
  * condition breaks every MCP host launch while the rest of the suite stays
  * green.
  *
  * So drive the real emitted `dist/index.js` as a child process. No database is
- * touched: the pg pool is lazy, and none of these paths issue a query.
+ * needed: the pg pool is lazy, and no tool call here reaches one. The server
+ * does run its startup role check on every start, so a child given the stub
+ * DSN attempts one connection to `stub-host`, which fails and is reported on
+ * stderr without stopping anything.
  */
 
 import assert from "node:assert/strict";
 import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -70,6 +73,56 @@ describe("CLI: version subcommand", () => {
   }
 });
 
+describe("CLI: audit env is validated on the server-start path only", () => {
+  // api.ts used to open the audit sink at its module load, so every command,
+  // including the ones that serve nothing, validated the audit env and opened
+  // (and created) the audit file. Now index.ts calls initAudit() after its
+  // subcommands.
+  const badAudit = {
+    POSTGRES_AUDIT_LOG: "bogus",
+    POSTGRES_AUDIT_LOG_FILE: undefined,
+    POSTGRES_AUDIT_REDACT: undefined,
+  };
+
+  it("`version` prints the version and exits 0 despite an invalid audit variable", async () => {
+    const res = await runCli(["version"], badAudit);
+    assert.equal(res.code, 0, `stderr: ${res.stderr}`);
+    assert.match(res.stdout.trim(), /^\d+\.\d+\.\d+$/);
+    assert.doesNotMatch(res.stderr, /POSTGRES_AUDIT_LOG/);
+  });
+
+  it("`version` does not create the audit file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pgmcp-version-audit-"));
+    const file = join(dir, "audit.log");
+    try {
+      const res = await runCli(["version"], {
+        ...badAudit,
+        POSTGRES_AUDIT_LOG: undefined,
+        POSTGRES_AUDIT_LOG_FILE: file,
+      });
+      assert.equal(res.code, 0, `stderr: ${res.stderr}`);
+      assert.equal(existsSync(file), false, "version serves nothing, so it has nothing to audit");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the usage error reports the subcommand, not the audit variable", async () => {
+    const res = await runCli(["doctor"], badAudit);
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /unknown subcommand 'doctor'/);
+    assert.doesNotMatch(res.stderr, /POSTGRES_AUDIT_LOG/);
+  });
+
+  it("starting the server still refuses the invalid value before serving", async () => {
+    const res = await runCli([], { ...badAudit, DATABASE_URL: "postgres://stub-host/stubdb" });
+    assert.notEqual(res.code, 0, JSON.stringify(res));
+    assert.match(res.stderr, /POSTGRES_AUDIT_LOG="bogus" is not a recognized value; .*Refusing to start/);
+    assert.doesNotMatch(res.stderr, /ready/, "the banner means it served");
+    assert.equal(res.stdout, "", "nothing may be served");
+  });
+});
+
 describe("CLI: argv guard", () => {
   it("rejects an unknown bare subcommand with usage on stderr and exit 1", async () => {
     const res = await runCli(["doctor"]);
@@ -93,6 +146,19 @@ describe("CLI: argv guard", () => {
       assert.doesNotMatch(res.stderr, /unknown subcommand/);
     }
   });
+
+  for (const flag of ["--help", "-h"]) {
+    it(`\`${flag}\` prints usage on stdout and exits 0 instead of starting the server`, async () => {
+      // It used to pass through with the other dash flags and start the
+      // server, which waits on stdin. runCli gives the child no stdin, so that
+      // shows up here as the ready banner on stderr and an empty stdout.
+      const res = await runCli([flag]);
+      assert.equal(res.code, 0, `stderr: ${res.stderr}`);
+      assert.match(res.stdout, /^Usage:\n {2}postgres-mcp {12}start the MCP server on stdio\n/);
+      assert.match(res.stdout, /postgres-mcp version/);
+      assert.equal(res.stderr, "", "no banner: nothing was started");
+    });
+  }
 
   it("passes a leading-dash flag through instead of rejecting it", async () => {
     // MCP hosts may pass flags; the guard must only reject bare words. If this
@@ -135,14 +201,53 @@ function waitForBanner(child: ChildProcessWithoutNullStreams): Promise<string> {
   });
 }
 
+describe("CLI: POSTGRES_MCP_SANDBOX without the launcher", () => {
+  // Only bin/postgres-mcp.mjs can apply the sandbox. dist/index.js started
+  // directly (`npm start`, the `oam compile` binary) used to ignore the
+  // variable and serve unsandboxed. The values are the launcher's vocabulary;
+  // "launcher: parseSandboxSetting()" below pins that side.
+  for (const value of ["1", " TRUE ", "yes", ""]) {
+    it(`refuses to serve when it sees POSTGRES_MCP_SANDBOX=${JSON.stringify(value)}`, async () => {
+      const res = await runCli([], { DATABASE_URL: "postgres://stub-host/stubdb", POSTGRES_MCP_SANDBOX: value });
+      assert.equal(res.code, 1, JSON.stringify(res));
+      assert.equal(res.stdout, "", "nothing may be served");
+      assert.match(
+        res.stderr,
+        /^postgres-mcp: POSTGRES_MCP_SANDBOX=".*" is set, but the server was started without its launcher, .*; refusing to start without the sandbox\.$/m,
+      );
+      assert.ok(res.stderr.includes(`POSTGRES_MCP_SANDBOX=${JSON.stringify(value)} `), res.stderr);
+      assert.doesNotMatch(res.stderr, /ready/, "the banner means it served");
+    });
+  }
+
+  it("serves when the variable is an explicit off", async () => {
+    // The launcher's own in-process and unsandboxed-spawn paths hand the
+    // variable on unchanged, so an off value must not stop the server.
+    for (const value of ["0", " OFF "]) {
+      const child = spawnServer({ POSTGRES_MCP_SANDBOX: value });
+      try {
+        assert.match(await waitForBanner(child), /ready/, `POSTGRES_MCP_SANDBOX=${JSON.stringify(value)}`);
+      } finally {
+        child.kill("SIGKILL");
+      }
+    }
+  });
+
+  it("still answers `version`, which serves nothing", async () => {
+    const res = await runCli(["version"], { POSTGRES_MCP_SANDBOX: "1" });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout.trim(), /^\d+\.\d+\.\d+$/);
+  });
+});
+
 describe("CLI: MCP stdio handshake with no args", () => {
   // The happy path -- and the only test that covers index.ts's tool
-  // registration wiring (inputSchema.shape + annotations + wrapToolHandler).
+  // registration wiring (inputSchema + annotations + wrapToolHandler).
   // A break here means every MCP host fails to launch the server.
   it("starts, completes initialize, and advertises every tool", async () => {
     const child = spawn(process.execPath, [ENTRY], {
-      // A syntactically valid DSN is enough: the pool is lazy and nothing here
-      // issues a query, so no postgres is contacted.
+      // A syntactically valid DSN is enough: the pool is lazy and no tool is
+      // called. The startup role check does dial stub-host once, and fails.
       env: { ...process.env, DATABASE_URL: "postgres://stub-host/stubdb" },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -198,9 +303,9 @@ describe("CLI: MCP stdio handshake with no args", () => {
         names.every((n) => n.startsWith("pg_")),
         `every tool name should be pg_-prefixed: ${JSON.stringify(names)}`,
       );
-      // inputSchema must survive registration -- index.ts passes
-      // `tool.inputSchema.shape`, and a regression there yields tools the host
-      // cannot call.
+      // inputSchema must survive registration -- index.ts passes the zod object
+      // itself (`tool.inputSchema`, not `.shape`), and a regression there yields
+      // tools the host cannot call.
       for (const tool of tools) {
         assert.equal(typeof tool.description, "string");
         assert.ok(tool.inputSchema, `${tool.name} advertised no inputSchema`);
@@ -476,7 +581,10 @@ describe("CLI: audit attribution", () => {
     // auditQuery's run(), and auditQuery's catch still records an ok:false line
     // carrying the tool field -- which is the whole field under test. So this
     // needs no database, opens no socket, and costs a fraction of a millisecond
-    // per call. POSTGRES_AUDIT_LOG_FILE is cleared for a related reason: left
+    // per call. The unset DSN is also what keeps the count below at exactly 2:
+    // the startup role check skips without one, where with the stub DSN it
+    // would run its own audited statement. POSTGRES_AUDIT_LOG_FILE is cleared
+    // for a related reason: left
     // set in the ambient environment it would redirect the lines to a file, and
     // the failure would read as a missing tool field rather than a misdirected
     // sink.
@@ -732,6 +840,22 @@ describe("launcher: runtime selection", () => {
     const res = await runLauncher(["doctor"], { POSTGRES_MCP_RUNTIME: "node", OAM_BIN: undefined });
     assert.equal(res.code, 1);
     assert.match(res.stderr, /unknown subcommand 'doctor'/);
+  });
+
+  it("reports a missing dist/index.js in one line on the primary in-process path", () => {
+    // A copy of the launcher with no dist/ beside it. The in-process import
+    // was awaited bare, so this was an uncaught ERR_MODULE_NOT_FOUND with a
+    // stack trace; only the fallback paths had a reporter.
+    const root = mkdtempSync(join(tmpdir(), "postgres-mcp-launcher-nodist-"));
+    mkdirSync(join(root, "bin"));
+    const copy = join(root, "bin", "postgres-mcp.mjs");
+    copyFileSync(LAUNCHER, copy);
+    const env: NodeJS.ProcessEnv = { ...process.env, POSTGRES_MCP_RUNTIME: "node" };
+    for (const k of Object.keys(env)) if (k.toUpperCase() === "POSTGRES_MCP_SANDBOX") delete env[k];
+    const res = spawnSync(process.execPath, [copy, "version"], { env, encoding: "utf8", timeout: 30_000 });
+    assert.equal(res.status, 1, JSON.stringify(res));
+    assert.equal(res.stdout, "");
+    assert.match(res.stderr, /^postgres-mcp: could not start the server \(Cannot find module .*index\.js.*\)\n$/);
   });
 });
 
@@ -1606,7 +1730,14 @@ const SPAWN_SENTINEL = 97;
 /** A DSN with a password, so a refusal that echoes it is caught. */
 const SANDBOX_DSN = "postgres://u:hunter2@stub-host:6543/db";
 type SpawnStep = "capture" | "throw" | "error" | "real";
-type SpawnRecord = { cmd: string; args: string[]; step: SpawnStep; envKeys: string[]; nodeOptions: string | null };
+type SpawnRecord = {
+  cmd: string;
+  args: string[];
+  step: SpawnStep;
+  envKeys: string[];
+  nodeOptions: string | null;
+  sandboxVar: string | null;
+};
 
 /**
  * A preload that replaces child_process.spawn inside the launcher, so the
@@ -1629,7 +1760,8 @@ function spawnPreload(...steps: SpawnStep[]): string {
     "  const step = steps[Math.min(calls++, steps.length - 1)];",
     "  const envKeys = Object.keys(opts?.env ?? {}).filter((k) => /^(pghost|pgport|database_url)$/i.test(k)).sort();",
     "  const nodeOptions = Object.entries(opts?.env ?? {}).find(([k]) => k.toUpperCase() === 'NODE_OPTIONS')?.[1] ?? null;",
-    '  spawnLog(2, "SPAWN_ARGV=" + JSON.stringify({ cmd, args, step, envKeys, nodeOptions }) + "\\n");',
+    "  const sandboxVar = Object.entries(opts?.env ?? {}).find(([k]) => k.toUpperCase() === 'POSTGRES_MCP_SANDBOX')?.[1] ?? null;",
+    '  spawnLog(2, "SPAWN_ARGV=" + JSON.stringify({ cmd, args, step, envKeys, nodeOptions, sandboxVar }) + "\\n");',
     `  if (step === "capture") process.exit(${SPAWN_SENTINEL});`,
     '  if (step === "throw") throw new Error("spawn EINVAL (stubbed)");',
     '  if (step === "error") return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
@@ -1724,6 +1856,9 @@ describe("launcher: already hosted on oam", () => {
       assert.equal(spawns.length, 1, `hostOam=${hostOam}: exactly one spawn`);
       assert.equal(spawns[0].cmd, process.execPath);
       assert.deepEqual(spawns[0].args, expectedArgv("stub-host:6543"), `hostOam=${hostOam}`);
+      // The server refuses to start when it can see the variable switched on,
+      // so the sandboxed child must not be handed it.
+      assert.equal(spawns[0].sandboxVar, null, `hostOam=${hostOam}`);
     }
   });
 
@@ -2180,14 +2315,25 @@ function rpc(child: ChildProcessWithoutNullStreams, request: { id: number; [k: s
 // name would have vanished under the sandbox with no diagnostic.
 //
 // This pins the invariant the CHANGELOG claims: the allowlist is derived from
-// what the shipped bundle actually reads. Only STATICALLY literal reads can be
-// checked -- the pg driver builds some of its own names by concatenation
-// (`process.env['PG' + key.toUpperCase()]`), which no static scan can see, so
-// those stay a manual entry.
+// what the shipped bundle actually reads. A literal `process.env.NAME` read is
+// one way a name shows up; the other is as a string handed to a helper --
+// api.ts's `positiveIntEnv("POSTGRES_MAX_RESULT_BYTES", ...)` reads
+// `process.env[name]`, which is how POSTGRES_MAX_RESULT_BYTES and
+// POSTGRES_QUERY_DEADLINE_MS shipped unlisted in 0.14.0 with this test green.
+// So every POSTGRES_* name the bundle holds as a whole string literal is
+// checked too. What no static scan can see is a name the pg driver builds by
+// concatenation (`process.env['PG' + key.toUpperCase()]`), so those stay a
+// manual entry.
 // ─────────────────────────────────────────────────────────────────────────
 
+// Read by the launcher (and, for the sandbox flag, by the server's own
+// refusal), never configuration for the sandboxed server. POSTGRES_MCP_SANDBOX
+// must NOT be granted: a sandboxed server that could see it would refuse to
+// start.
+const LAUNCHER_ONLY_ENV = ["POSTGRES_MCP_RUNTIME", "POSTGRES_MCP_SANDBOX"];
+
 describe("oam sandbox --allow-env allowlist", () => {
-  it("covers every literal process.env read in the shipped bundle", async () => {
+  it("covers every config variable the shipped bundle reads, directly or through a helper", async () => {
     const { readFileSync } = await import("node:fs");
     const launcherSrc = readFileSync(LAUNCHER, "utf8");
     const bundleSrc = readFileSync(ENTRY, "utf8");
@@ -2205,10 +2351,26 @@ describe("oam sandbox --allow-env allowlist", () => {
     for (const m of bundleSrc.matchAll(/process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g)) read.add(m[1]);
     for (const m of bundleSrc.matchAll(/process\.env\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]/g)) read.add(m[1]);
 
+    // A name passed to a helper as a string. Only a WHOLE literal counts, so a
+    // name mentioned inside an error message is not picked up.
+    const named = new Set<string>();
+    for (const m of bundleSrc.matchAll(/(["'`])(POSTGRES_[A-Z0-9_]+)\1/g)) named.add(m[2]);
+    assert.ok(named.size > 0, "found no POSTGRES_* string literal in the bundle -- scan is broken");
+
     // NODE_ENV and friends are read by bundled deps and are not ours to grant;
     // restrict the assertion to the config surface this server documents.
-    const ours = [...read].filter((n) => n.startsWith("POSTGRES_") || n.startsWith("PG") || n === "ALLOW_WRITES");
+    const ours = [...new Set([...read, ...named])].filter(
+      (n) =>
+        (n.startsWith("POSTGRES_") || n.startsWith("PG") || n === "ALLOW_WRITES" || n === "DATABASE_URL") &&
+        !LAUNCHER_ONLY_ENV.includes(n),
+    );
     assert.ok(ours.length > 0, "found no config env reads in the bundle -- scan is broken");
+    assert.ok(ours.includes("DATABASE_URL"), "the scan no longer sees DATABASE_URL -- it is broken");
+    assert.deepEqual(
+      LAUNCHER_ONLY_ENV.filter((n) => allowed.has(n)),
+      [],
+      "a launcher-only variable is on the allowlist; the sandboxed server would see POSTGRES_MCP_SANDBOX and refuse",
+    );
 
     const missing = ours.filter((n) => !allowed.has(n));
     assert.deepEqual(

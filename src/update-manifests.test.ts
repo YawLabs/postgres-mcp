@@ -25,6 +25,7 @@ type FormulaInput = {
 
 let rubyString: (value: unknown) => string;
 let renderFormula: (input: FormulaInput) => string;
+let commitPush: (dir: string, file: string, msg: string, git: (...args: string[]) => void) => void;
 
 before(async () => {
   // A computed specifier keeps tsc from resolving the untyped .mjs, and
@@ -32,9 +33,11 @@ before(async () => {
   const mod = (await import(pathToFileURL(scriptPath).href)) as {
     rubyString: typeof rubyString;
     renderFormula: typeof renderFormula;
+    commitPush: typeof commitPush;
   };
   rubyString = mod.rubyString;
   renderFormula = mod.renderFormula;
+  commitPush = mod.commitPush;
 });
 
 // Read the body of a Ruby double-quoted literal the way Ruby does, failing on
@@ -145,6 +148,29 @@ describe("update-manifests renderFormula", () => {
     assert.equal(stanza(formula, "license"), 'MIT"#{3}');
   });
 
+  it("escapes the command and every asset url and sha256", () => {
+    // The other eight interpolation sites. Each line is read back the way Ruby
+    // would read it, so dropping rubyString at any one of them fails here.
+    const cmd = 'x"#{1}';
+    const hostile = (n: number): Asset => ({ url: `https://x.test/a${n}"#{${n}}\\`, sha256: `${n}"#{${n}}` });
+    const assets = { macArm64: hostile(1), macX64: hostile(2), linuxX64: hostile(3) };
+    const lines = renderFormula({ ...baseInput, cmd, assets }).split("\n");
+    const bodies = (re: RegExp) => lines.flatMap((l) => re.exec(l)?.[1] ?? []).map(parseRubyDq);
+
+    const order = [assets.macArm64, assets.macX64, assets.linuxX64];
+    assert.deepEqual(
+      bodies(/^\s*url "(.*)", using: :nounzip$/),
+      order.map((a) => a.url),
+    );
+    assert.deepEqual(
+      bodies(/^\s*sha256 "(.*)"$/),
+      order.map((a) => a.sha256),
+    );
+    assert.deepEqual(bodies(/^\s*bin\.install Dir\["\*"\]\.first => "(.*)"$/), [cmd]);
+    // `#{bin}` is the formula's own interpolation; only what follows it is the value.
+    assert.deepEqual(bodies(/shell_output\("#\{bin\}\/(.*) --version"\)$/), [cmd]);
+  });
+
   it("renders the usual stanzas for a normal package", () => {
     const formula = renderFormula(baseInput);
     assert.ok(formula.startsWith("class PostgresMcp < Formula\n"));
@@ -161,5 +187,23 @@ describe("update-manifests renderFormula", () => {
 
   it("rejects a class name that is not a Ruby constant", () => {
     assert.throws(() => renderFormula({ ...baseInput, className: "Foo; system('id')" }), /not a Ruby constant/);
+  });
+});
+
+describe("update-manifests commitPush", () => {
+  it("commits the freshly written manifest before it rebases", () => {
+    // main() writes the manifest into the sibling repo and then calls this. A
+    // `git pull --rebase` ahead of the commit refuses to run on a tracked file
+    // with unstaged changes, so --push only ever worked for a first publish.
+    const calls: string[][] = [];
+    commitPush("/repo", "bucket/postgres-mcp.json", "postgres-mcp 1.2.3", (...args) => {
+      calls.push(args);
+    });
+    assert.deepEqual(calls, [
+      ["add", "bucket/postgres-mcp.json"],
+      ["commit", "-m", "postgres-mcp 1.2.3"],
+      ["pull", "--rebase", "origin", "main"],
+      ["push", "origin", "main"],
+    ]);
   });
 });

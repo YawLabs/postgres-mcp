@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it } from "node:test";
-import pg from "pg";
-import { shutdown } from "../api.js";
+import { describe, it } from "node:test";
+import { stubClient, stubConnect, stubPoolQuery, useStubbedPool } from "../test-helpers/pool-stub.js";
 import {
   compareVersions,
   hasStatementsInfo,
   indexLastScanCols,
   PG_STAT_STATEMENTS_INFO_MIN_VERSION,
+  statementsRelation,
   statsTools,
   tableLastScanCols,
   withStatsReset,
@@ -336,7 +336,10 @@ function categorize(sql: string): StatsCategory {
   // `pg_stat_statements_info`, so the looser check would swallow the info
   // probe and this whole suite would assert against the wrong statement.
   if (sql.includes("pg_stat_statements_info")) return "info";
-  if (sql.includes("FROM pg_stat_statements")) return "ranking";
+  // Optional schema prefix: the handler qualifies the view with the schema
+  // the extension probe reports (see statementsRelation), which may be a
+  // quoted identifier with spaces in it.
+  if (/FROM (?:"[^"]*"\.|\S+\.)?pg_stat_statements\b/.test(sql)) return "ranking";
   if (sql.includes("pg_stat_database")) return "reset";
   if (sql.includes("pg_stat_user_tables")) return "tables";
   if (sql.includes("pg_stat_user_indexes")) return "indexes";
@@ -408,9 +411,6 @@ interface StatsResponse {
 }
 
 describe("stats tools (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
   let seen: { sql: string; params: unknown[] }[] = [];
   let pooled: string[] = [];
 
@@ -420,66 +420,48 @@ describe("stats tools (stubbed connect, no live DB)", () => {
    *   catalogs on managed providers.
    * @param empty statements that succeed with zero rows -- the branch that must
    *   not be reported as "never reset".
+   * @param extSchema the schema the extension probe reports; omitted leaves the
+   *   column off the probe row altogether.
    */
   function installStub(
     extVersion: string,
-    { failing = [], empty = [] }: { failing?: StatsCategory[]; empty?: StatsCategory[] } = {},
+    {
+      failing = [],
+      empty = [],
+      extSchema,
+    }: { failing?: StatsCategory[]; empty?: StatsCategory[]; extSchema?: string } = {},
   ) {
     seen = [];
     pooled = [];
-    pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
-      const text = typeof sql === "string" ? sql : "";
+    stubPoolQuery(async (text) => {
       pooled.push(text);
       switch (categorize(text)) {
         // PG18 so the PG16 last-scan gates never fire: this suite is about the
         // extversion gate and the reset envelope, not those.
         case "version":
-          return Promise.resolve({ rows: [{ v: "180000" }] });
+          return { rows: [{ v: "180000" }] };
         case "extversion":
-          return Promise.resolve({ rows: [{ version: extVersion }] });
+          return {
+            rows: [extSchema === undefined ? { version: extVersion } : { version: extVersion, schema: extSchema }],
+          };
         default:
-          return Promise.resolve({ rows: [] });
+          return { rows: [] };
       }
-    } as unknown as typeof pg.Pool.prototype.query;
+    });
 
-    const client = {
-      async query(sql: string, params: unknown[] = []) {
-        seen.push({ sql, params });
-        const category = categorize(sql);
-        if (failing.includes(category)) throw new Error("permission denied for view");
-        return { rows: empty.includes(category) ? [] : rowsFor(sql) };
-      },
-      release() {
-        /* no-op */
-      },
-      // acquireClient() attaches an 'error' listener for the checked-out lifetime.
-      on() {
-        return this;
-      },
-      removeListener() {
-        return this;
-      },
-    };
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(client);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    const client = stubClient(async (sql: string, params: unknown[] = []) => {
+      seen.push({ sql, params });
+      const category = categorize(sql);
+      if (failing.includes(category)) throw new Error("permission denied for view");
+      return { rows: empty.includes(category) ? [] : rowsFor(sql) };
+    });
+    stubConnect(() => client);
   }
 
-  beforeEach(async () => {
-    // shutdown() clears the pool AND the process-wide cached
-    // server_version_num. Without it the first test's version leaks into every
-    // later one and this suite becomes order-dependent.
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  });
-
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  });
+  // The shutdown() on the way in clears the pool AND the process-wide cached
+  // server_version_num. Without it the first test's version leaks into every
+  // later one and this suite becomes order-dependent.
+  useStubbedPool();
 
   // ── The pre-1.9 degraded envelope ──────────────────────────────────────
 
@@ -592,6 +574,70 @@ describe("stats tools (stubbed connect, no live DB)", () => {
     assert.match(warning, /pg_stat_database/);
     assert.doesNotMatch(warning, /pg_stat_statements_info/);
     assert.equal("dealloc" in res.data, false);
+  });
+
+  // ── SQL text the server evaluates, so a stub cannot prove it by rows ─────
+
+  it("pg_top_queries: both views are qualified with the schema the extension lives in", async () => {
+    // The install probe reads pg_catalog.pg_extension, which succeeds whatever
+    // schema holds the extension. A bare view name then fails with 42P01 when
+    // that schema is off the role's search_path -- contradicting the probe
+    // that just passed. The quoted spelling is what regnamespace::text emits
+    // for a name that needs quoting, and it must be pasted through untouched.
+    installStub("1.9", { extSchema: '"Mon itoring"' });
+    const res = (await pgTopQueries.handler({})) as StatsResponse;
+    assert.equal(res.ok, true);
+    const sqlOf = (c: StatsCategory) => seen.find((q) => categorize(q.sql) === c)?.sql ?? "";
+    assert.match(sqlOf("ranking"), /FROM "Mon itoring"\.pg_stat_statements\n/);
+    assert.match(sqlOf("info"), /FROM "Mon itoring"\.pg_stat_statements_info$/);
+    assert.ok(
+      pooled.some((q) => q.includes("extnamespace::regnamespace::text AS schema")),
+      "the extension probe must ask for the schema",
+    );
+  });
+
+  it("pg_top_queries: a probe row without a schema falls back to the bare view names", async () => {
+    installStub("1.9");
+    await pgTopQueries.handler({});
+    const sqls = seen.map((q) => q.sql);
+    assert.ok(sqls.some((q) => /FROM pg_stat_statements\n/.test(q)));
+    assert.ok(sqls.some((q) => /FROM pg_stat_statements_info$/.test(q)));
+  });
+
+  it("statementsRelation qualifies only when a schema is known", () => {
+    assert.equal(statementsRelation("monitoring", "pg_stat_statements"), "monitoring.pg_stat_statements");
+    assert.equal(statementsRelation(null, "pg_stat_statements"), "pg_stat_statements");
+    assert.equal(statementsRelation(undefined, "pg_stat_statements_info"), "pg_stat_statements_info");
+    assert.equal(statementsRelation("", "pg_stat_statements"), "pg_stat_statements");
+  });
+
+  it("pg_seq_scan_tables: the ratio carries no precision cap", async () => {
+    installStub("1.9");
+    await pgSeqScanTables.handler({});
+    const sql = seen.find((q) => categorize(q.sql) === "tables")?.sql ?? "";
+    // numeric(10, 2) holds values below 10^8 only. A table seq-scanned 10^8
+    // times against a single index scan -- the tool's headline offender --
+    // raised 22003 there, and one such row failed the whole statement.
+    // (Measured on PG 15/17: the round() form returns 100000000.)
+    assert.match(sql, /ELSE round\(seq_scan::numeric \/ idx_scan, 2\)::float8\n\s+END AS ratio/);
+    assert.doesNotMatch(sql, /numeric\(\d+,\s*\d+\)/, "a precision-capped cast is back in the row query");
+  });
+
+  it("pg_unused_indexes: every constraint-enforcing index kind is filtered out", async () => {
+    installStub("1.9");
+    await pgUnusedIndexes.handler({});
+    const sql = seen.find((q) => categorize(q.sql) === "indexes")?.sql ?? "";
+    // An EXCLUDE constraint's index is neither indisunique nor indisprimary,
+    // so without its own predicate it is offered as a drop candidate while
+    // enforcing a constraint on every write -- which the description promises
+    // never happens.
+    for (const flag of ["indisunique", "indisprimary", "indisexclusion"]) {
+      assert.match(sql, new RegExp(`AND NOT i\\.${flag}\\b`), `${flag} indexes are not excluded`);
+    }
+    assert.match(
+      pgUnusedIndexes.description,
+      /PRIMARY KEY, UNIQUE and EXCLUDE-constraint indexes are already excluded/,
+    );
   });
 
   it("pg_seq_scan_tables: a failed reset probe warns and keeps the rows", async () => {

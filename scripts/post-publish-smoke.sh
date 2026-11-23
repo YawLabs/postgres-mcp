@@ -63,7 +63,15 @@ until npm install --no-save "${PKG}@${VERSION}" >/dev/null 2>"${TMP}/install.err
 done
 
 echo "  -> invoking ${BIN} version"
-GOT=$(./node_modules/.bin/"${BIN}" version 2>&1 | tail -1)
+# Captured whole, with the exit status checked, and only then cut to the last
+# line. `GOT=$(bin version 2>&1 | tail -1)` under set -e -o pipefail exited on
+# a crashing bin before the FAIL branch below, and its output went with it.
+if ! OUT=$(./node_modules/.bin/"${BIN}" version 2>&1); then
+  printf '%s\n' "$OUT" >&2
+  echo "  FAIL smoke test: ${BIN} version exited non-zero (its output is above)" >&2
+  exit 1
+fi
+GOT=$(printf '%s\n' "$OUT" | tail -1)
 
 if [ "$GOT" = "$VERSION" ]; then
   echo "  ok smoke test passed: ${PKG}@${VERSION} reports ${GOT}"

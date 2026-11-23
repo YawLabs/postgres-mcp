@@ -363,7 +363,7 @@ describe("audit never records parameter values", () => {
   it("logs the count only, even though the caller holds the values", async () => {
     const lines = captureAudit();
     // The shape api.ts builds: paramCount: params.length, values left behind.
-    const params = ["hunter2", "jeff@rad.fyi"];
+    const params = ["hunter2", "user@example.com"];
     await auditQuery(
       { source: "user", sql: "SELECT * FROM users WHERE pw = $1 AND email = $2", paramCount: params.length },
       () => Promise.resolve({ rows: [], rowCount: 0 }),
@@ -384,7 +384,7 @@ describe("audit never records parameter values", () => {
 });
 
 describe("audit redaction (hash-only mode)", () => {
-  const sql = "SELECT ssn FROM people WHERE email = 'jeff@rad.fyi'";
+  const sql = "SELECT ssn FROM people WHERE email = 'user@example.com'";
 
   it("logs the first keyword and a sha256 instead of the statement text", async () => {
     const lines = captureAudit({ POSTGRES_AUDIT_LOG: "1", POSTGRES_AUDIT_REDACT: "1" });
@@ -399,7 +399,7 @@ describe("audit redaction (hash-only mode)", () => {
     assert.equal(entry.sqlKeyword, "SELECT");
     assert.equal(entry.sqlSha256, createHash("sha256").update(sql).digest("hex"));
     // The inline literal is the whole reason this mode exists.
-    assert.equal(raw.includes("jeff@rad.fyi"), false);
+    assert.equal(raw.includes("user@example.com"), false);
     assert.equal(raw.includes("ssn"), false);
   });
 
@@ -567,7 +567,7 @@ describe("audit file sink", () => {
 });
 
 describe("initAudit is idempotent", () => {
-  it("ignores a second call so importers of api.ts cannot reopen the sink", async () => {
+  it("ignores a second call, so a repeated init cannot reopen the sink", async () => {
     const lines = captureAudit();
     process.env.POSTGRES_AUDIT_REDACT = "1";
     initAudit();
@@ -578,6 +578,20 @@ describe("initAudit is idempotent", () => {
     );
     const entry = parseOnly(lines);
     assert.equal(entry.sql, "SELECT 1", "the second init must not have swapped in the redacted mode");
+  });
+});
+
+describe("importing api.ts does not initialize auditing", () => {
+  it("leaves an invalid audit env unread until initAudit() is called", async () => {
+    // api.ts used to call initAudit() at module load, so `postgres-mcp
+    // version` -- which imports it through index.ts -- refused to print a
+    // version over a bad audit variable. The query string forces a fresh
+    // evaluation of api.ts; audit.js stays the one shared instance.
+    process.env.POSTGRES_AUDIT_LOG = "bogus";
+    await import(`./api.js?fresh-${process.pid}`);
+    assert.equal(isAuditEnabled(), false);
+    // The refusal itself is intact; it just waits for the explicit call.
+    assert.throws(() => initAudit(), /POSTGRES_AUDIT_LOG="bogus" is not a recognized value/);
   });
 });
 
@@ -774,6 +788,27 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
     assert.equal("sqlstate" in entry, false);
   });
 
+  it("a statement the read-only guard refuses writes its ok:false line, with no connection taken", async () => {
+    // The guard runs inside the audited span on purpose, so refused agent SQL
+    // is in the trail too; hoisting it above the span would drop the line.
+    let connects = 0;
+    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+      connects++;
+      return Promise.reject(refused());
+    } as typeof pg.Pool.prototype.connect;
+    const blocked = "SET ROLE postgres";
+    const res = await runReadOnly(blocked);
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /Blocked in read-only mode/);
+    const { entry } = onlyLine();
+    assert.equal(entry.source, "user");
+    assert.equal(entry.sql, blocked);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.rows, null);
+    assert.equal(entry.sqlstate, "PGMCP_BLOCKED");
+    assert.equal(connects, 0, "refused before a connection was asked for");
+  });
+
   it("a hook setup that throws writes the line for the statement it was preparing", async () => {
     // pg_explain's hypothetical_indexes: setup creates the indexes inside the
     // transaction, before the EXPLAIN. When it throws, the EXPLAIN never runs
@@ -863,6 +898,31 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
     // `after` equal to the statement count is what ties the release to a
     // point past the COMMIT; a release moved inside the audited span would
     // record a smaller number.
+    assert.deepEqual(client.releases, [{ discard: undefined, after: client.statements.length }]);
+  });
+
+  it("runReadWrite: a COMMIT the server refuses is the statement's one ok:false line, not an ok:true one", async () => {
+    // 23503 at COMMIT is a DEFERRABLE INITIALLY DEFERRED foreign key; a 40001
+    // lands there too. The statement itself succeeded, so with the COMMIT
+    // outside the audited span the trail recorded a write that never persisted.
+    const client = makeFakeClient((s) =>
+      s === "COMMIT"
+        ? pgError('insert or update on table "orders" violates foreign key constraint', "23503")
+        : undefined,
+    );
+    connectTo(client);
+    const res = await runReadWrite(sql, params);
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /violates foreign key constraint \(code: 23503\)/);
+    const { entry } = onlyLine();
+    assert.equal(entry.source, "user");
+    assert.equal(entry.sql, sql);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.rows, null);
+    assert.equal(entry.sqlstate, "23503");
+    // Unchanged by the move: the failed transaction is rolled back, and the
+    // checkout goes back once, after the last statement.
+    assert.deepEqual(client.statements.slice(-3), ["COMMIT", "ROLLBACK", "DISCARD ALL"]);
     assert.deepEqual(client.releases, [{ discard: undefined, after: client.statements.length }]);
   });
 
@@ -957,9 +1017,9 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
 // The server-version probe is an internal line (#42, found in review).
 //
 // pg_explain with a version-floored option, and the tools that probe before
-// checking out their shared connection (pg_describe_table, pg_advisor,
-// pg_table_bloat, pg_seq_scan_tables, pg_unused_indexes, pg_io_stats,
-// pg_index_advisor), run getServerVersionNum() before anything else reaches
+// checking out their shared connection (pg_describe_table, pg_health,
+// pg_advisor, pg_replication_status, pg_seq_scan_tables, pg_unused_indexes,
+// pg_io_stats), run getServerVersionNum() before anything else reaches
 // the database, and it swallows every failure into the 0 sentinel. Unaudited,
 // a refused connection under any of them wrote no line: the fix above moved
 // the checkout into the agent statement's span, and this path never reached
@@ -1073,7 +1133,9 @@ describe("the server-version probe writes an internal line (#42)", () => {
     // tools' next database access is the shared checkout, which was silent
     // -- so an outage that began after the first successful call left no
     // trace of any of them. withSharedClient now attributes a refused
-    // connection to the first statement its callback runs.
+    // connection to the first statement its callback runs. pg_index_advisor
+    // also probes first, but it is not in the set: its next access is an
+    // audited runInternal, which already logged a refused connection.
     probeAnswers("170000");
     assert.equal(await getServerVersionNum(), 170_000);
     const originalConnect = pg.Pool.prototype.connect;

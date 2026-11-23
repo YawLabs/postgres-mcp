@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readdirSync, readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import pg from "pg";
+import { z } from "zod";
 import { shutdown } from "../api.js";
 import { initAudit, resetAuditForTests, setAuditSinkForTests } from "../audit.js";
 import { wrapToolHandler } from "../mcp-wrapper.js";
+import { stubClient, stubConnect, stubPoolQuery, useStubbedPool } from "../test-helpers/pool-stub.js";
 import { adminTools } from "./admin.js";
 
 const pgKill = adminTools.find((t) => t.name === "pg_kill")!;
@@ -95,34 +96,31 @@ function makeFakeClient(opts: FakeClientOptions) {
   };
 }
 
+/** Hands every checkout the same makeFakeClient(opts) and returns it, so a test can read its calls. */
+function installKillStub(opts: FakeClientOptions): ReturnType<typeof makeFakeClient> {
+  const client = makeFakeClient(opts);
+  stubConnect(() => client);
+  return client;
+}
+
 describe("pg_kill note construction (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
   const originalAllowWrites = process.env.ALLOW_WRITES;
-  const originalDbUrl = process.env.DATABASE_URL;
-  let fakeClient: ReturnType<typeof makeFakeClient>;
 
   function installStub(opts: FakeClientOptions) {
-    fakeClient = makeFakeClient(opts);
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(fakeClient);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    installKillStub(opts);
   }
 
-  beforeEach(async () => {
-    // Rebuild the pool against our stub. DATABASE_URL must be set or getPool()
-    // throws on construction before connect() is reached.
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+  // Rebuilds the pool against the stub. DATABASE_URL must be set or getPool()
+  // throws on construction before connect() is reached.
+  useStubbedPool();
+
+  beforeEach(() => {
     process.env.ALLOW_WRITES = "1";
   });
 
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    await shutdown();
+  afterEach(() => {
     if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
     else process.env.ALLOW_WRITES = originalAllowWrites;
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
   });
 
   it("signaled=true: data.signaled is true and the note names SIGINT (cancel)", async () => {
@@ -173,7 +171,7 @@ describe("pg_kill note construction (stubbed connect, no live DB)", () => {
 // statement runs inside that wrapper's async context: asserting on the bare
 // handler would prove a line is written and say nothing about attribution.
 // Delete the auditQuery wrapper in admin.ts and every test here that expects a
-// line goes red on the line count (checked: six fail). Two hold either way, by
+// line goes red on the line count (the seven that call onlyLine()). Two hold either way, by
 // design: the ALLOW_WRITES one asserts NO line, and the README one checks what
 // is SENT, not what is logged.
 // ─────────────────────────────────────────────────────────────────────────
@@ -181,9 +179,7 @@ describe("pg_kill note construction (stubbed connect, no live DB)", () => {
 const AUDIT_ENV = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
 
 describe("pg_kill audit line (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
   const originalAllowWrites = process.env.ALLOW_WRITES;
-  const originalDbUrl = process.env.DATABASE_URL;
   let auditEnvSnapshot: Record<string, string | undefined> = {};
   let fakeClient: ReturnType<typeof makeFakeClient>;
   let lines: string[];
@@ -196,10 +192,7 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
   const killViaWrapper = wrapToolHandler(pgKill.handler as (input: unknown) => Promise<unknown>, pgKill.name);
 
   function installStub(opts: FakeClientOptions) {
-    fakeClient = makeFakeClient(opts);
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(fakeClient);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    fakeClient = installKillStub(opts);
   }
 
   function onlyLine(): { raw: string; entry: Record<string, unknown> } {
@@ -208,9 +201,9 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
     return { raw, entry: JSON.parse(raw) as Record<string, unknown> };
   }
 
-  beforeEach(async () => {
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+  useStubbedPool();
+
+  beforeEach(() => {
     process.env.ALLOW_WRITES = "1";
     // Cleared first, then set. The capture sink installed below replaces
     // whatever initAudit() opens, so an ambient POSTGRES_AUDIT_LOG_FILE cannot
@@ -235,9 +228,7 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
     });
   });
 
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    await shutdown();
+  afterEach(() => {
     resetAuditForTests();
     for (const name of AUDIT_ENV) {
       const original = auditEnvSnapshot[name];
@@ -246,8 +237,6 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
     }
     if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
     else process.env.ALLOW_WRITES = originalAllowWrites;
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
   });
 
   it("writes exactly one line per signal call, attributed to pg_kill", async () => {
@@ -269,9 +258,9 @@ describe("pg_kill audit line (stubbed connect, no live DB)", () => {
     // The checkout sits inside the audited call, so a pool that refuses a
     // connection leaves the line for the statement that never went out. With
     // the checkout before the audit, this call wrote nothing.
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.reject(Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }));
-    } as typeof pg.Pool.prototype.connect;
+    stubConnect(() =>
+      Promise.reject(Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" })),
+    );
     const res = await killViaWrapper({ pid: PID, mode: "terminate" });
     assert.equal(res.isError, true);
     assert.match(res.content[0]!.text, /ECONNREFUSED/);
@@ -435,35 +424,27 @@ describe("pg_kill's checkout carries an 'error' listener (stubbed connect, no li
     }
   }
 
-  const originalConnect = pg.Pool.prototype.connect;
   const originalAllowWrites = process.env.ALLOW_WRITES;
-  const originalDbUrl = process.env.DATABASE_URL;
   const originalError = console.error;
   let client: EmitterClient;
   let logged: string[];
 
-  beforeEach(async () => {
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+  useStubbedPool();
+
+  beforeEach(() => {
     process.env.ALLOW_WRITES = "1";
     client = new EmitterClient();
     logged = [];
     console.error = (...args: unknown[]) => {
       logged.push(args.map(String).join(" "));
     };
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(client);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    stubConnect(() => client);
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     console.error = originalError;
-    pg.Pool.prototype.connect = originalConnect;
-    await shutdown();
     if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
     else process.env.ALLOW_WRITES = originalAllowWrites;
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
   });
 
   it("attached while the signal runs, removed after release, and the NOTICE listener with it", async () => {
@@ -492,15 +473,18 @@ describe("pg_kill's checkout carries an 'error' listener (stubbed connect, no li
 // The structural half of #57: acquireClient() is the only place a client may be
 // checked out, because it is the only place the 'error' listener is attached.
 // pg_kill was the one raw checkout, found by grep after the fact; this makes the
-// next one fail here instead. Comment lines are skipped -- several explain the
-// rule by naming the call.
+// next one fail here instead. It matches ANY `.connect(` call, not the literal
+// `getPool().connect(`: a checkout through an aliased pool (`const p =
+// getPool(); p.connect()`) or with `.connect(` wrapped onto the next line has
+// no listener either, and a literal match would not see it. Comment lines are
+// skipped -- several explain the rule by naming the call.
 //
 // Runs from dist/tools/, two levels below the repo root.
 describe("getPool().connect() appears only inside acquireClient", () => {
   it("no non-test source file checks a client out of the pool on its own", () => {
     const srcRoot = new URL("../../src/", import.meta.url);
     const offenders: string[] = [];
-    let inApi = 0;
+    const inApi: string[] = [];
     for (const entry of readdirSync(srcRoot, { recursive: true, encoding: "utf8" })) {
       const rel = entry.replaceAll("\\", "/");
       if (!rel.endsWith(".ts") || rel.endsWith(".test.ts") || rel.startsWith("integration/")) continue;
@@ -508,13 +492,20 @@ describe("getPool().connect() appears only inside acquireClient", () => {
       lines.forEach((line, i) => {
         const code = line.trim();
         if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) return;
-        if (!/\bgetPool\(\)\s*\.connect\(/.test(code)) return;
-        if (rel === "api.ts") inApi += 1;
+        if (!/\.connect\s*\(/.test(code)) return;
+        if (rel === "api.ts") inApi.push(code);
         else offenders.push(`${rel}:${i + 1}`);
       });
     }
     assert.deepEqual(offenders, [], "a raw pool checkout has no 'error' listener -- go through acquireClient()");
-    assert.equal(inApi, 1, "expected exactly one checkout in api.ts (acquireClient); the scan may be broken");
+    // api.ts holds exactly two: acquireClient's pool checkout, and
+    // terminateBackend's standalone pg.Client, which attaches its own 'error'
+    // listener before connecting.
+    assert.equal(inApi.length, 2, `expected acquireClient + terminateBackend in api.ts, got ${JSON.stringify(inApi)}`);
+    assert.ok(
+      inApi.some((c) => /\bgetPool\(\)\s*\.connect\(/.test(c)),
+      "acquireClient's getPool().connect() not found; the scan may be broken",
+    );
   });
 });
 
@@ -534,30 +525,21 @@ describe("pg_kill says what a permission denial and a `false` really are", () =>
 });
 
 describe("pg_kill fallback note (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
   const originalAllowWrites = process.env.ALLOW_WRITES;
-  const originalDbUrl = process.env.DATABASE_URL;
 
-  beforeEach(async () => {
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
+  useStubbedPool();
+
+  beforeEach(() => {
     process.env.ALLOW_WRITES = "1";
   });
 
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    await shutdown();
+  afterEach(() => {
     if (originalAllowWrites === undefined) delete process.env.ALLOW_WRITES;
     else process.env.ALLOW_WRITES = originalAllowWrites;
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
   });
 
   it("a `false` with no warning captured does not send the agent looking for a grant", async () => {
-    const fake = makeFakeClient({ rows: [{ signaled: false }] });
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(fake);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    installKillStub({ rows: [{ signaled: false }] });
     const res = (await pgKill.handler({ pid: 9999, mode: "cancel" })) as { ok: boolean; data: { note: string } };
     assert.equal(res.ok, true);
     assert.match(res.data.note, /found no backend with PID 9999/);
@@ -661,9 +643,6 @@ interface AdvisorResponse {
 }
 
 describe("pg_advisor wraparound_risk (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
   let seen: { sql: string; params: unknown[] }[] = [];
 
   /**
@@ -674,53 +653,27 @@ describe("pg_advisor wraparound_risk (stubbed connect, no live DB)", () => {
    */
   function installStub(versionNum: number | null, failing: AdvisorCategory[] = []) {
     seen = [];
-    pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
-      if (versionNum === null) return Promise.reject(new Error("version probe unavailable"));
-      const text = typeof sql === "string" ? sql : "";
-      return Promise.resolve({ rows: text.includes("server_version_num") ? [{ v: String(versionNum) }] : [] });
-    } as unknown as typeof pg.Pool.prototype.query;
+    stubPoolQuery(async (text) => {
+      if (versionNum === null) throw new Error("version probe unavailable");
+      return { rows: text.includes("server_version_num") ? [{ v: String(versionNum) }] : [] };
+    });
 
-    const client = {
-      async query(sql: string, params: unknown[] = []) {
-        seen.push({ sql, params });
-        if (failing.includes(categorize(sql))) throw new Error("permission denied");
-        return { rows: rowsFor(sql) };
-      },
-      release() {
-        /* no-op */
-      },
-      // acquireClient() attaches an 'error' listener for the checked-out lifetime.
-      on() {
-        return this;
-      },
-      removeListener() {
-        return this;
-      },
-    };
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(client);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    const client = stubClient(async (sql: string, params: unknown[] = []) => {
+      seen.push({ sql, params });
+      if (failing.includes(categorize(sql))) throw new Error("permission denied");
+      return { rows: rowsFor(sql) };
+    });
+    stubConnect(() => client);
   }
 
   function sqlFor(category: AdvisorCategory): string {
     return seen.find((q) => categorize(q.sql) === category)?.sql ?? "";
   }
 
-  beforeEach(async () => {
-    // shutdown() also clears the cached server_version_num, so each test's
-    // stubbed version is actually probed instead of reusing the previous
-    // test's value.
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  });
-
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  });
+  // The shutdown() on the way in also clears the cached server_version_num, so
+  // each test's stubbed version is actually probed instead of reusing the
+  // previous test's value.
+  useStubbedPool();
 
   it("PG18: names relallfrozen and returns the freeze-coverage keys", async () => {
     installStub(180_000);
@@ -853,7 +806,7 @@ describe("pg_advisor wraparound_risk (stubbed connect, no live DB)", () => {
     assert.equal(res.data.wraparound_risk.autovacuum_multixact_freeze_max_age, null);
   });
 
-  it("resolves the per-table multixact override before falling back to the GUC", async () => {
+  it("resolves the per-table multixact override alongside the GUC", async () => {
     installStub(180_000);
     await pgAdvisor.handler({});
     const sql = sqlFor("wrapTables");
@@ -862,6 +815,46 @@ describe("pg_advisor wraparound_risk (stubbed connect, no live DB)", () => {
     // force-vacuumed while it still reads as safe against the cluster default.
     assert.match(sql, /option_name = 'autovacuum_multixact_freeze_max_age'/);
     assert.match(sql, /current_setting\('autovacuum_multixact_freeze_max_age'\)/);
+  });
+
+  it("takes the LOWER of the per-table override and the GUC for both divisors", async () => {
+    installStub(180_000);
+    await pgAdvisor.handler({});
+    const sql = sqlFor("wrapTables");
+    // autovacuum computes Min(reloption, GUC): a per-table value RAISED above
+    // the cluster setting is ignored. COALESCE(reloption, GUC) let a table set
+    // to 2 billion divide its age by a limit autovacuum never uses, so at 95%
+    // of the real limit it reported 9.5% and fell below the threshold. LEAST
+    // skips a NULL (no reloption), which is the GUC fallback.
+    for (const guc of ["autovacuum_freeze_max_age", "autovacuum_multixact_freeze_max_age"]) {
+      assert.match(
+        sql,
+        new RegExp(
+          `LEAST\\(\\s*\\(SELECT o\\.option_value::int\\s+FROM pg_catalog\\.pg_options_to_table\\(c\\.reloptions\\) o\\s+` +
+            `WHERE o\\.option_name = '${guc}'\\),\\s*current_setting\\('${guc}'\\)::int\\s*\\)`,
+        ),
+        `${guc} should be capped at the GUC`,
+      );
+    }
+    assert.doesNotMatch(sql, /COALESCE\(/, "a bare COALESCE lets a raised override win");
+  });
+
+  it("the description and the field text no longer say a per-table override wins over the GUC", () => {
+    assert.doesNotMatch(pgAdvisor.description, /storage parameter wins/);
+    assert.match(pgAdvisor.description, /the LOWER of the\s+per-table/);
+    const described = JSON.stringify(z.toJSONSchema(pgAdvisor.outputSchema, { io: "output" }));
+    assert.doesNotMatch(described, /wins over the cluster GUC/);
+  });
+
+  it("tables_without_primary_key skips partitions; public_tables_without_rls does not", async () => {
+    installStub(180_000);
+    await pgAdvisor.handler({});
+    // One PK-less partitioned parent used to bring every partition with it,
+    // enough to fill `limit` alone and cut off every later table.
+    assert.match(sqlFor("noPk"), /AND NOT c\.relispartition/);
+    // RLS is per relation and is not inherited: a partition without it can be
+    // queried directly around the parent's policies, so it stays a finding.
+    assert.doesNotMatch(sqlFor("rls"), /relispartition/);
   });
 
   it("guards InvalidMultiXactId without dropping the row from the xid check", async () => {
@@ -936,6 +929,266 @@ describe("pg_advisor wraparound_risk (stubbed connect, no live DB)", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// pg_advisor sequence_exhaustion WITHOUT a live DB.
+//
+// Same stubbed pool/connect pattern as the wraparound suite above, but the
+// sequence rows are per-test: the statement returns its findings plus one
+// trailing `row_kind = 'skipped'` row carrying the count of sequences the
+// role cannot read, and that row is what these tests vary. Matching on
+// `pg_sequences` mirrors categorize() above.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("pg_advisor sequence_exhaustion (stubbed connect, no live DB)", () => {
+  let seen: string[] = [];
+
+  const finding = {
+    row_kind: "finding",
+    schema: "public",
+    sequence: "legacy_id_seq",
+    last_value: "1900000000",
+    max_value: "9223372036854775807",
+    increment_by: "1",
+    limit_value: "2147483647",
+    limited_by: "column",
+    owned_by: "public.legacy.id",
+    owned_by_type: "integer",
+    pct_used: 0.8848,
+    skipped_unreadable: null,
+  };
+  const skippedRow = (n: number) => ({
+    row_kind: "skipped",
+    schema: null,
+    sequence: null,
+    last_value: null,
+    max_value: null,
+    increment_by: null,
+    limit_value: null,
+    limited_by: null,
+    owned_by: null,
+    owned_by_type: null,
+    pct_used: null,
+    skipped_unreadable: n,
+  });
+
+  function installStub(sequenceRows: Record<string, unknown>[] | "fail") {
+    seen = [];
+    stubPoolQuery(async (text) => ({ rows: text.includes("server_version_num") ? [{ v: "180000" }] : [] }));
+    const client = stubClient(async (sql: string) => {
+      seen.push(sql);
+      if (!sql.includes("pg_sequences")) return { rows: [] };
+      if (sequenceRows === "fail") throw new Error("permission denied for view pg_sequences");
+      return { rows: sequenceRows };
+    });
+    stubConnect(() => client);
+  }
+
+  const sequenceSql = () => seen.find((s) => s.includes("pg_sequences")) ?? "";
+
+  useStubbedPool();
+
+  it("warns with the count of unreadable sequences even when nothing is flagged", async () => {
+    installStub([skippedRow(3)]);
+    const res = (await pgAdvisor.handler({})) as AdvisorResponse;
+    assert.equal(res.ok, true);
+    // The case the warning exists for: an empty list that would otherwise
+    // read as "every sequence is healthy" to a table-scoped role.
+    assert.deepEqual(res.data.sequence_exhaustion, []);
+    const warning = (res.data._warnings ?? []).find((w) => w.startsWith("sequence_exhaustion skipped"));
+    assert.ok(warning, `expected a skipped-sequence warning, got ${JSON.stringify(res.data._warnings)}`);
+    assert.match(warning, /skipped 3 sequence\(s\)/);
+    assert.match(warning, /SELECT or USAGE/);
+  });
+
+  it("emits no skipped warning at 0, and the summary row never leaks into the findings", async () => {
+    installStub([finding, skippedRow(0)]);
+    const res = (await pgAdvisor.handler({})) as AdvisorResponse;
+    assert.equal(res.data._warnings, undefined);
+    assert.equal(res.data.sequence_exhaustion.length, 1);
+    const row = res.data.sequence_exhaustion[0] ?? {};
+    assert.equal(row.sequence, "legacy_id_seq");
+    assert.equal(row.limited_by, "column");
+    assert.equal("row_kind" in row, false);
+    assert.equal("skipped_unreadable" in row, false);
+  });
+
+  it("the count rides in the same statement, so the fanout stays at six queries", async () => {
+    installStub([skippedRow(2)]);
+    await pgAdvisor.handler({});
+    assert.equal(seen.length, 6);
+    const sql = sequenceSql();
+    assert.match(sql, /has_sequence_privilege\(c\.oid, 'SELECT,USAGE'\)/);
+    // UNION ALL, not a filtered join: the summary row must exist when no
+    // finding does.
+    assert.match(sql, /UNION ALL\s+SELECT 'skipped'/);
+  });
+
+  it("a failed sequence fetch warns once and does not invent a skipped count", async () => {
+    installStub("fail");
+    const res = (await pgAdvisor.handler({})) as AdvisorResponse;
+    const warnings = res.data._warnings ?? [];
+    assert.equal(warnings.filter((w) => w.startsWith("sequence_exhaustion")).length, 1);
+    assert.match(warnings.join("\n"), /sequence_exhaustion fetch failed/);
+    assert.deepEqual(res.data.sequence_exhaustion, []);
+  });
+
+  it("measures a descending sequence against min_value instead of dropping it", async () => {
+    installStub([skippedRow(0)]);
+    await pgAdvisor.handler({});
+    const sql = sequenceSql();
+    // The old `max_value > 0` filter excluded every default descending
+    // sequence (max_value -1).
+    assert.doesNotMatch(sql, /max_value > 0/);
+    assert.match(sql, /CASE WHEN s\.increment_by > 0[\s\S]*ELSE GREATEST\(s\.min_value,/);
+    assert.match(sql, /sign\(limit_value\) = sign\(increment_by\)/);
+  });
+
+  it("narrows the bound to the owning column's type through pg_depend", async () => {
+    installStub([skippedRow(0)]);
+    await pgAdvisor.handler({});
+    const sql = sequenceSql();
+    assert.match(sql, /pg_catalog\.pg_depend d/);
+    assert.match(sql, /d\.deptype IN \('a', 'i'\)/);
+    assert.match(
+      sql,
+      /LEAST\(s\.max_value,\s+CASE o\.typ WHEN 'int2'::regtype THEN 32767 WHEN 'int4'::regtype THEN 2147483647 END\)/,
+    );
+    assert.match(sql, /'int4'::regtype THEN -2147483648/);
+    // A bigint sequence past its smallint column reads as a ratio in the
+    // hundreds of thousands; numeric(6, 4) would overflow and fail the category.
+    assert.doesNotMatch(sql, /numeric\(6, 4\)/);
+    assert.match(sql, /round\(last_value::numeric \/ limit_value::numeric, 4\)::float8 AS pct_used/);
+  });
+
+  it("the declared outputSchema accepts both the new row shape and a sequence no column owns", () => {
+    const schema = (pgAdvisor as unknown as { outputSchema: z.ZodTypeAny }).outputSchema;
+    const { row_kind: _k, skipped_unreadable: _s, ...owned } = finding;
+    const unowned = {
+      ...owned,
+      sequence: "countdown_seq",
+      last_value: "-900",
+      max_value: "-1",
+      increment_by: "-1",
+      limit_value: "-1000",
+      limited_by: "sequence",
+      owned_by: null,
+      owned_by_type: null,
+      pct_used: 0.9,
+    };
+    const parsed = schema.safeParse({
+      sequence_exhaustion: [
+        owned,
+        unowned,
+        { schema: "public", sequence: "s", last_value: "9", max_value: "10", pct_used: 0.9 },
+      ],
+      wraparound_risk: {
+        autovacuum_freeze_max_age: null,
+        autovacuum_multixact_freeze_max_age: null,
+        databases: [],
+        tables: [],
+      },
+      tables_without_primary_key: [],
+      public_tables_without_rls: [],
+    });
+    assert.equal(parsed.success, true, parsed.success ? "" : JSON.stringify(parsed.error.issues));
+    // Declared, not merely tolerated: an undeclared key is stripped on parse,
+    // so these would vanish from structuredContent if the schema lost them.
+    const rows = (parsed.data as { sequence_exhaustion: Record<string, unknown>[] }).sequence_exhaustion;
+    assert.equal(rows[0]?.limit_value, "2147483647");
+    assert.equal(rows[0]?.limited_by, "column");
+    assert.equal(rows[0]?.owned_by, "public.legacy.id");
+    assert.equal(rows[1]?.owned_by, null);
+    assert.equal(rows[1]?.increment_by, "-1");
+  });
+
+  it("the description names limit_value and the unreadable-sequence warning", () => {
+    assert.match(pgAdvisor.description, /`seqExhaustionThreshold` of `limit_value`/);
+    assert.match(pgAdvisor.description, /`min_value` when\s+descending/);
+    assert.match(pgAdvisor.description, /counted in `_warnings`/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// pg_replication_status against a role without pg_read_all_stats, WITHOUT a
+// live DB (and without a replica, which no test cluster here has).
+//
+// pg_stat_replication hides every walsender column but the pid from a role
+// that neither owns the walsender nor holds pg_read_all_stats, so `state` and
+// `sync_state` arrive as SQL NULL. The MCP SDK validates structuredContent
+// against outputSchema and fails the whole call on a mismatch (see
+// output.ts), so the assertion that matters is the schema parse: declared
+// non-null, one redacted row cost the caller the slots and the WAL position
+// too.
+// ─────────────────────────────────────────────────────────────────────────
+
+const pgReplicationStatus = adminTools.find((t) => t.name === "pg_replication_status")!;
+
+describe("pg_replication_status with a redacted replica row (stubbed connect, no live DB)", () => {
+  function installStub(replicas: Record<string, unknown>[]) {
+    const client = stubClient(async (sql: string) => {
+      if (sql.includes("pg_stat_replication")) return { rows: replicas };
+      if (sql.includes("pg_replication_slots")) return { rows: [] };
+      return { rows: [{ is_in_recovery: false, wal_position: "0/16B3748" }] };
+    });
+    stubConnect(() => client);
+  }
+
+  useStubbedPool();
+
+  // What the view returns to such a role: application_name comes from
+  // pg_stat_activity's side and stays visible, the rest is NULL.
+  const REDACTED = {
+    application_name: "walreceiver",
+    client_addr: null,
+    state: null,
+    sync_state: null,
+    write_lag_seconds: null,
+    flush_lag_seconds: null,
+    replay_lag_seconds: null,
+  };
+  const VISIBLE = { ...REDACTED, state: "streaming", sync_state: "async", write_lag_seconds: 0.01 };
+
+  it("a row with NULL state / sync_state passes the declared outputSchema", async () => {
+    installStub([REDACTED]);
+    const res = (await pgReplicationStatus.handler()) as { ok: boolean; data: Record<string, unknown> };
+    assert.equal(res.ok, true);
+    const parsed = pgReplicationStatus.outputSchema.safeParse(res.data);
+    assert.equal(parsed.success, true, `outputSchema rejected the response: ${JSON.stringify(parsed.error?.issues)}`);
+    // The readable parts survive alongside the redacted row.
+    assert.equal(res.data.wal_position, "0/16B3748");
+    assert.deepEqual(res.data.replicas, [REDACTED]);
+  });
+
+  it("says why the row is null instead of leaving it to read as 'nothing to report'", async () => {
+    installStub([REDACTED, VISIBLE]);
+    const res = (await pgReplicationStatus.handler()) as { ok: boolean; data: { _warnings?: string[] } };
+    assert.equal(res.data._warnings?.length, 1);
+    assert.match(res.data._warnings?.[0] ?? "", /^1 replica row\(s\) have null state .* lacks pg_read_all_stats$/);
+  });
+
+  it("emits no warning when every replica row is readable", async () => {
+    installStub([VISIBLE]);
+    const res = (await pgReplicationStatus.handler()) as { ok: boolean; data: Record<string, unknown> };
+    assert.equal(pgReplicationStatus.outputSchema.safeParse(res.data).success, true);
+    assert.equal("_warnings" in res.data, false);
+  });
+});
+
+// pg_table_privileges reads information_schema.table_privileges, which shows a
+// grant only to a role that IS the grantor or grantee (or for PUBLIC).
+// pg_read_all_data grants SELECT on tables and membership in nothing else, so
+// the description's old advice produced the same partial list while telling
+// the caller it was complete -- in a tool meant for access audits.
+describe("pg_table_privileges visibility caveat", () => {
+  it("the description does not offer pg_read_all_data as a way to a complete picture", () => {
+    const { description } = adminTools.find((t) => t.name === "pg_table_privileges")!;
+    assert.doesNotMatch(description, /superuser or a member of\s+`pg_read_all_data`/);
+    assert.match(description, /run as a superuser/);
+    assert.match(description, /`pg_read_all_data` does NOT widen this view/);
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 // pg_table_bloat PG19 stats_reset gate WITHOUT a live DB.
 //
@@ -990,8 +1243,6 @@ function bloatRowsFor(sql: string): Record<string, unknown>[] {
 }
 
 describe("pg_table_bloat stats_reset gate (stubbed pool, no live DB)", () => {
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
   let seen: string[] = [];
 
   /**
@@ -1000,35 +1251,24 @@ describe("pg_table_bloat stats_reset gate (stubbed pool, no live DB)", () => {
    */
   function installStub(versionNum: number | null) {
     seen = [];
-    pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
-      const text = typeof sql === "string" ? sql : "";
+    stubPoolQuery(async (text) => {
       seen.push(text);
       if (categorizeBloat(text) === "version") {
-        return versionNum === null
-          ? Promise.reject(new Error("version probe unavailable"))
-          : Promise.resolve({ rows: [{ v: String(versionNum) }] });
+        if (versionNum === null) throw new Error("version probe unavailable");
+        return { rows: [{ v: String(versionNum) }] };
       }
-      return Promise.resolve({ rows: bloatRowsFor(text) });
-    } as unknown as typeof pg.Pool.prototype.query;
+      return { rows: bloatRowsFor(text) };
+    });
   }
 
   function sqlFor(category: BloatCategory): string {
     return seen.find((sql) => categorizeBloat(sql) === category) ?? "";
   }
 
-  beforeEach(async () => {
-    // shutdown() clears the cached server_version_num, so each case's stubbed
-    // version is actually probed instead of reusing the previous case's.
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  });
-
-  afterEach(async () => {
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  });
+  // The shutdown() on the way in clears the cached server_version_num, so each
+  // case's stubbed version is actually probed instead of reusing the previous
+  // case's.
+  useStubbedPool();
 
   it("PG19: names stats_reset and returns it on the row", async () => {
     installStub(190_000);
@@ -1065,6 +1305,17 @@ describe("pg_table_bloat stats_reset gate (stubbed pool, no live DB)", () => {
     assert.equal(res.ok, true);
     assert.equal(sqlFor("estimate").includes("stats_reset"), false);
     assert.equal(res.data?.length, 1);
+  });
+
+  it("both query shapes guard the filter's division with NULLIF", async () => {
+    // The `> 0` qual beside it is not a guarantee: postgres does not promise
+    // to evaluate AND-ed quals in written order.
+    installStub(180_000);
+    await pgTableBloat.handler({});
+    assert.match(sqlFor("estimate"), /n_dead_tup::float8 \/ NULLIF\(n_live_tup \+ n_dead_tup, 0\)\) >= \$1/);
+    installStub(180_000);
+    await pgTableBloat.handler({ method: "exact" });
+    assert.match(sqlFor("pgstattuple"), /NULLIF\(p\.tuple_count \+ p\.dead_tuple_count, 0\)\) >= \$1/);
   });
 
   it("the pgstattuple methods return the same row shape as estimate on the same server", async () => {

@@ -22,8 +22,11 @@ import {
   FIXTURE_WRAPAROUND_FREEZE_MAX_AGE,
   FIXTURE_WRAPAROUND_MULTIXACT_FREEZE_MAX_AGE,
   FIXTURE_WRAPAROUND_OVERRIDE_TABLE,
+  FIXTURE_WRAPAROUND_RAISED_MAX_AGE,
+  FIXTURE_WRAPAROUND_RAISED_TABLE,
   fdwFixtureAvailable,
   integrationEnabled,
+  probeServerVersionNum,
   setupFixtures,
   teardownFixtures,
 } from "./fixtures.js";
@@ -37,21 +40,6 @@ const replicationStatus = adminTools.find((t) => t.name === "pg_replication_stat
 const pgKill = adminTools.find((t) => t.name === "pg_kill")!;
 const seqScanTables = statsTools.find((t) => t.name === "pg_seq_scan_tables")!;
 const unusedIndexes = statsTools.find((t) => t.name === "pg_unused_indexes")!;
-
-// Server-version capability probe for the PG16-gated last_*_scan columns.
-// Asks the server directly rather than importing the handler's own
-// getServerVersionNum(), for the same reason the pgstattuple check in
-// pg_table_bloat re-queries pg_extension instead of trusting the tool: a
-// regression in the probe the handler uses to gate those columns must not
-// also move the test's expectation. Returns 0 when the probe itself fails,
-// which callers treat as "cannot tell" and skip -- matching this file's habit
-// of skipping rather than failing when a capability can't be established.
-async function probeServerVersionNum(): Promise<number> {
-  const res = await runInternal<{ v: string }>("SELECT current_setting('server_version_num') AS v");
-  if (!res.ok || !res.data?.length) return 0;
-  const parsed = Number.parseInt(res.data[0].v, 10);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
 
 // pg_seq_scan_tables and pg_unused_indexes return the same stats-window
 // envelope, so the window assertions live here instead of being duplicated in
@@ -147,12 +135,19 @@ type AdvisorResult = {
   error?: string;
 };
 
-// pct_of_* ship as numeric(10, 4) while the WHERE clause and the triggered_by
-// CASE both compare the UNROUNDED ratio, so a reported value can legitimately
-// sit up to half a ten-thousandth on the wrong side of the threshold. Exactly
-// that much slack and no more -- anything wider stops catching a genuinely
-// mislabelled row.
+// pct_of_* ship as numeric(10, 4), so a reported value sits up to half a
+// ten-thousandth from the ratio it rounds. Used only where a test recomputes
+// a pct_* column from the row's own age and divisor. NOT usable against the
+// wraparound threshold: the tests derive that threshold from a just-created
+// table's ratio (~1e-6), far below this slack, so a slack-tolerant threshold
+// comparison would accept every row -- see assertTriggeredByConsistent.
 const WRAPAROUND_PCT_SLACK = 5e-5;
+
+// Relative tolerance for comparing a ratio recomputed in JS (float8) against
+// the threshold the server compared in numeric. Both divide the same two
+// integers, so they agree to ~1e-16; this only absorbs that last-bit
+// difference at exact equality.
+const WRAPAROUND_RATIO_EPSILON = 1e-12;
 
 /**
  * Ratio the wraparound control table currently sits at: age(relfrozenxid) over
@@ -163,7 +158,7 @@ const WRAPAROUND_PCT_SLACK = 5e-5;
  * probe and the handler call, so the margin cannot close underneath them.
  *
  * Returns 0 when the probe fails or the table is missing; callers treat that as
- * "cannot tell" and skip, matching probeServerVersionNum above.
+ * "cannot tell" and skip.
  */
 async function probeControlXidRatio(): Promise<number> {
   const res = await runInternal<{ ratio: string | null }>(
@@ -183,29 +178,40 @@ async function probeControlXidRatio(): Promise<number> {
  * operator whether to chase a freeze VACUUM or the lock-heavy workload burning
  * multixact members, and the unit tests only ever see the literal a stubbed
  * client handed back -- the CASE has never been evaluated by a server.
+ *
+ * The ratios are recomputed UNROUNDED from the row's own ages and the divisors
+ * it was measured against (`limits`), because the rounded pct_* columns are
+ * useless at the thresholds these tests use: a ratio of ~1e-6 rounds to 0.0000,
+ * which cannot be told apart from a side that never cleared anything.
  */
-function assertTriggeredByConsistent(row: WraparoundRatios, threshold: number, label: string): void {
+function assertTriggeredByConsistent(
+  row: WraparoundRatios,
+  limits: { freeze_max_age: number; multixact_freeze_max_age: number },
+  threshold: number,
+  label: string,
+): void {
   assert.ok(
     ["xid", "multixact", "both"].includes(row.triggered_by),
     `${label}: triggered_by must be xid | multixact | both, got ${JSON.stringify(row.triggered_by)}`,
   );
-  const xid = row.pct_of_freeze_max_age;
-  const mxid = row.pct_of_multixact_freeze_max_age;
+  const xid = row.xid_age / limits.freeze_max_age;
+  const mxid = row.mxid_age === null ? null : row.mxid_age / limits.multixact_freeze_max_age;
+  const clears = (ratio: number | null) => ratio !== null && ratio >= threshold * (1 - WRAPAROUND_RATIO_EPSILON);
   // 'xid' is the CASE's ELSE arm, reached only when the multixact side did not
   // clear the threshold -- which the WHERE's OR then makes an assertion that
   // the xid side did.
   if (row.triggered_by !== "multixact") {
     assert.ok(
-      xid !== null && xid + WRAPAROUND_PCT_SLACK >= threshold,
+      clears(xid),
       `${label}: triggered_by=${row.triggered_by} claims the xid side cleared threshold=${threshold}, but ` +
-        `pct_of_freeze_max_age=${xid}`,
+        `xid_age ${row.xid_age} / ${limits.freeze_max_age} = ${xid}`,
     );
   }
   if (row.triggered_by !== "xid") {
     assert.ok(
-      mxid !== null && mxid + WRAPAROUND_PCT_SLACK >= threshold,
+      clears(mxid),
       `${label}: triggered_by=${row.triggered_by} claims the multixact side cleared threshold=${threshold}, but ` +
-        `pct_of_multixact_freeze_max_age=${mxid}`,
+        `mxid_age ${row.mxid_age} / ${limits.multixact_freeze_max_age} = ${mxid}`,
     );
   }
   if (row.triggered_by === "multixact") {
@@ -214,9 +220,9 @@ function assertTriggeredByConsistent(row: WraparoundRatios, threshold: number, l
     // sends the operator after a locking workload while the xid horizon is the
     // thing about to stop writes.
     assert.ok(
-      xid === null || xid - WRAPAROUND_PCT_SLACK < threshold,
-      `${label}: triggered_by=multixact but pct_of_freeze_max_age=${xid} also clears threshold=${threshold}; ` +
-        `that row should be labelled 'both'`,
+      xid < threshold * (1 + WRAPAROUND_RATIO_EPSILON),
+      `${label}: triggered_by=multixact but xid_age ${row.xid_age} / ${limits.freeze_max_age} = ${xid} also ` +
+        `clears threshold=${threshold}; that row should be labelled 'both'`,
     );
   }
   if (row.mxid_age === null) {
@@ -230,6 +236,42 @@ function assertTriggeredByConsistent(row: WraparoundRatios, threshold: number, l
       `${label}: mxid_age is null (no multixact horizon) so triggered_by must be 'xid', got ${row.triggered_by}`,
     );
   }
+}
+
+/**
+ * Poll pg_blocking_pids() until postgres actually registers the waiter's wait.
+ * Beats a hardcoded sleep, which can be too short on a slow host (waiter not
+ * yet queued) or too long on a fast one. Shared by the pg_inspect_locks
+ * contention cases.
+ */
+async function waitUntilBlocked(waiterPid: number): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const probe = (await runInternal<{ blockers: number[] }>("SELECT pg_blocking_pids($1)::int[] AS blockers", [
+      waiterPid,
+    ])) as { ok: boolean; data?: { blockers: number[] }[] };
+    if (probe.ok && (probe.data?.[0]?.blockers ?? []).length > 0) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.fail(`waiter pid ${waiterPid} never appeared in pg_blocking_pids within 5s`);
+}
+
+/**
+ * Cleanup for a holder/waiter contention pair. Order matters: close the holder
+ * first (which releases the lock if an assertion threw before the explicit
+ * ROLLBACK), then await the waiter (which can now make progress), then close
+ * the waiter. This keeps the floating waiterPromise from outliving the test on
+ * assertion-failure paths. Every step is best-effort.
+ */
+async function endContention(
+  holder: pg.Client,
+  waiter: pg.Client,
+  waiterPromise: Promise<unknown> | undefined,
+): Promise<void> {
+  await holder.end().catch(() => {});
+  // May reject if waiter.end() raced ahead -- benign.
+  if (waiterPromise) await waiterPromise.catch(() => {});
+  await waiter.end().catch(() => {});
 }
 
 // One setup/teardown for the whole file - every describe below shares the
@@ -281,22 +323,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         // relation lock, so bl.relation in the handler's CASE is non-null.
         waiterPromise = waiter.query(`SELECT 1 FROM ${FIXTURE_SCHEMA}.users LIMIT 1`).catch((e: unknown) => e);
 
-        // Poll pg_blocking_pids() until postgres actually registers the
-        // wait. Beats a hardcoded sleep, which can be too short on a slow
-        // CI host (waiter not yet queued) or too long on a fast one.
-        const deadline = Date.now() + 5000;
-        let registered = false;
-        while (Date.now() < deadline) {
-          const probe = (await runInternal<{ blockers: number[] }>("SELECT pg_blocking_pids($1)::int[] AS blockers", [
-            waiterPid,
-          ])) as { ok: boolean; data?: { blockers: number[] }[] };
-          if (probe.ok && (probe.data?.[0]?.blockers ?? []).length > 0) {
-            registered = true;
-            break;
-          }
-          await new Promise((r) => setTimeout(r, 50));
-        }
-        assert.ok(registered, `waiter pid ${waiterPid} never appeared in pg_blocking_pids within 5s`);
+        await waitUntilBlocked(waiterPid);
 
         const res = (await inspectLocks.handler({ limit: 50 })) as {
           ok: boolean;
@@ -323,28 +350,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         // Release the holder so the waiter completes.
         await holder.query("ROLLBACK");
       } finally {
-        // Order matters: close the holder first (which releases the lock if
-        // an assertion threw before the explicit ROLLBACK), then await the
-        // waiter (which can now make progress), then close the waiter. This
-        // keeps the floating waiterPromise from outliving the test on
-        // assertion-failure paths.
-        try {
-          await holder.end();
-        } catch {
-          // Best-effort.
-        }
-        if (waiterPromise) {
-          try {
-            await waiterPromise;
-          } catch {
-            // May reject if waiter.end() raced ahead -- benign.
-          }
-        }
-        try {
-          await waiter.end();
-        } catch {
-          // Best-effort.
-        }
+        await endContention(holder, waiter, waiterPromise);
       }
     });
 
@@ -375,19 +381,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
           .query(`UPDATE ${FIXTURE_SCHEMA}.users SET email = email WHERE id = 1`)
           .catch((e: unknown) => e);
 
-        const deadline = Date.now() + 5000;
-        let registered = false;
-        while (Date.now() < deadline) {
-          const probe = (await runInternal<{ blockers: number[] }>("SELECT pg_blocking_pids($1)::int[] AS blockers", [
-            waiterPid,
-          ])) as { ok: boolean; data?: { blockers: number[] }[] };
-          if (probe.ok && (probe.data?.[0]?.blockers ?? []).length > 0) {
-            registered = true;
-            break;
-          }
-          await new Promise((r) => setTimeout(r, 50));
-        }
-        assert.ok(registered, `waiter pid ${waiterPid} never appeared in pg_blocking_pids within 5s`);
+        await waitUntilBlocked(waiterPid);
 
         const res = (await inspectLocks.handler({ limit: 50 })) as {
           ok: boolean;
@@ -417,23 +411,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
         await holder.query("ROLLBACK");
       } finally {
-        try {
-          await holder.end();
-        } catch {
-          // Best-effort.
-        }
-        if (waiterPromise) {
-          try {
-            await waiterPromise;
-          } catch {
-            // May reject if waiter.end() raced ahead -- benign.
-          }
-        }
-        try {
-          await waiter.end();
-        } catch {
-          // Best-effort.
-        }
+        await endContention(holder, waiter, waiterPromise);
       }
     });
 
@@ -456,9 +434,9 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // the assertions below.
     //
     // Locking a shared catalog needs owner/superuser rights. That is not
-    // treated as a capability skip: setupFixtures already requires CREATE ROLE
-    // and CREATE DATABASE, so a failure here is an environment problem worth
-    // failing loudly on rather than a reason to silently not run.
+    // treated as a capability skip: setupFixtures already requires CREATE ROLE,
+    // so a failure here is an environment problem worth failing loudly on
+    // rather than a reason to silently not run.
     it("resolves a shared-catalog lock (pg_locks.database = 0) to its pg_catalog name", async () => {
       const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
       const waiter = new pg.Client({ connectionString: process.env.DATABASE_URL });
@@ -477,19 +455,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         await waiter.query("BEGIN");
         waiterPromise = waiter.query("LOCK TABLE pg_catalog.pg_authid IN EXCLUSIVE MODE").catch((e: unknown) => e);
 
-        const deadline = Date.now() + 5000;
-        let registered = false;
-        while (Date.now() < deadline) {
-          const probe = (await runInternal<{ blockers: number[] }>("SELECT pg_blocking_pids($1)::int[] AS blockers", [
-            waiterPid,
-          ])) as { ok: boolean; data?: { blockers: number[] }[] };
-          if (probe.ok && (probe.data?.[0]?.blockers ?? []).length > 0) {
-            registered = true;
-            break;
-          }
-          await new Promise((r) => setTimeout(r, 50));
-        }
-        assert.ok(registered, `waiter pid ${waiterPid} never appeared in pg_blocking_pids within 5s`);
+        await waitUntilBlocked(waiterPid);
 
         // The distinction, made explicit against the REAL lock row: the same
         // pg_locks entry evaluated by the shipped predicate and by the
@@ -581,25 +547,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
         await holder.query("ROLLBACK");
       } finally {
-        // Same ordering as the two contention cases above: release the holder
-        // first, then let the waiter finish, then close it.
-        try {
-          await holder.end();
-        } catch {
-          // Best-effort.
-        }
-        if (waiterPromise) {
-          try {
-            await waiterPromise;
-          } catch {
-            // May reject if waiter.end() raced ahead -- benign.
-          }
-        }
-        try {
-          await waiter.end();
-        } catch {
-          // Best-effort.
-        }
+        await endContention(holder, waiter, waiterPromise);
       }
     });
   });
@@ -630,11 +578,6 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       );
     });
 
-    // 0.3.1 fixed member_of from raw postgres-text-array form (`{a,b}`) to
-    // a real JS string[] via the `::text[]` cast in admin.ts. Without an
-    // actual membership in the cluster, member_of stays `[]` for every row
-    // and the cast is never exercised -- a regression that drops the cast
-    // would silently re-introduce stringly-typed arrays in tool responses.
     // The handler returns superuser/createdb/createrole/replication/bypass_rls
     // as booleans alongside name and member_of, but the existing tests only
     // assert on name + member_of + can_login. A regression that drops an AS
@@ -676,6 +619,11 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.equal(member.replication, false);
     });
 
+    // 0.3.1 fixed member_of from raw postgres-text-array form (`{a,b}`) to
+    // a real JS string[] via the `::text[]` cast in admin.ts. Without an
+    // actual membership in the cluster, member_of stays `[]` for every row
+    // and the cast is never exercised -- a regression that drops the cast
+    // would silently re-introduce stringly-typed arrays in tool responses.
     it("returns member_of as a real JS string[] when role memberships exist", async () => {
       const res = (await listRoles.handler({ includeSystem: false })) as {
         ok: boolean;
@@ -728,8 +676,6 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
 
   describe("pg_seq_scan_tables", () => {
     it("returns an array of table stats", async () => {
-      // Trigger some stats by querying the users table.
-      await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 20 });
       const res = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 20 })) as {
         ok: boolean;
         data?: {
@@ -769,11 +715,13 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       };
       assert.equal(baseline.ok, true);
       const empty = (baseline.data?.rows ?? []).filter((r) => Number(r.live_tuples) === 0);
-      // If the cluster happens to have no zero-tuple tables in the fixture
-      // schema, the test is vacuous -- threshold-filtering has nothing to
-      // bite on. The fixture's no_pk_table / no_pk_partitioned / matview /
-      // products usually satisfy this.
-      if (empty.length === 0) return;
+      // no_pk_table is never populated and was ANALYZEd above, so a zero-tuple
+      // row is guaranteed. Asserted rather than assumed: without one the
+      // threshold has nothing to bite on and the loop below checks nothing.
+      assert.ok(
+        empty.some((r) => r.table === "no_pk_table"),
+        `expected no_pk_table at live_tuples=0 in the baseline, got ${JSON.stringify(baseline.data?.rows)}`,
+      );
 
       const filtered = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 1, limit: 100 })) as {
         ok: boolean;
@@ -791,6 +739,13 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
           `${b.table} (live_tuples=0) should be excluded at minSize=1`,
         );
       }
+      // The surviving side: `users` holds 3 rows and was ANALYZEd above, so it
+      // clears minSize=1. Without this a predicate that filtered EVERYTHING
+      // out would pass the exclusion loop just as well.
+      assert.ok(
+        (filtered.data?.rows ?? []).some((f) => f.table === "users"),
+        `users (3 rows) should survive minSize=1, got ${JSON.stringify(filtered.data?.rows)}`,
+      );
     });
 
     // Locks the CASE WHEN COALESCE(idx_scan,0)=0 THEN NULL guard. Without
@@ -872,7 +827,6 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // pgstattuple check in pg_table_bloat below.
     it("carries last_seq_scan / last_idx_scan on PG16+ and omits the keys below 16", async () => {
       const version = await probeServerVersionNum();
-      if (version === 0) return; // version undeterminable -- nothing to gate on
 
       const res = (await seqScanTables.handler({ schema: FIXTURE_SCHEMA, minSize: 0, limit: 20 })) as {
         ok: boolean;
@@ -1093,6 +1047,13 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         !noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "events_2026"),
         `events_2026 inherits a PK from events; should not appear, got ${JSON.stringify(noPk)}`,
       );
+      // no_pk_partitioned_2026 is a partition of the PK-less parent, so it has
+      // no PK either -- but the parent row is the finding. Listed per
+      // partition, one parent with 60 daily partitions filled `limit` alone.
+      assert.ok(
+        !noPk.some((r) => r.schema === FIXTURE_SCHEMA && r.table === "no_pk_partitioned_2026"),
+        `no_pk_partitioned_2026 is reported through its parent; should not appear, got ${JSON.stringify(noPk)}`,
+      );
       assert.ok(Array.isArray(res.data?.sequence_exhaustion));
       assert.ok(Array.isArray(res.data?.public_tables_without_rls));
 
@@ -1183,6 +1144,13 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
         tables.has("no_pk_partitioned") || tables.has("events"),
         `expected at least one partitioned parent (no_pk_partitioned or events) in public_tables_without_rls, got ${JSON.stringify([...tables])}`,
       );
+      // Unlike tables_without_primary_key, partitions stay in this list: RLS is
+      // per relation and not inherited, so a partition without it can be
+      // queried directly around the parent's policies.
+      assert.ok(
+        tables.has("no_pk_partitioned_2026"),
+        `expected the partition no_pk_partitioned_2026 in public_tables_without_rls, got ${JSON.stringify([...tables])}`,
+      );
     });
 
     // The load-bearing assertion for everything else in this describe.
@@ -1269,14 +1237,25 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.ok(databases.length > 0, `expected wraparound databases at threshold=${threshold}, got none`);
 
       for (const row of tables) {
-        assertTriggeredByConsistent(row, threshold, `tables/${row.schema}.${row.table}`);
+        // A table row carries its own EFFECTIVE divisors.
+        assertTriggeredByConsistent(row, row, threshold, `tables/${row.schema}.${row.table}`);
       }
+      // A database row is measured against the two GUCs.
+      const wrap = res.data?.wraparound_risk;
+      const gucs = {
+        freeze_max_age: wrap?.autovacuum_freeze_max_age ?? 0,
+        multixact_freeze_max_age: wrap?.autovacuum_multixact_freeze_max_age ?? 0,
+      };
+      assert.ok(
+        gucs.freeze_max_age > 0 && gucs.multixact_freeze_max_age > 0,
+        `expected both GUC divisors, got ${JSON.stringify(gucs)}`,
+      );
       for (const row of databases) {
-        assertTriggeredByConsistent(row, threshold, `databases/${row.database}`);
+        assertTriggeredByConsistent(row, gucs, threshold, `databases/${row.database}`);
       }
     });
 
-    // The per-table storage-parameter branch of the freeze_max_age COALESCE.
+    // The per-table storage-parameter branch of the freeze_max_age LEAST.
     // Only the GUC fallback was provable before, and the untested branch fails
     // in the dangerous direction: a table with a LOWERED override reads as safe
     // -- its age measured against 200000000 instead of 100000 -- while
@@ -1311,12 +1290,12 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       assert.equal(
         override.freeze_max_age,
         FIXTURE_WRAPAROUND_FREEZE_MAX_AGE,
-        `the reloption must win over the GUC, got ${override.freeze_max_age}`,
+        `a reloption LOWER than the GUC must win, got ${override.freeze_max_age}`,
       );
       assert.equal(
         override.multixact_freeze_max_age,
         FIXTURE_WRAPAROUND_MULTIXACT_FREEZE_MAX_AGE,
-        `the multixact reloption must win over the GUC, got ${override.multixact_freeze_max_age}`,
+        `a multixact reloption LOWER than the GUC must win, got ${override.multixact_freeze_max_age}`,
       );
       // The reported field could be right while the ratio was still divided by
       // the GUC -- the two come from different expressions. Recomputing the
@@ -1335,7 +1314,7 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       // The control shares the GUC divisor with every catalog relation, so it
       // sits at the bottom of the ordering: on a cluster carrying more frozen
       // relations than `limit` it legitimately falls off the end. That is the
-      // LIMIT working, not a broken COALESCE -- but an untruncated result that
+      // LIMIT working, not a broken LEAST -- but an untruncated result that
       // is missing it is a real failure.
       if (!control) {
         assert.ok(
@@ -1371,6 +1350,55 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       );
     });
 
+    // The other direction: autovacuum computes Min(reloption, GUC), so a
+    // per-table value RAISED above the GUC is ignored and the table is
+    // force-vacuumed at the cluster limit. A resolver that let the reloption win
+    // divided this table's age by 2 billion -- 10x below the control's ratio,
+    // so under the threshold here, exactly as a table about to be
+    // force-vacuumed dropped out of the real report.
+    it("ignores a per-table freeze-max-age override RAISED above the GUC, as autovacuum does", async () => {
+      const controlRatio = await probeControlXidRatio();
+      if (controlRatio === 0) return; // no live ratio to derive a threshold from -- nothing to gate on
+
+      const threshold = controlRatio / 2;
+      const limit = 500;
+      const res = (await advisor.handler({
+        seqExhaustionThreshold: 0.99,
+        wraparoundThreshold: threshold,
+        rlsSchemas: ["public"],
+        limit,
+      })) as AdvisorResult;
+      assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+      const wrap = res.data?.wraparound_risk;
+      assert.ok(wrap, `expected a wraparound_risk envelope, got ${JSON.stringify(res.data)}`);
+
+      const raised = wrap.tables.find(
+        (r) => r.schema === FIXTURE_SCHEMA && r.table === FIXTURE_WRAPAROUND_RAISED_TABLE,
+      );
+      // Created right after the control, so it shares the control's place at
+      // the bottom of the ordering and can fall off a truncated result the
+      // same way (see the control-table note above).
+      if (!raised) {
+        assert.ok(
+          wrap.tables.length >= limit,
+          `${FIXTURE_WRAPAROUND_RAISED_TABLE} (reloption ${FIXTURE_WRAPAROUND_RAISED_MAX_AGE}) missing from an ` +
+            `untruncated result of ${wrap.tables.length} rows at threshold=${threshold}: its age was divided by the ` +
+            `raised reloption instead of the GUC`,
+        );
+        return;
+      }
+      assert.equal(
+        raised.freeze_max_age,
+        wrap.autovacuum_freeze_max_age,
+        `a reloption above the GUC must resolve to the GUC, got ${raised.freeze_max_age}`,
+      );
+      assert.equal(
+        raised.multixact_freeze_max_age,
+        wrap.autovacuum_multixact_freeze_max_age,
+        `a multixact reloption above the GUC must resolve to the GUC, got ${raised.multixact_freeze_max_age}`,
+      );
+    });
+
     // The PG18 relallfrozen branch is otherwise proven only by a string match on
     // the generated SQL. A wrong column name there is a 42703 that takes the
     // ENTIRE tables sub-query down -- on the newest major only, and silently:
@@ -1379,7 +1407,6 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // what breaks first.
     it("carries the relallfrozen freeze-coverage keys on PG18+ and omits them below 18", async () => {
       const version = await probeServerVersionNum();
-      if (version === 0) return; // version undeterminable -- nothing to gate on
       const controlRatio = await probeControlXidRatio();
       if (controlRatio === 0) return; // no live ratio to derive a threshold from -- nothing to gate on
 
@@ -1591,8 +1618,6 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       };
       assert.equal(res.ok, true);
       assert.ok(Array.isArray(res.data?.rows));
-      // posts_user_id_idx is a non-unique, non-primary index - should be eligible
-      // to appear at some maxScans threshold.
     });
 
     // Locks the `AND NOT i.indisunique AND NOT i.indisprimary` filter that
@@ -1611,6 +1636,15 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       };
       assert.equal(res.ok, true);
       const indexes = (res.data?.rows ?? []).map((r) => r.index);
+      // The positive half, first: posts_user_id_idx is the fixture's one
+      // non-unique, non-PK index and sits far under a 1,000,000 scan ceiling.
+      // Without it every check below passes on an EMPTY result -- a broken
+      // schema filter or a join that drops every row would read as "no
+      // constraint index was recommended".
+      assert.ok(
+        indexes.includes("posts_user_id_idx"),
+        `expected posts_user_id_idx in pg_unused_indexes, got ${JSON.stringify(indexes)}`,
+      );
       // users.email is `UNIQUE` -> implicit unique index. Must not appear.
       assert.ok(
         !indexes.some((i) => i.includes("users_email")),
@@ -1704,7 +1738,6 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // pg_seq_scan_tables gate above.
     it("carries last_idx_scan on PG16+ and omits the key below 16", async () => {
       const version = await probeServerVersionNum();
-      if (version === 0) return; // version undeterminable -- nothing to gate on
 
       const res = (await unusedIndexes.handler({ schema: FIXTURE_SCHEMA, maxScans: 1_000_000, limit: 200 })) as {
         ok: boolean;
@@ -1717,9 +1750,10 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
       };
       assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
       const rows = res.data?.rows ?? [];
-      // The fixture's non-unique, non-PK indexes normally land here at a
-      // 1,000,000 scan ceiling; an empty list leaves nothing to inspect.
-      if (rows.length === 0) return;
+      // posts_user_id_idx always lands here at a 1,000,000 scan ceiling (see
+      // the constraint-index test above); an empty list would leave the loop
+      // below with nothing to inspect.
+      assert.ok(rows.length > 0, "expected at least posts_user_id_idx to inspect");
 
       for (const row of rows) {
         const keys = Object.keys(row).join(", ");
@@ -1744,8 +1778,8 @@ describe("integration: admin + stats tools", { skip: !integrationEnabled() }, ()
     // on a slow / loaded CI host (the sleep hasn't started, so the cancel fires
     // against an idle backend and pg_cancel_backend returns true with nothing
     // in flight) and needlessly long on a fast one. Mirrors the pg_blocking_pids
-    // poll the lock tests use (~77-92) and the file's note there about
-    // hardcoded sleeps. Bounded by a 5s deadline; proceeds anyway on timeout so
+    // poll in the pg_inspect_locks tests and their note about hardcoded
+    // sleeps. Bounded by a 5s deadline; proceeds anyway on timeout so
     // a missed activation surfaces as the downstream assertion rather than a
     // hang.
     async function waitForActiveSleep(pid: number): Promise<void> {

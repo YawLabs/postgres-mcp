@@ -95,10 +95,10 @@ describe("paramsArray nesting-depth cap", () => {
     assert.doesNotThrow(() => paramsArray.parse([nest("mix", MAX_PARAM_DEPTH)]));
   });
 
-  // The reason this test exists: previously `paramValue` was unbounded
-  // recursion through z.lazy. A pathologically nested request would
-  // either OOM the parse or surface a `Maximum call stack size exceeded`
-  // RangeError. The refine returns a clear validation error instead.
+  // What the refine buys is the cap itself: a value nested past it is
+  // refused with a message that says why. It does not bound Zod's own
+  // recursion through z.lazy, which runs BEFORE the refine -- see the note on
+  // paramsArray for the measured depths.
   it("rejects nesting one level past the cap", () => {
     assert.throws(() => paramsArray.parse([nest("array", MAX_PARAM_DEPTH + 1)]), /maximum nesting depth/i);
   });

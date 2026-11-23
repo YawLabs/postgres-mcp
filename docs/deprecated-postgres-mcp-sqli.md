@@ -1,6 +1,6 @@
 # The Postgres MCP everyone's still using has a known SQLi
 
-In May 2025, Anthropic archived `@modelcontextprotocol/server-postgres`. In July, they marked it deprecated on npm. They haven't shipped a replacement. A year later, the deprecated package is still pulling roughly 500,000 downloads per month - a lot of agents pointed at code that's known-broken and isn't going to get fixed.
+In May 2025, Anthropic archived `@modelcontextprotocol/server-postgres`. In July, they marked it deprecated on npm. They haven't shipped a replacement. A year later, the deprecated package is still pulling more than 100,000 downloads per week (npm download counts, November 2026) - a lot of agents pointed at code that's known-broken and isn't going to get fixed.
 
 The break in question is a stacked-query SQL injection. Datadog Security Labs published [the case study](https://securitylabs.datadoghq.com/articles/mcp-vulnerability-case-study-SQL-injection-in-the-postgresql-mcp-server/) in 2025. The reference server's defense was a `BEGIN READ ONLY` transaction wrapper around user SQL. The defense doesn't work, because the simple query protocol the server uses accepts multi-statement strings. A payload like:
 
@@ -33,7 +33,7 @@ await client.query({
 });
 ```
 
-`queryMode: 'extended'` forces the extended protocol even when `params` is an empty array. (In pg versions before 8.14, the driver would silently fall back to the simple protocol on empty `values`, defeating the guard - the project pins `pg ^8.14.0` for exactly this reason.)
+`queryMode: 'extended'` forces the extended protocol even when `params` is an empty array. (In pg versions before 8.14, the driver would silently fall back to the simple protocol on empty `values`, defeating the guard - the project has required `pg` 8.14 or newer ever since, for exactly this reason, and currently builds against `^8.23.0`.)
 
 The regression test asserts both halves: the payload is rejected, and the schema survives the attempt:
 
@@ -94,7 +94,7 @@ The replacement is:
   "mcpServers": {
     "postgres": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/postgres-mcp"],
+      "args": ["-y", "@yawlabs/postgres-mcp@latest"],
       "env": {
         "DATABASE_URL": "postgres://..."
       }
@@ -107,6 +107,6 @@ Two differences: the connection string moves from a CLI argument to a `DATABASE_
 
 ## Maintenance
 
-`@yawlabs/postgres-mcp` is maintained by [Yaw Labs](https://yaw.sh). CI runs the integration test matrix on every push against PG17 and PG18. Releases go through a tag-triggered GitHub Action that publishes with `--provenance`. Source: [github.com/YawLabs/postgres-mcp](https://github.com/YawLabs/postgres-mcp).
+`@yawlabs/postgres-mcp` is maintained by [Yaw Labs](https://yaw.sh). The integration suite runs against real PostgreSQL 15, 17 and 18 clusters (`scripts/wsl-test-matrix.sh`). Releases are cut from a maintainer workstation with `release.sh`, which runs lint, the type check and the tests before publishing; there is no hosted CI, and the npm packages carry no provenance attestation. Source: [github.com/YawLabs/postgres-mcp](https://github.com/YawLabs/postgres-mcp).
 
 If you find a security issue, please report it via the repo's private vulnerability reporting (see `SECURITY.md`) rather than a public issue.

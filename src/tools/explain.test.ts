@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import pg from "pg";
 import { shutdown } from "../api.js";
 import { initAudit, resetAuditForTests, setAuditSinkForTests } from "../audit.js";
+import { stubConnect, stubPoolQuery, withStubbedPool } from "../test-helpers/pool-stub.js";
 import { explainTools } from "./explain.js";
 
 const [pgExplain] = explainTools;
@@ -252,10 +252,47 @@ describe("pg_explain planner option dependencies", () => {
   });
 
   it("allows `costs: false` without analyze (COSTS is not ANALYZE-only)", async () => {
-    // Not rejected by the dependency guard and not version-gated, so the
-    // handler runs on to the connection -- which is the observable proof it
-    // passed validation. See withoutDatabaseUrl below for the mechanism.
-    await withoutDatabaseUrl(() => assertReachedConnection({ costs: false }));
+    // Not rejected by the dependency guard and not version-gated. Run against
+    // the answered-but-unknown version sentinel (see assertUngated): a gate on
+    // this option would reject there, and "the connection attempt failed"
+    // cannot tell that apart from "the gate fired and its probe threw".
+    await assertUngated({ costs: false }, "EXPLAIN (COSTS OFF) SELECT 1");
+  });
+
+  it("rejects hypothetical_indexes combined with analyze, before any connection", async () => {
+    // HypoPG stands down whenever the option list carries an `analyze` key, so
+    // this combination used to create the index, run EXPLAIN ANALYZE, and hand
+    // back the REAL plan with ok:true -- "the index does not help", silently
+    // wrong. The stub reports HypoPG installed and would answer the EXPLAIN, so
+    // `connects === 0` is what proves the refusal is the handler's own.
+    await withStubbedServer(170_000, async (session) => {
+      const result = (await pgExplain.handler({
+        sql: "SELECT * FROM t WHERE a = 1",
+        analyze: true,
+        hypothetical_indexes: [{ table: "t", columns: ["a"] }],
+      })) as { ok: boolean; error?: string };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /`hypothetical_indexes` cannot be combined with `analyze: true`/);
+      assert.equal(session.connects, 0);
+      assert.equal(session.hypoCreateSql(), "");
+      assert.deepEqual(session.poolQueries, []);
+    });
+  });
+
+  it("still runs hypothetical_indexes with `costs: false` (HypoPG injects under COSTS OFF)", async () => {
+    // Measured on PG 15/17/18: `EXPLAIN (COSTS OFF)` uses the hypothetical
+    // index exactly as `(COSTS ON)` does, so refusing this pair would block a
+    // working call. Only an `analyze` key switches HypoPG off.
+    await withStubbedServer(170_000, async (session) => {
+      const result = (await pgExplain.handler({
+        sql: "SELECT * FROM t WHERE a = 1",
+        costs: false,
+        hypothetical_indexes: [{ table: "t", columns: ["a"] }],
+      })) as { ok: boolean; error?: string };
+      assert.equal(result.ok, true, result.error);
+      assert.equal(session.hypoCreateSql(), 'CREATE INDEX ON "t" USING btree ("a")');
+      assert.equal(session.explainSql(), "EXPLAIN (COSTS OFF) SELECT * FROM t WHERE a = 1");
+    });
   });
 
   it("rejects generic_plan combined with analyze", async () => {
@@ -296,11 +333,12 @@ describe("pg_explain planner option dependencies", () => {
  * Runs `fn` with DATABASE_URL cleared.
  *
  * The version gate calls getServerVersionNum(), which probes the live server.
- * With no DATABASE_URL, getPool() throws, getServerVersionNum swallows it and
- * returns its documented 0 ("unknown -- assume oldest") sentinel. That gives
- * these tests a deterministic "server too old" without a mock or a live
- * postgres. The value is saved and restored so nothing sharing the process
- * inherits a cleared env.
+ * With no DATABASE_URL, getPool() throws, so the probe THROWS before reaching
+ * any server -- and the handler then reports that failure rather than a
+ * version verdict (#42). This is the "probe threw" case only; the
+ * "answered, but not with a version" sentinel is withStubbedServer(NaN).
+ * The value is saved and restored so nothing sharing the process inherits a
+ * cleared env.
  */
 async function withoutDatabaseUrl<T>(fn: () => Promise<T>): Promise<T> {
   const saved = process.env.DATABASE_URL;
@@ -310,10 +348,9 @@ async function withoutDatabaseUrl<T>(fn: () => Promise<T>): Promise<T> {
   // and `getServerVersionNum()` short-circuits on a cached `serverVersionNum`.
   // If either was already populated -- by an earlier test in this file, or
   // simply because the developer running the suite has DATABASE_URL exported
-  // -- the probe never re-runs, never throws, and never returns its 0
-  // sentinel, so the six version-gate cases below silently assert the wrong
-  // thing. That made the whole file pass on a machine with DATABASE_URL unset
-  // and fail with four errors on one that has it set.
+  // -- the probe never re-runs and never throws, so the probe-failure case
+  // below silently asserts the wrong thing. That made the whole file pass on
+  // a machine with DATABASE_URL unset and fail on one that has it set.
   //
   // `shutdown()` resets the pool, `serverVersionNum`, and `typeNameCache`
   // together, so it is the one call that actually restores the precondition.
@@ -393,37 +430,45 @@ describe("pg_explain server-version gating", () => {
     assert.doesNotMatch(result.error ?? "", /requires PostgreSQL|could not be determined|Drop the option/);
   });
 
-  it("does NOT gate the pre-existing options when the version probe fails", async () => {
-    // A probe of 0 must not block analyze/format/params -- those work on every
-    // supported server. Reaching the connection attempt is the proof: the
-    // handler got past validation and tried to run the EXPLAIN.
-    await withoutDatabaseUrl(() => assertReachedConnection({ analyze: true, format: "json" }));
+  it("does NOT gate the pre-existing options when the version is unknown", async () => {
+    // An unknown version must not block analyze/format/params -- those work on
+    // every supported server.
+    await assertUngated({ analyze: true, format: "json" }, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1");
   });
 
   it("does NOT gate the analyze-implied BUFFERS default", async () => {
     // `buffers` defaults to true under analyze, and BUFFERS *with* ANALYZE has
     // no version floor -- so the new default can never trip the PG13 gate,
     // which only covers BUFFERS without ANALYZE.
-    await withoutDatabaseUrl(() => assertReachedConnection({ analyze: true }));
+    await assertUngated({ analyze: true }, "EXPLAIN (ANALYZE, BUFFERS) SELECT 1");
   });
 
   it("does NOT gate a plain EXPLAIN with buffers omitted", async () => {
-    await withoutDatabaseUrl(() => assertReachedConnection({}));
+    await assertUngated({}, "EXPLAIN (COSTS ON) SELECT 1");
   });
 });
 
 /**
- * Asserts the handler got past validation and asked for a connection. Under
- * withoutDatabaseUrl the first thing after validation is the pool refusing
- * to build, and that failure comes back as the call's `{ok: false}` -- the
- * checkout sits inside the statement's audited span and is returned like any
- * other failure (#42). It used to propagate as a rejection, which is what
- * these cases asserted on.
+ * Asserts `input` carries no version-gated option: against a server whose
+ * version is the answered-but-unparsable sentinel, where EVERY gate rejects
+ * (see the "unknown version" cases above), the call must succeed, emit exactly
+ * `expected`, and never ask for the version at all.
+ *
+ * These cases used to run with DATABASE_URL unset and assert that the
+ * connection attempt failed. Since #42 a gate that fires while its probe threw
+ * returns that same "DATABASE_URL is not set" text, so the old assertion held
+ * whether or not the option was gated.
  */
-async function assertReachedConnection(input: Record<string, unknown>): Promise<void> {
-  const result = (await pgExplain.handler({ sql: "SELECT 1", ...input })) as { ok: boolean; error?: string };
-  assert.equal(result.ok, false, `expected the connection attempt to fail, got ${JSON.stringify(result)}`);
-  assert.match(result.error ?? "", /DATABASE_URL is not set/);
+async function assertUngated(input: Record<string, unknown>, expected: string): Promise<void> {
+  await withStubbedServer(Number.NaN, async (session) => {
+    const result = (await pgExplain.handler({ sql: "SELECT 1", ...input })) as { ok: boolean; error?: string };
+    assert.equal(result.ok, true, result.error);
+    assert.equal(session.explainSql(), expected);
+    assert.ok(
+      !session.poolQueries.some((q) => q.includes("server_version_num")),
+      "the version probe ran although no gated option was requested",
+    );
+  });
 }
 
 /** One statement the fake client saw, with the values bound to it. */
@@ -485,9 +530,9 @@ const DECLARE_PREFIX = "DECLARE __pgmcp_cur NO SCROLL CURSOR FOR ";
  * `planRows` back as the plan.
  *
  * Why this exists rather than another withoutDatabaseUrl case: that helper
- * only ever produces getServerVersionNum's 0 "unknown" sentinel, so every
- * version-gate test written on top of it asserts on the error STRING and none
- * of them exercises the NUMBER the `serverVersion < g.min` comparison uses.
+ * only ever makes the probe throw, so nothing written on top of it exercises
+ * the NUMBER the `serverVersion < g.min` comparison uses. (`Number.NaN` here
+ * is the other unknown: the server answered, with something unparsable.)
  * Raising the generic_plan gate from PG16 to PG17 left the entire suite green
  * -- the gates could be inverted in production with a clean run. A stubbed
  * probe is the only way to pin a floor from the ACCEPTING side.
@@ -510,10 +555,6 @@ async function withStubbedServer<T>(
   planRows: string[] = ["Seq Scan on t  (cost=0.00..1.00 rows=1 width=4)"],
   behavior: StubBehavior = {},
 ): Promise<T> {
-  const originalConnect = pg.Pool.prototype.connect;
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
-
   const statements: StubStatement[] = [];
   const releases: unknown[] = [];
   let dead = false;
@@ -652,34 +693,24 @@ async function withStubbedServer<T>(
     },
   };
 
-  await shutdown();
-  process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
-    const text = typeof sql === "string" ? sql : "";
-    poolQueries.push(text);
-    if (text.includes("server_version_num")) return Promise.resolve({ rows: [{ v: String(versionNum) }] });
-    if (text.includes("FROM pg_catalog.pg_type")) {
-      return Promise.resolve({ rows: [{ oid: 25, typname: "text" }], fields: [], command: "SELECT", rowCount: 1 });
-    }
-    // The HypoPG presence probe runs through runInternal -> pool.query. Report
-    // it installed so the `using` cases reach the CREATE INDEX text.
-    if (text.includes("hypopg")) return Promise.resolve({ rows: [{ installed: true }] });
-    return Promise.resolve({ rows: [] });
-  } as unknown as typeof pg.Pool.prototype.query;
-  pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-    session.connects += 1;
-    return Promise.resolve(client);
-  } as unknown as typeof pg.Pool.prototype.connect;
-
-  try {
-    return await fn(session);
-  } finally {
-    pg.Pool.prototype.connect = originalConnect;
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  }
+  return withStubbedPool(async () => {
+    stubPoolQuery(async (text) => {
+      poolQueries.push(text);
+      if (text.includes("server_version_num")) return { rows: [{ v: String(versionNum) }] };
+      if (text.includes("FROM pg_catalog.pg_type")) {
+        return { rows: [{ oid: 25, typname: "text" }], fields: [], command: "SELECT", rowCount: 1 };
+      }
+      // The HypoPG presence probe runs through runInternal -> pool.query. Report
+      // it installed so the `using` cases reach the CREATE INDEX text.
+      if (text.includes("hypopg")) return { rows: [{ installed: true }] };
+      return { rows: [] };
+    });
+    stubConnect(() => {
+      session.connects += 1;
+      return client;
+    });
+    return fn(session);
+  });
 }
 
 describe("pg_explain server-version gate boundaries (stubbed probe)", () => {
@@ -768,7 +799,7 @@ describe("pg_explain server-version gate boundaries (stubbed probe)", () => {
         // The DETECTED-version branch has to be the one that ran. Its message
         // differs from the 0-sentinel branch's ("could not be determined"), and
         // only this one proves a real number was compared -- which is precisely
-        // what the withoutDatabaseUrl cases above cannot show.
+        // what the unknown-version cases above cannot show.
         assert.match(result.error ?? "", /this server reports PostgreSQL/);
         // Rejecting BEFORE the connection is the point: an older server answers
         // `unrecognized EXPLAIN option`, which reads like a caller typo.
@@ -816,24 +847,30 @@ describe("pg_explain server-version gate boundaries (stubbed probe)", () => {
   });
 
   it("skips the version probe entirely when no gated option was requested", async () => {
-    // getServerVersionNum returns the 0 sentinel on a server we cannot probe,
-    // so consulting it unconditionally would gate analyze/format/params on
-    // something that has no version floor at all. PG12 is below every floor in
-    // the table above, so a probe that ran here would reject.
-    await withStubbedServer(120_000, async (session) => {
+    // The probe is a round trip (and, uncached, a failure mode) that a call
+    // with no version floor has no reason to pay. A probe that ran would
+    // reject nothing here -- filtering an empty gate list is a no-op -- so the
+    // outcome cannot show it; the pool's own query log does. PG11 is below
+    // every floor in the table above, so a gate wrongly applied to
+    // analyze/format would also reject.
+    await withStubbedServer(110_000, async (session) => {
       const result = (await pgExplain.handler({ sql: "SELECT 1", analyze: true, format: "json" })) as {
         ok: boolean;
         error?: string;
       };
       assert.equal(result.ok, true, result.error);
       assert.equal(session.explainSql(), "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1");
+      assert.ok(
+        !session.poolQueries.some((q) => q.includes("server_version_num")),
+        "the version probe ran although no gated option was requested",
+      );
     });
   });
 });
 
 describe("pg_explain text-plan truncation notice", () => {
   // A text plan arrives one row per line, so a plan longer than
-  // POSTGRES_MAX_ROWS is chopped mid-output by the cursor FETCH. Handing those
+  // POSTGRES_MAX_ROWS is chopped mid-output by the row-cap slice. Handing those
   // lines back unmarked gives the caller a plan that LOOKS complete -- the node
   // they are hunting may be in the part that was dropped. The notice is the
   // only signal. query.integration.test.ts forces the same truncation against a

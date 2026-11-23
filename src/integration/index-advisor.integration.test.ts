@@ -4,11 +4,26 @@
 
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { getServerVersionNum, PG16, runInternal } from "../api.js";
+import { PG16, runInternal } from "../api.js";
 import { indexAdvisorTools } from "../tools/index-advisor.js";
-import { FIXTURE_SCHEMA, hypopgAvailable, integrationEnabled, setupFixtures, teardownFixtures } from "./fixtures.js";
+import {
+  FIXTURE_SCHEMA,
+  hypopgAvailable,
+  integrationEnabled,
+  probeServerVersionNum,
+  setupFixtures,
+  teardownFixtures,
+} from "./fixtures.js";
 
-const pgIndexAdvisor = indexAdvisorTools[0];
+const pgIndexAdvisor = indexAdvisorTools.find((tool) => tool.name === "pg_index_advisor");
+if (!pgIndexAdvisor) throw new Error("pg_index_advisor is not registered");
+
+// Every test here needs HypoPG, and each one that cannot run says so through
+// `t.skip` rather than a bare `return`: a test that returns before its first
+// assertion is reported as PASSED, so on a cluster without the extension this
+// whole file -- the stacked-query regressions included -- used to go green
+// having checked nothing.
+const HYPOPG_MISSING = "HypoPG is not installed on this cluster, and pg_index_advisor refuses to run without it";
 
 describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () => {
   before(setupFixtures);
@@ -27,15 +42,18 @@ describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () =>
   // single-statement validator. Both halves need pinning: the payload must be
   // rejected, AND a legitimate parameterized statement must still plan.
   describe("stacked-query injection", () => {
-    it("rejects a stacked payload in `statements` instead of executing it", async () => {
-      // Same in-body guard as the two tests below. pg_index_advisor probes for
+    it("rejects a stacked payload in `statements` instead of executing it", async (t) => {
+      // Same in-body skip as the two tests below. pg_index_advisor probes for
       // HypoPG BEFORE it builds the workload (index-advisor.ts), so on a cluster
       // where `CREATE EXTENSION hypopg` failed -- exactly the case fixtures.ts
       // now tracks, and the one its own comment anticipates for a PG major PGDG
       // has not packaged yet -- res.error is the extension-missing message. The
       // assertion below would then go red reporting what looks like a failed
       // injection defense, on a run where the payload never reached the server.
-      if (!hypopgAvailable()) return;
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       const canary = `${FIXTURE_SCHEMA}.advisor_injection_canary`;
       const created = await runInternal(`CREATE TABLE IF NOT EXISTS ${canary} (id int)`);
@@ -79,13 +97,17 @@ describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () =>
       await runInternal(`DROP TABLE IF EXISTS ${canary}`);
     });
 
-    it("still plans an ordinary statement", async () => {
+    it("still plans an ordinary statement", async (t) => {
       // Checked in the BODY, not as a `skip` option: an option object is
       // evaluated when `it()` registers the test, which is during the describe
       // callback -- before `before(setupFixtures)` has run and set the flag. As
       // a skip option this read false every time and the test silently never
-      // ran. Same in-body pattern the fdwFixtureAvailable() call sites use.
-      if (!hypopgAvailable()) return;
+      // ran. The runtime `t.skip` is evaluated here, after the fixtures are up,
+      // and still reports as a skip with its reason.
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       // The guard runs the EXPLAIN itself on the extended protocol when the
       // statement has no placeholders, so this is the path that must not have
@@ -99,14 +121,20 @@ describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () =>
       assert.equal(res.data?.statements?.[0]?.planned, true);
     });
 
-    it("still plans a legitimate parameterized statement", async () => {
-      if (!hypopgAvailable()) return;
+    it("still plans a legitimate parameterized statement", async (t) => {
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
       // GENERIC_PLAN is PostgreSQL 16+, and below it the advisor deliberately
       // skips a parameterized statement with its own warning -- a pre-existing
       // behaviour this guard does not change. Asserting the planned path there
       // would be asserting the wrong thing, so the version decides which
       // outcome is correct.
-      if ((await getServerVersionNum()) < PG16) return;
+      if ((await probeServerVersionNum()) < PG16) {
+        t.skip("EXPLAIN (GENERIC_PLAN) needs PostgreSQL 16+, so there is no planned path to assert here");
+        return;
+      }
 
       // A single statement carrying `$1` FAILS the extended-protocol bind
       // (08P01), and that failure is precisely what proves it is one command.
@@ -126,8 +154,11 @@ describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () =>
       );
     });
 
-    it("rejects a stacked payload that also carries a placeholder", async () => {
-      if (!hypopgAvailable()) return;
+    it("rejects a stacked payload that also carries a placeholder", async (t) => {
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       // The most load-bearing shape in this file, because it is the one a real
       // attack takes on the pg_stat_statements path: that text is always
@@ -165,7 +196,7 @@ describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () =>
         // runs. That is still a rejection -- the canary check below covers it --
         // but it is no evidence about parse-vs-bind, so the SQLSTATE assertion
         // only applies where the guard actually issued its probe.
-        if ((await getServerVersionNum()) >= PG16) {
+        if ((await probeServerVersionNum()) >= PG16) {
           assert.match(reported, /\(code: 42601\)/, `expected the multi-command parse error, got: ${reported}`);
           assert.ok(
             !/08P01/.test(reported),
@@ -195,8 +226,11 @@ describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () =>
   });
 
   describe("mixed workloads", () => {
-    it("reports every statement against its own SQL when only some are rejected", async () => {
-      if (!hypopgAvailable()) return;
+    it("reports every statement against its own SQL when only some are rejected", async (t) => {
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       // `baselineCosts`, `rawPlans`, `needsGenericPlan` and `workload` are four
       // PARALLEL arrays, appended across five different `continue` paths in the
@@ -283,8 +317,11 @@ describe("integration: pg_index_advisor", { skip: !integrationEnabled() }, () =>
   });
 
   describe("HypoPG recommendations", () => {
-    it("recommends an index on the column the workload filters, and sizes it", async () => {
-      if (!hypopgAvailable()) return;
+    it("recommends an index on the column the workload filters, and sizes it", async (t) => {
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       // The one path with no real-database coverage until now. The unit tests
       // model HypoPG as a COUNTER -- any live hypothetical index makes plans

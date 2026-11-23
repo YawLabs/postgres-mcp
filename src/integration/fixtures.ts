@@ -4,6 +4,17 @@
  * quoted-name identifier so we can exercise every tool against a real DB.
  *
  * Gated on POSTGRES_MCP_INTEGRATION=1 so `npm test` without a DB stays fast.
+ *
+ * Two things the suite assumes about DATABASE_URL and does not check:
+ *
+ *   - The cluster is EXCLUSIVE to one run. Every name here is fixed and several
+ *     are cluster-scoped (the roles, the FDW server, the second database), and
+ *     setup / teardown drop them unconditionally -- so a second run against the
+ *     same cluster has its schema and roles dropped mid-test by the first, and
+ *     fails on assertions that have nothing to do with the cause.
+ *   - The connecting role is a superuser named `postgres`, as
+ *     scripts/wsl-test-matrix.sh sets up. admin.integration.test.ts asserts on
+ *     that name in pg_list_roles and pg_table_privileges.
  */
 
 import { runInternal, shutdown, withSharedClient } from "../api.js";
@@ -46,28 +57,73 @@ export const FIXTURE_IDENTITY_ALWAYS_COLUMN = "id";
 export const FIXTURE_IDENTITY_BY_DEFAULT_COLUMN = "legacy_id";
 export const FIXTURE_PLAIN_DEFAULT_COLUMN = "label";
 
-// Wraparound fixture pair for pg_advisor.wraparound_risk. The advisor resolves
-// a table's freeze horizon as COALESCE(reloption, GUC), so proving the
-// reloption branch fires needs a table whose override is nowhere near the GUC:
-// 100000 / 10000 are the per-table minimums postgres accepts, 2000x and 40000x
-// below the 200000000 / 400000000 GUC defaults. A reported freeze_max_age of
-// 100000 therefore cannot have come from the fallback, and the control table
-// pins the other side of the same COALESCE.
+// Wraparound fixture tables for pg_advisor.wraparound_risk. The advisor
+// resolves a table's freeze horizon as LEAST(reloption, GUC) -- what autovacuum
+// itself uses -- so proving the reloption branch fires needs a table whose
+// override is nowhere near the GUC: 100000 / 10000 are the per-table minimums
+// postgres accepts, 2000x and 40000x below the 200000000 / 400000000 GUC
+// defaults. A reported freeze_max_age of 100000 therefore cannot have come from
+// the fallback, and the control table pins the GUC side of the same LEAST.
+//
+// The RAISED table is the other direction: 2000000000 is the per-table maximum,
+// above any value the GUC can take, and autovacuum ignores a per-table value
+// above the GUC. It must therefore report the GUC, exactly like the control. A
+// resolver that let the reloption win would divide its age by 2 billion and
+// hide a table autovacuum is about to force-vacuum.
 //
 // That gap is also what makes the ratio testable without controlling the XID
 // counter: both tables are created back to back, so age(relfrozenxid) is
 // identical to within a few XIDs and the override row's xid_ratio is exactly
 // 2000x the control's however many transactions the run has burned. A
 // wraparoundThreshold low enough to clear age/100000 but not age/200000000
-// surfaces the override row alone; at the 0.5 default neither appears, so the
-// pair cannot leak into other advisor assertions.
+// surfaces the override row alone; at the 0.5 default none of them appears, so
+// they cannot leak into other advisor assertions.
 export const FIXTURE_WRAPAROUND_OVERRIDE_TABLE = "wraparound_override";
 export const FIXTURE_WRAPAROUND_CONTROL_TABLE = "wraparound_control";
+export const FIXTURE_WRAPAROUND_RAISED_TABLE = "wraparound_raised";
 export const FIXTURE_WRAPAROUND_FREEZE_MAX_AGE = 100_000;
 export const FIXTURE_WRAPAROUND_MULTIXACT_FREEZE_MAX_AGE = 10_000;
+export const FIXTURE_WRAPAROUND_RAISED_MAX_AGE = 2_000_000_000;
+
+// Foreign key INTO a partitioned table (`events`). PostgreSQL stores it as the
+// declared pg_constraint row plus one internal clone per partition of the
+// referenced table, all on the referencing table. pg_describe_table must list
+// the declared constraint once, on both sides.
+export const FIXTURE_PARTITIONED_FK_TABLE = "event_notes";
+export const FIXTURE_PARTITIONED_FK_CONSTRAINT = "event_notes_event_fk";
+
+// A table with no columns at all -- legal, and what a table whose columns were
+// all dropped looks like. pg_describe_table must describe it, not report it as
+// missing.
+export const FIXTURE_ZERO_COLUMN_TABLE = "no_columns";
 
 export function integrationEnabled(): boolean {
   return process.env.POSTGRES_MCP_INTEGRATION === "1";
+}
+
+/**
+ * The connected server's server_version_num, asked of the server directly.
+ *
+ * Version-gated assertions use this rather than the handlers' own
+ * getServerVersionNum(): that is the probe the handlers PICK their SQL branch
+ * with, so a regression in it (a stale cache surviving a pool swap, its
+ * 0-on-failure silently downgrading a query) must not also move the
+ * expectation the test checks the handler against.
+ *
+ * It throws instead of returning 0. A 0 used to read as "cannot tell" and the
+ * caller returned early, so a broken probe turned every version-gated test
+ * into a pass that checked nothing. The fixture setup has already run SQL by
+ * the time any caller gets here, so a failure is a real fault worth seeing.
+ */
+export async function probeServerVersionNum(): Promise<number> {
+  const res = await runInternal<{ v: string }>("SELECT current_setting('server_version_num') AS v");
+  if (!res.ok) throw new Error(`server_version_num probe failed: ${res.error}`);
+  const raw = res.data?.[0]?.v;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`server_version_num probe returned ${JSON.stringify(raw)}, not a positive integer`);
+  }
+  return parsed;
 }
 
 export const FDW_SERVER_NAME = "mcp_test_fdw_server";
@@ -88,8 +144,7 @@ export async function setupFdwFixture(): Promise<boolean> {
 
   let url: URL;
   try {
-    // URL constructor rejects the postgres:// scheme; swap to http:// for parsing only.
-    url = new URL(dbUrl.replace(/^postgres(?:ql)?:\/\//, "http://"));
+    url = new URL(dbUrl);
   } catch {
     return false;
   }
@@ -204,6 +259,22 @@ export async function setupFixtures(): Promise<void> {
     `CREATE TABLE ${FIXTURE_SCHEMA}.events_2026 PARTITION OF ${FIXTURE_SCHEMA}.events
        FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`,
 
+    // FK into the partitioned table above: one declared constraint, plus the
+    // per-partition clone postgres adds for events_2026. Has its own PK so it
+    // stays out of the tables_without_primary_key list.
+    `CREATE TABLE ${FIXTURE_SCHEMA}.${FIXTURE_PARTITIONED_FK_TABLE} (
+       id SERIAL PRIMARY KEY,
+       event_id BIGINT NOT NULL,
+       event_occurred_at DATE NOT NULL,
+       note TEXT,
+       CONSTRAINT ${FIXTURE_PARTITIONED_FK_CONSTRAINT} FOREIGN KEY (event_id, event_occurred_at)
+         REFERENCES ${FIXTURE_SCHEMA}.events(id, occurred_at)
+     )`,
+
+    // Zero-column table: exists in pg_class with no pg_attribute rows above
+    // attnum 0.
+    `CREATE TABLE ${FIXTURE_SCHEMA}.${FIXTURE_ZERO_COLUMN_TABLE} ()`,
+
     // Advisor fixture: a heap table with no primary key. Used by the
     // pg_advisor tables_without_primary_key check.
     `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_table (id INT, label TEXT)`,
@@ -239,9 +310,13 @@ export async function setupFixtures(): Promise<void> {
     // Advisor fixture: a partitioned table parent with NO primary key.
     // pg_advisor must flag this (relkind='p' coverage). The negative case
     // is covered by `events` above, which is also partitioned but DOES
-    // have a PK.
+    // have a PK. Its partition has no PK either and must NOT be flagged on
+    // its own: the parent row is the finding, and listing every partition
+    // lets one PK-less parent fill the advisor's LIMIT.
     `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_partitioned (id INT, occurred_at DATE)
        PARTITION BY RANGE (occurred_at)`,
+    `CREATE TABLE ${FIXTURE_SCHEMA}.no_pk_partitioned_2026 PARTITION OF ${FIXTURE_SCHEMA}.no_pk_partitioned
+       FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`,
 
     // Materialized view fixture: covers the `includeMaterialized` true /
     // false branches of pg_list_views and the relkind='m' bucket of
@@ -259,17 +334,22 @@ export async function setupFixtures(): Promise<void> {
     `CREATE SEQUENCE ${FIXTURE_SCHEMA}.near_full_seq MAXVALUE 1000`,
     `SELECT setval('${FIXTURE_SCHEMA}.near_full_seq', 800)`,
 
-    // Advisor fixture: wraparound override vs GUC fallback. Created back to
-    // back so the only thing separating the two rows in wraparound_risk.tables
+    // Advisor fixture: wraparound overrides vs GUC fallback. Created back to
+    // back so the only thing separating the rows in wraparound_risk.tables
     // is the freeze_max_age divisor -- which is exactly the per-table
-    // reloption branch under test. Both are plain heap tables with a PK so
+    // reloption branch under test. All are plain heap tables with a PK so
     // they stay out of the tables_without_primary_key list. Setting these
     // storage parameters is an owner-level ALTER; no superuser involved.
     `CREATE TABLE ${FIXTURE_SCHEMA}.${FIXTURE_WRAPAROUND_OVERRIDE_TABLE} (id INT PRIMARY KEY, payload TEXT)`,
     `CREATE TABLE ${FIXTURE_SCHEMA}.${FIXTURE_WRAPAROUND_CONTROL_TABLE} (id INT PRIMARY KEY, payload TEXT)`,
+    `CREATE TABLE ${FIXTURE_SCHEMA}.${FIXTURE_WRAPAROUND_RAISED_TABLE} (id INT PRIMARY KEY, payload TEXT)`,
     `ALTER TABLE ${FIXTURE_SCHEMA}.${FIXTURE_WRAPAROUND_OVERRIDE_TABLE} SET (
        autovacuum_freeze_max_age = ${FIXTURE_WRAPAROUND_FREEZE_MAX_AGE},
        autovacuum_multixact_freeze_max_age = ${FIXTURE_WRAPAROUND_MULTIXACT_FREEZE_MAX_AGE}
+     )`,
+    `ALTER TABLE ${FIXTURE_SCHEMA}.${FIXTURE_WRAPAROUND_RAISED_TABLE} SET (
+       autovacuum_freeze_max_age = ${FIXTURE_WRAPAROUND_RAISED_MAX_AGE},
+       autovacuum_multixact_freeze_max_age = ${FIXTURE_WRAPAROUND_RAISED_MAX_AGE}
      )`,
 
     `INSERT INTO ${FIXTURE_SCHEMA}.users (email, metadata) VALUES
@@ -294,9 +374,8 @@ export async function setupFixtures(): Promise<void> {
 
     // Limited login role for the pg_replication_status _warnings test.
     // CONNECT is granted to PUBLIC by default on every postgres database,
-    // so we don't need an explicit GRANT here -- the role can connect but
-    // can't read any of the replication-monitoring views/functions because
-    // it has no pg_monitor / REPLICATION attribute.
+    // so we don't need an explicit GRANT here. What the role can and cannot
+    // read is spelled out on FIXTURE_LIMITED_ROLE at the top of this file.
     `DROP ROLE IF EXISTS ${FIXTURE_LIMITED_ROLE}`,
     `CREATE ROLE ${FIXTURE_LIMITED_ROLE} LOGIN PASSWORD '${FIXTURE_LIMITED_PASSWORD}'`,
   ];
@@ -394,17 +473,11 @@ let _pg18: Pg18FixtureState = {
 };
 
 /**
- * Run a group of statements, stopping at the first failure. Unlike the
- * always-run array in setupFixtures this never throws: on PG15 / PG17 (both in
- * the matrix -- see scripts/wsl-pg-setup.sh) every group below fails on syntax
- * the server has never heard of, and that is the expected outcome, not a
- * broken fixture. A half-created group leaves the partial table behind rather
- * than rolling it back; the probe reports false either way, and DROP SCHEMA
- * CASCADE reclaims the remnant.
- */
-/**
  * Run a best-effort statement group ATOMICALLY: either every statement lands
- * or none does.
+ * or none does. Unlike the always-run array in setupFixtures this never
+ * throws: on PG15 / PG17 (both in the matrix -- see scripts/wsl-pg-setup.sh)
+ * every group below fails on syntax the server has never heard of, and that
+ * is the expected outcome, not a broken fixture.
  *
  * The atomicity is load-bearing, not tidiness. These groups are shaped as
  * `CREATE TABLE ...` followed by a PG18-only `ALTER TABLE ...`, so running
@@ -583,11 +656,9 @@ export async function runMarkerQueryInOtherDatabase(): Promise<boolean> {
 
   // Connect directly -- the pool is bound to the primary database.
   const { default: pg } = await import("pg");
-  const other = new URL(dbUrl.replace(/^postgres(?:ql)?:\/\//, "http://"));
+  const other = new URL(dbUrl);
   other.pathname = `/${FIXTURE_OTHER_DB}`;
-  const client = new pg.Client({
-    connectionString: other.toString().replace(/^http:\/\//, "postgres://"),
-  });
+  const client = new pg.Client({ connectionString: other.toString() });
   try {
     await client.connect();
     // pg_stat_statements must be enabled per-database to RECORD from it, but

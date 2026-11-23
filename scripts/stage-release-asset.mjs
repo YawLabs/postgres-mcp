@@ -2,11 +2,12 @@
 // Stage the host-built `oam compile` binary as a named release asset + sha256
 // sidecar.
 //
-// build-binary-oam.mjs emits bin/<platform>-<arch>/yaw-mcp(.exe) (host-native,
-// one build per host). This renames that to the public asset name the
-// Scoop/Homebrew manifests point at (yaw-mcp-<platform>-<arch>[.exe]) and
-// writes a `<asset>.sha256` sidecar in sha256sum format (`<hex>  <asset>`)
-// that Scoop's autoupdate `hash.url` reads.
+// build-binary-oam.mjs emits bin/<platform>-<arch>/<cmd>(.exe) (host-native,
+// one build per host; <cmd> is package.json's first `bin` name, postgres-mcp
+// here). This renames that to the public asset name the Scoop/Homebrew
+// manifests point at (<cmd>-<platform>-<arch>[.exe]) and writes a
+// `<asset>.sha256` sidecar in sha256sum format (`<hex>  <asset>`) that
+// Scoop's autoupdate `hash.url` reads.
 //
 // Pure stdlib; writes only to dist-release/. Run after build-binary-oam.mjs:
 //   node scripts/stage-release-asset.mjs
@@ -35,8 +36,8 @@ const outSha = `${outAsset}.sha256`;
 mkdirSync(outDir, { recursive: true });
 rmSync(outAsset, { force: true });
 copyFileSync(builtExe, outAsset);
-// Preserve the executable bit on Unix (copyFileSync drops it) so the staged
-// asset is runnable for the CI smoke test and after download.
+// Set the executable bit on Unix so the staged asset is runnable as it sits
+// and after download.
 if (!isWin) chmodSync(outAsset, 0o755);
 
 const hex = createHash('sha256').update(readFileSync(outAsset)).digest('hex');
@@ -45,7 +46,3 @@ writeFileSync(outSha, `${hex}  ${assetName}\n`);
 
 console.log(`asset:  ${outAsset}`);
 console.log(`sha256: ${hex}`);
-// Surfaced as a step output in CI (GITHUB_OUTPUT) for downstream jobs.
-if (process.env.GITHUB_OUTPUT) {
-  writeFileSync(process.env.GITHUB_OUTPUT, `asset=${assetName}\nsha256=${hex}\n`, { flag: 'a' });
-}

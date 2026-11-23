@@ -71,6 +71,13 @@
  * names the fix, in every runtime mode and on every host -- never a fallback. A
  * sandbox that quietly switches itself off is worse than none (#41).
  *
+ * Only this launcher can apply the sandbox. dist/index.js started any other
+ * way -- `node dist/index.js`, `npm start`, the `oam compile` binary -- has no
+ * launcher in front of it, so the server itself refuses to start when it sees
+ * POSTGRES_MCP_SANDBOX switched on (src/index.ts). The sandboxed child never
+ * sees the variable: it is not in the --allow-env list and is dropped from
+ * the child's environment.
+ *
  * A host oam BELOW the floor never serves, sandbox or not. Without the sandbox it
  * hands the server off to the newest usable oam, or to Node found on PATH, or
  * exits with an error when there is neither; under the sandbox only a fresh oam
@@ -159,7 +166,7 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, writeSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -624,7 +631,11 @@ function sandboxChildEnv(source, names, platform) {
  * adding it here is a silent regression under the sandbox, not a loud one: oam
  * removes an undeclared var from process.env rather than denying access, so
  * the server reads undefined and quietly takes its default. The suite checks
- * this list against the bundle's literal reads. POSTGRES_APPLICATION_NAME is
+ * this list against the bundle's literal reads and against every POSTGRES_*
+ * name the bundle holds as a string, which is how a name read through a helper
+ * (positiveIntEnv(name) -> process.env[name]) is seen. POSTGRES_MCP_SANDBOX
+ * must stay OFF this list: the server refuses to start when it can see that
+ * variable switched on. POSTGRES_APPLICATION_NAME is
  * read by getApplicationName() in src/api.ts; PGAPPNAME is pg's own env
  * fallback for the same setting (connection-parameters.js: val('application_name',
  * config, 'PGAPPNAME')), so omitting it would drop a name set the driver's way.
@@ -650,7 +661,7 @@ function sandboxChildEnv(source, names, platform) {
  * disables itself is worse than none), but it is a surprising one to hit at
  * runtime. Use the stderr sink under the sandbox.
  */
-const SANDBOX_ENV = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGBINARY","PGCLIENT_ENCODING","PGCONNECT_TIMEOUT","PGDATABASE","PGHOST","PGOPTIONS","PGPASSWORD","PGPORT","PGREPLICATION","PGSSLMODE","PGSSLNEGOTIATION","PGUSER","POSTGRES_APPLICATION_NAME","POSTGRES_AUDIT_LOG","POSTGRES_AUDIT_LOG_FILE","POSTGRES_AUDIT_REDACT","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
+const SANDBOX_ENV = ["ALLOW_WRITES","DATABASE_URL","NODE_PG_FORCE_NATIVE","PGAPPNAME","PGBINARY","PGCLIENT_ENCODING","PGCONNECT_TIMEOUT","PGDATABASE","PGHOST","PGOPTIONS","PGPASSWORD","PGPORT","PGREPLICATION","PGSSLMODE","PGSSLNEGOTIATION","PGUSER","POSTGRES_APPLICATION_NAME","POSTGRES_AUDIT_LOG","POSTGRES_AUDIT_LOG_FILE","POSTGRES_AUDIT_REDACT","POSTGRES_CONNECTION_TIMEOUT_MS","POSTGRES_MAX_RESULT_BYTES","POSTGRES_MAX_ROWS","POSTGRES_POOL_MAX","POSTGRES_QUERY_DEADLINE_MS","POSTGRES_SSL_REJECT_UNAUTHORIZED","POSTGRES_STATEMENT_TIMEOUT_MS","USER","USERNAME"];
 
 /**
  * The `--permission` flags for a sandboxed spawn. `grant` is sandboxEndpoint's
@@ -688,8 +699,7 @@ function sandboxFlags(grant) {
  * stderr turns out to be unusable give up quietly -- failing to print a
  * diagnostic is not worth crashing a stdio server over.
  */
-async function errSync(message) {
-  const { writeSync } = await import("node:fs");
+function errSync(message) {
   const buf = Buffer.from(message);
   let off = 0;
   for (let attempts = 0; off < buf.length && attempts < 1000; attempts++) {
@@ -704,7 +714,7 @@ async function errSync(message) {
 
 /** Print a refusal and exit 1. Nothing is served after this. */
 async function refuse(message) {
-  await errSync(message);
+  errSync(message);
   process.exit(1);
 }
 
@@ -845,6 +855,18 @@ async function runInProcess() {
 const fallbackFailed = (e) => {
   process.stderr.write(`postgres-mcp: fallback failed (${e?.message ?? e})\n`);
   process.exitCode = 1;
+};
+
+// The same for the PRIMARY in-process path, where nothing was fallen back
+// from. A missing bundle gets one line; anything else is the server's own
+// startup error, so its stack is kept. It exits rather than setting
+// process.exitCode, as the uncaught exception it replaces did: a server that
+// threw after attaching its stdin listener would otherwise stay up, half
+// started.
+const startFailed = (e) => {
+  const missing = e?.code === "ERR_MODULE_NOT_FOUND";
+  errSync(`postgres-mcp: could not start the server (${(missing ? e.message : e?.stack) ?? e})\n`);
+  process.exit(1);
 };
 
 /**
@@ -1081,7 +1103,7 @@ async function handOffToNode(reason) {
   if (permissionReachesChildren(process.versions.oam, process.execArgv, process.env.NODE_OPTIONS)) {
     // oam would append its grants to Node's NODE_OPTIONS, and Node refuses
     // the oam-only ones: the handoff could only end in a cryptic exit 9.
-    await errSync(
+    errSync(
       `postgres-mcp: ${reason || "POSTGRES_MCP_RUNTIME=node"}, but this oam runs under --permission, and it passes its --permission and --allow-* flags to every child in NODE_OPTIONS, which Node rejects.\n` +
         (reason
           ? `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`
@@ -1093,7 +1115,7 @@ async function handOffToNode(reason) {
   if (!node) {
     // An empty reason is POSTGRES_MCP_RUNTIME=node on a supported oam, where
     // updating oam is not the way out.
-    await errSync(
+    errSync(
       reason
         ? `postgres-mcp: ${reason}, and no Node was found on PATH to run the server instead.\n` +
             `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`
@@ -1102,12 +1124,12 @@ async function handOffToNode(reason) {
     );
     process.exit(1);
   }
-  if (reason) await errSync(`postgres-mcp: ${reason}; running on ${node} instead.\n`);
+  if (reason) errSync(`postgres-mcp: ${reason}; running on ${node} instead.\n`);
   await launchChild(
     node,
     [SERVER_ENTRY, ...process.argv.slice(2)],
     async (err) => {
-      await errSync(`postgres-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+      errSync(`postgres-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
       process.exit(1);
     },
     withoutPermissionOptions(process.env),
@@ -1125,19 +1147,22 @@ const hostIsSupportedOam = atLeast(parseVersion(hostOam ?? ""), OAM_MIN);
 /**
  * What the fallback will do, for the stderr note that precedes it. Never
  * reached while POSTGRES_MCP_SANDBOX is on -- the plan, the no-chosen branch
- * and onLaunchFailed refuse first.
+ * and onLaunchFailed refuse first. Never reached on a supported oam host
+ * either: without the sandbox runtimePlan serves in-process there (or hands
+ * off under POSTGRES_MCP_RUNTIME=node), so discovery only ever falls back to
+ * Node.
  */
-const fallbackWhat = hostIsSupportedOam ? `serving on this oam ${hostOam} instead` : "using Node instead";
+const fallbackWhat = "using Node instead";
 
 /**
- * No usable oam, under a mode that allows a fallback. On Node, and on an oam
- * host at or above the floor, the server runs in THIS process. An oam host
- * below the floor never serves, so it hands off to Node on PATH. Never reached
- * while POSTGRES_MCP_SANDBOX is on -- the plan, the no-chosen branch and
+ * No usable oam, under a mode that allows a fallback. On Node the server runs
+ * in THIS process. An oam host that gets here is below the floor and never
+ * serves, so it hands off to Node on PATH. Never reached while
+ * POSTGRES_MCP_SANDBOX is on -- the plan, the no-chosen branch and
  * onLaunchFailed refuse first.
  */
 async function fallBack(why) {
-  if (hostOam === undefined || hostIsSupportedOam) {
+  if (hostOam === undefined) {
     await runInProcess();
     return;
   }
@@ -1166,13 +1191,21 @@ let sandbox = [];
 let childEnv = process.env;
 if (setting.on) {
   childEnv = withoutPermissionOptions(sandboxChildEnv(process.env, SANDBOX_ENV, process.platform));
+  // The server refuses to start when it can see POSTGRES_MCP_SANDBOX switched
+  // on: started without this launcher, that means no sandbox was applied. Here
+  // one is being applied, so the variable is not passed on. oam strips it
+  // anyway, as a name outside --allow-env (measured on 0.21.1); deleting it
+  // keeps the child's start from resting on that.
+  for (const key of Object.keys(childEnv)) {
+    if (key.toUpperCase() === "POSTGRES_MCP_SANDBOX") delete childEnv[key];
+  }
   const endpoint = sandboxEndpoint(childEnv.DATABASE_URL, childEnv.PGHOST, childEnv.PGPORT);
   if (endpoint.refusal) await refuse(sandboxRefusal(setting.shown, endpointProblem(endpoint.refusal)));
   sandbox = sandboxFlags(endpoint.grant);
 }
 
 if (plan === "in-process") {
-  await runInProcess();
+  await runInProcess().catch(startFailed);
 } else if (plan === "handoff-node") {
   await handOffToNode(hostIsSupportedOam ? "" : `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}`);
 } else {
@@ -1180,7 +1213,7 @@ if (plan === "in-process") {
 
   if (chosen) {
     if (overrideNote) {
-      await errSync(`postgres-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
+      errSync(`postgres-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
     }
     // `--` separates oam's own flags from the script's argv. Everything after
     // it lands in process.argv for the server, so `postgres-mcp version` and
@@ -1201,10 +1234,10 @@ if (plan === "in-process") {
           );
         }
         if (mode === "oam") {
-          await errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
+          errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
           process.exit(1);
         }
-        await errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); ${fallbackWhat}.\n`);
+        errSync(`postgres-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); ${fallbackWhat}.\n`);
         await fallBack("the newer oam could not be launched");
       },
       childEnv,
@@ -1233,7 +1266,7 @@ if (plan === "in-process") {
     if (mode === "oam") {
       // Explicitly demanded, so this is a real misconfiguration -- do not
       // silently do something else.
-      await errSync(
+      errSync(
         `postgres-mcp: POSTGRES_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
           remedyFor(found, "Or use POSTGRES_MCP_RUNTIME=node to run on Node")
@@ -1245,7 +1278,7 @@ if (plan === "in-process") {
     // auto without the sandbox: falling back is correct, but silence is how
     // someone never learns their OAM_BIN is wrong, their oam is too old to use,
     // or their install is a shape this launcher skips.
-    if (notes.length > 0) await errSync(`postgres-mcp: ${notes.join("; ")}; ${fallbackWhat}.\n`);
+    if (notes.length > 0) errSync(`postgres-mcp: ${notes.join("; ")}; ${fallbackWhat}.\n`);
     await fallBack("no newer oam was found").catch(fallbackFailed);
   }
 }

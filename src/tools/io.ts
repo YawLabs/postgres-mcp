@@ -43,11 +43,12 @@ type IoRow = {
  * whole key is absent rather than empty on older servers.
  *
  * `off` and `length` come back as decimal strings for the same reason every
- * other bigint in this repo does (stats.ts, health.ts): node-pg hands back a
- * JS number for int8 and silently loses precision past 2^53. `off` is a file
- * offset, so the cast is cheap insurance rather than a live concern; `::text`
- * is correct whether the underlying column is int4 or int8, so it also
- * insulates this query from a future widening of either column.
+ * other bigint in this repo does (stats.ts, health.ts): the explicit `::text`
+ * pins the wire type, so the output schema's `string` holds whatever the
+ * column type or the installed int8 type parser is (node-pg's default already
+ * returns int8 as a string; a JS number would lose precision past 2^53).
+ * `::text` is correct whether the underlying column is int4 or int8, so it
+ * also insulates this query from a future widening of either column.
  */
 type AioRow = {
   pid: number;

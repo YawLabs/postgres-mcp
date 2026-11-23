@@ -301,11 +301,15 @@ export const healthTools = [
             // the whole time. That gap is the tell for the long-open
             // transaction behind most of the rest of this snapshot. xact_start
             // is NULL for backends not in a transaction block.
+            //
+            // Both ages are round()ed rather than cast to numeric(10, 2): that
+            // cast raises 22003 at 10^8 seconds (3.2 years), and one such
+            // backend would cost the whole active_queries list.
             `SELECT
                pid,
                state,
-               EXTRACT(EPOCH FROM (now() - query_start))::numeric(10, 2)::float8 AS duration_seconds,
-               EXTRACT(EPOCH FROM (now() - xact_start))::numeric(10, 2)::float8 AS transaction_age_seconds,
+               round(EXTRACT(EPOCH FROM (now() - query_start))::numeric, 2)::float8 AS duration_seconds,
+               round(EXTRACT(EPOCH FROM (now() - xact_start))::numeric, 2)::float8 AS transaction_age_seconds,
                xact_start::text AS xact_start,
                wait_event_type,
                wait_event,
@@ -337,9 +341,11 @@ export const healthTools = [
             // deadlocks" is alarming since yesterday and unremarkable since
             // 2019. stats_reset is NULL when the stats have never been reset.
             //
-            // ::text on the counters: they are bigint, and node-pg would hand
-            // back a JS number that silently loses precision past 2^53 on a
-            // long-lived cluster's temp_bytes.
+            // ::text on the counters: they are bigint, and the cast pins the
+            // wire type so the output schema's `string` holds whatever int8
+            // type parser is installed -- a JS number would silently lose
+            // precision past 2^53 on a long-lived cluster's temp_bytes.
+            // (node-pg's default already returns int8 as a string.)
             //
             // cache_hit_ratio divides in numeric rather than float8 for the
             // same reason, and NULLIF guards the freshly-reset case where both
@@ -403,16 +409,18 @@ export const healthTools = [
           data: {
             connected: true,
             version: versionRes.data?.[0]?.version,
-            database: sizeRes.ok ? sizeRes.data?.[0] : null,
-            connections: connsRes.ok ? connsRes.data?.[0] : null,
-            active_queries: activeRes.ok ? activeRes.data : [],
-            // `?? null` matters here and not on the sibling single-row
-            // lookups: pg_stat_database has no row for a database the role
-            // cannot see, so a successful query can legitimately return zero
-            // rows. Normalize that to null instead of undefined, which JSON
-            // serialization would drop from the response entirely.
+            // `?? null` on every single-row lookup: a successful query that
+            // returns zero rows must read as null, not undefined, which JSON
+            // serialization would drop from the response entirely. Only
+            // database_stats can legitimately do that (pg_stat_database has no
+            // row for a database the role cannot see); the others are
+            // aggregates that always return a row, guarded the same way so a
+            // key never goes missing.
+            database: sizeRes.ok ? (sizeRes.data?.[0] ?? null) : null,
+            connections: connsRes.ok ? (connsRes.data?.[0] ?? null) : null,
+            active_queries: activeRes.ok ? (activeRes.data ?? []) : [],
             database_stats: dbStatsRes.ok ? (dbStatsRes.data?.[0] ?? null) : null,
-            table_count: tableCountRes.ok ? tableCountRes.data?.[0]?.count : null,
+            table_count: tableCountRes.ok ? (tableCountRes.data?.[0]?.count ?? null) : null,
             ...(warnings.length > 0 ? { _warnings: warnings } : {}),
           },
         };

@@ -1,1 +1,4 @@
+# Requests a review from the owner on every pull request. It does not gate a merge:
+# the main ruleset has require_code_owner_review off (checked 2026-11-22), so this
+# file is a notification, not an enforced review control.
 * @jeffyaw

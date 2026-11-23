@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import pg from "pg";
-import { formatPgError, shutdown, TERMINATE_OWN_BACKEND_SQL } from "../api.js";
+import { formatPgError, TERMINATE_OWN_BACKEND_SQL } from "../api.js";
+import { stubConnect, stubPoolQuery, withStubbedPool } from "../test-helpers/pool-stub.js";
 import {
   applySkipScanGate,
   assertSingleStatement,
   buildCandidates,
   classifyRole,
+  coveredIndexPrefix,
   extractIdentifiers,
   greedySearch,
   harvestPlanPredicates,
@@ -17,6 +18,7 @@ import {
   planTotalCost,
   type RelationPredicates,
   renderCreateIndex,
+  requiresSkipScan,
 } from "./index-advisor.js";
 
 const [pgIndexAdvisor] = indexAdvisorTools;
@@ -38,6 +40,7 @@ function candidate(table: string, columns: string[], overrides: Partial<IndexCan
     table,
     columns,
     leadingConstrained: true,
+    trailingConstrained: false,
     statements: [0],
     seqScans: 0,
     ...overrides,
@@ -81,6 +84,33 @@ describe("classifyRole", () => {
   it("reads an inequality as a range in either operand order", () => {
     assert.equal(classifyRole("created_at", "(created_at > '2024-01-01'::date)"), "range");
     assert.equal(classifyRole("created_at", "('2024-01-01'::date < created_at)"), "range");
+  });
+
+  it("reads the shapes VERBOSE really emits: alias-qualified, and wrapped in a cast", () => {
+    // Copied from `EXPLAIN (FORMAT JSON, VERBOSE)` on PostgreSQL 18 -- the tool
+    // always passes VERBOSE, which qualifies every column with its alias and
+    // parenthesizes a column it had to cast. The unqualified fixtures above are
+    // a shape production never sees; on these, the reversed operand and every
+    // cast-wrapped comparison used to fall through to "equality" and take a
+    // slot in the key prefix ahead of the true equality columns.
+    const filter =
+      "((5 < c.relpages) AND (c.reltuples >= '1'::double precision) AND (7 >= c.relchecks) AND " +
+      "(c.relkind = 'r'::\"char\") AND ((c.relname)::text > 'm'::text) AND " +
+      "((c.relnatts)::bigint >= 3) AND (3 < ((c.relfrozenxid)::text)::bigint))";
+    for (const column of ["relpages", "reltuples", "relchecks", "relname", "relnatts", "relfrozenxid"]) {
+      assert.equal(classifyRole(column, filter), "range", `${column} is compared with an inequality`);
+    }
+    assert.equal(classifyRole("relkind", filter), "equality");
+    assert.equal(classifyRole("name", "((u.name)::character varying(20) <= 'm'::text)"), "range");
+    assert.equal(classifyRole("odd name", '(5 < "u"."odd name")'), "range");
+    assert.equal(classifyRole("status", "((u.status)::text = 'active'::text)"), "equality");
+  });
+
+  it("does not read a column inside a function call as bounded by the operator after it", () => {
+    // `lower(u.email) > 'm'` cannot be bounded by a plain btree on `email`; the
+    // paren that closes the CALL carries no cast, which is what tells it from
+    // the paren that closes a cast.
+    assert.equal(classifyRole("email", "(lower((u.email)::text) > 'm'::text)"), "equality");
   });
 
   it("does NOT treat <> as a range: a btree cannot bound a scan with it", () => {
@@ -297,6 +327,47 @@ describe("buildCandidates", () => {
     assert.deepEqual(candidates.at(-1)?.columns, ["status", "created_at"]);
   });
 
+  it("keeps sort columns in ORDER BY order, never reordering them by selectivity", () => {
+    // `WHERE status = 'x' ORDER BY created_at, email`. email is unique (1) and
+    // created_at is not (0.9), so sorting the sort columns by selectivity -- as
+    // the equality columns rightly are -- built (status, email, created_at), a
+    // key that cannot return rows in created_at order. The right index was then
+    // never generated, so HypoPG never got to say it helps.
+    const candidates = buildCandidates({
+      perStatement: [predicates("public", "users", { status: ["equality"], created_at: ["sort"], email: ["sort"] })],
+      columnStats: stats,
+      existingIndexPrefixes: new Set(),
+      seqScans: new Map(),
+      maxIndexColumns: 3,
+    });
+    assert.deepEqual(
+      candidates.map((c) => c.columns),
+      [["status"], ["status", "created_at"], ["status", "created_at", "email"]],
+    );
+  });
+
+  it("harvests a Sort Key in the planner's order, which is what the candidate key then follows", () => {
+    const plan = [
+      {
+        Plan: {
+          "Node Type": "Sort",
+          "Total Cost": 300,
+          "Sort Key": ["u.created_at DESC", "u.email"],
+          Plans: [{ "Node Type": "Seq Scan", "Relation Name": "users", Schema: "public", "Total Cost": 100 }],
+        },
+      },
+    ];
+    const known = new Map([["public.users", new Set(["email", "status", "created_at"])]]);
+    const candidates = buildCandidates({
+      perStatement: [harvestPlanPredicates(plan, known)],
+      columnStats: stats,
+      existingIndexPrefixes: new Set(),
+      seqScans: new Map(),
+      maxIndexColumns: 3,
+    });
+    assert.deepEqual(candidates.at(-1)?.columns, ["created_at", "email"]);
+  });
+
   it("honors maxIndexColumns", () => {
     const candidates = buildCandidates({
       perStatement: [
@@ -350,6 +421,27 @@ describe("buildCandidates", () => {
       maxIndexColumns: 3,
     });
     for (const c of candidates) assert.equal(c.leadingConstrained, false);
+    // ...and nothing behind it is filtered either, so this is an ordering
+    // index, usable on every version, not one that needs skip scan.
+    for (const c of candidates) assert.equal(c.trailingConstrained, false);
+    for (const c of candidates) assert.equal(requiresSkipScan(c), false);
+  });
+
+  it("records a filtered column behind the leading one", () => {
+    const candidates = buildCandidates({
+      perStatement: [predicates("public", "users", { status: ["equality"], created_at: ["range"] })],
+      columnStats: stats,
+      existingIndexPrefixes: new Set(),
+      seqScans: new Map(),
+      maxIndexColumns: 3,
+    });
+    assert.deepEqual(
+      candidates.map((c) => [c.leadingConstrained, c.trailingConstrained]),
+      [
+        [true, false],
+        [true, true],
+      ],
+    );
   });
 
   it("ranks the most sequentially-scanned table first, so a tight cap keeps what matters", () => {
@@ -369,10 +461,68 @@ describe("buildCandidates", () => {
   });
 });
 
+describe("coveredIndexPrefix: what an existing index really stands in for", () => {
+  it("covers every leading column of a plain index", () => {
+    assert.deepEqual(coveredIndexPrefix(["a", "b"], [0, 0], false), ["a", "b"]);
+  });
+
+  it("covers NOTHING for a partial index, which holds only the rows its predicate admits", () => {
+    // `CREATE INDEX ON users (status) WHERE deleted_at IS NULL` cannot answer
+    // `WHERE status = 'x'`, yet it used to suppress the (status) candidate
+    // with no warning, and the tool reported that no index would help.
+    assert.deepEqual(coveredIndexPrefix(["status"], [0], true), []);
+  });
+
+  it("stops at an expression position", () => {
+    assert.deepEqual(coveredIndexPrefix(["a", null, "c"], [0, 0, 0], false), ["a"]);
+  });
+
+  it("stops where the sort direction changes: (a, b DESC) cannot return ORDER BY a, b", () => {
+    assert.deepEqual(coveredIndexPrefix(["a", "b", "c"], [0, 3, 0], false), ["a"]);
+  });
+
+  it("treats an all-DESC index as the mirror of the all-ASC candidate", () => {
+    // A btree is read backward as cheaply as forward, so (a DESC, b DESC)
+    // serves everything (a, b) does.
+    assert.deepEqual(coveredIndexPrefix(["a", "b"], [3, 3], false), ["a", "b"]);
+  });
+
+  it("covers nothing when the leading column's NULLS placement was flipped", () => {
+    // ASC NULLS FIRST (2) and DESC NULLS LAST (1) are the mirror of each other
+    // but of neither default, so neither returns a plain ORDER BY a.
+    assert.deepEqual(coveredIndexPrefix(["a"], [2], false), []);
+    assert.deepEqual(coveredIndexPrefix(["a"], [1], false), []);
+  });
+
+  it("reads a missing option as the default rather than as a mismatch", () => {
+    assert.deepEqual(coveredIndexPrefix(["a", "b"], [], false), ["a", "b"]);
+  });
+});
+
 describe("applySkipScanGate (PostgreSQL 18 skip scan)", () => {
-  const unconstrainedLead = candidate("users", ["status", "created_at"], { leadingConstrained: false });
+  // The shape the rule is about: nothing constrains `status`, but `created_at`
+  // behind it is filtered, so the index is only searchable by skipping.
+  const unconstrainedLead = candidate("users", ["status", "created_at"], {
+    leadingConstrained: false,
+    trailingConstrained: true,
+  });
   const constrainedLead = candidate("users", ["status", "created_at"], { leadingConstrained: true });
   const singleColumn = candidate("users", ["status"], { leadingConstrained: false });
+  const orderingOnly = candidate("users", ["created_at", "id"], { leadingConstrained: false });
+
+  it("never prunes an index of ordering columns only, which needs no skip scan on any version", () => {
+    // `SELECT * FROM t ORDER BY a, b`: an (a, b) btree returns that by being
+    // read in order. The gate used to prune it below PG18 with a warning about
+    // skip scan, and report `requires_skip_scan: true` for it on PG18.
+    for (const version of [0, 170_000, 180_000]) {
+      const { kept, pruned } = applySkipScanGate([orderingOnly], version);
+      assert.equal(kept.length, 1, `pruned on server_version_num ${version}`);
+      assert.equal(pruned.length, 0);
+    }
+    assert.equal(requiresSkipScan(orderingOnly), false);
+    assert.equal(requiresSkipScan(unconstrainedLead), true);
+    assert.equal(requiresSkipScan(singleColumn), false);
+  });
 
   it("PRUNES an unconstrained leading column below PG18, where the index is unusable", () => {
     const { kept, pruned } = applySkipScanGate([unconstrainedLead, constrainedLead], 170_000);
@@ -432,8 +582,18 @@ describe("renderCreateIndex", () => {
   it("does not split a multi-byte character when truncating the name", () => {
     const sql = renderCreateIndex(candidate("é".repeat(40), ["x"]), false);
     const name = /CREATE INDEX "([^"]+)"/.exec(sql)?.[1] ?? "";
-    assert.ok(Buffer.byteLength(name, "utf8") <= 63);
-    assert.ok(!name.includes("�"), "truncation produced a replacement character");
+    // `é` is two bytes. "idx_" leaves 59, which is 29 whole characters and one
+    // byte over: the name must stop at 62 bytes rather than emit half of the
+    // 30th. Asserting the exact text is what makes this about multi-byte
+    // handling -- the name used to be flattened to underscores before it was
+    // measured, so the byte-aware path never ran and any truncation passed.
+    assert.equal(name, `idx_${"é".repeat(29)}`);
+    assert.equal(Buffer.byteLength(name, "utf8"), 62);
+  });
+
+  it("keeps non-ASCII letters in the name and still replaces punctuation", () => {
+    const sql = renderCreateIndex(candidate("commandes été", ["créé-le"]), false);
+    assert.match(sql, /CREATE INDEX "idx_commandes_été_créé_le" /);
   });
 });
 
@@ -448,17 +608,22 @@ describe("renderCreateIndex", () => {
 // left the entire suite green. The `extended: true` assertion below is the one
 // that kills that mutant, so do not relax it.
 //
-// The postgres error fixtures are built by calling the REAL formatPgError
-// rather than hand-writing its output. BIND_COUNT_MISMATCH matches on the
-// `(code: 08P01)` fragment that function renders, so going through it keeps the
-// guard's regex coupled to the real renderer: if formatPgError ever stops
-// emitting that fragment, case (b) fails here instead of the guard silently
-// starting to reject every parameterized statement in production.
+// The postgres error fixtures carry what the real shared runner returns for a
+// failed statement: the text from the REAL formatPgError, and the SQLSTATE on
+// `code` beside it. The guard reads only `code`. The text is still built by
+// the real renderer so that it contains the `(code: X)` fragment production
+// text contains -- which is what lets the echoed-identifier case below prove
+// the guard is not searching that text.
 // ─────────────────────────────────────────────────────────────────────────
 describe("assertSingleStatement: the stacked-query guard", () => {
   /** A pg-shaped error: an Error carrying a SQLSTATE on `code`. */
   function pgError(message: string, code: string): Error {
     return Object.assign(new Error(message), { code });
+  }
+
+  /** A failed statement as the shared runner reports it. */
+  function failure(message: string, code: string) {
+    return { ok: false, error: formatPgError(pgError(message, code)), code, serverError: true };
   }
 
   /**
@@ -509,22 +674,16 @@ describe("assertSingleStatement: the stacked-query guard", () => {
   it("(b) treats an 08P01 bind-count mismatch as proof of a single statement", async () => {
     // BIND happens after PARSE, so reaching a bind error proves the string
     // parsed as ONE command -- it just carries unbound $n placeholders.
-    const { run } = fakeRunner({
-      ok: false,
-      error: formatPgError(
-        pgError('bind message supplies 0 parameters, but prepared statement "" requires 1', "08P01"),
-      ),
-    });
+    const { run } = fakeRunner(
+      failure('bind message supplies 0 parameters, but prepared statement "" requires 1', "08P01"),
+    );
     const out = await assertSingleStatement(run, "EXPLAIN (FORMAT JSON, VERBOSE, GENERIC_PLAN) SELECT $1");
     assert.equal(out.ok, true, "a parameterized statement must be cleared, not rejected");
     assert.equal(out.cost, undefined, "nothing was planned, so the caller has to run the real EXPLAIN");
   });
 
   it("(c) rejects a 42601 multi-command string", async () => {
-    const { run } = fakeRunner({
-      ok: false,
-      error: formatPgError(pgError("cannot insert multiple commands into a prepared statement", "42601")),
-    });
+    const { run } = fakeRunner(failure("cannot insert multiple commands into a prepared statement", "42601"));
     const out = await assertSingleStatement(run, "EXPLAIN (FORMAT JSON) SELECT 1; DROP TABLE users;");
     assert.equal(out.ok, false, "a stacked payload must be rejected");
     assert.match(out.error ?? "", /multiple commands/);
@@ -540,10 +699,27 @@ describe("assertSingleStatement: the stacked-query guard", () => {
       ["permission denied for table users", "42501"],
       ["some future error", "XX999"],
     ] as const) {
-      const { run } = fakeRunner({ ok: false, error: formatPgError(pgError(message, code)) });
+      const { run } = fakeRunner(failure(message, code));
       const out = await assertSingleStatement(run, "EXPLAIN (FORMAT JSON) SELECT 1");
       assert.equal(out.ok, false, `SQLSTATE ${code} must not clear the guard`);
     }
+  });
+
+  it("is not cleared by error TEXT that merely contains the 08P01 fragment", async () => {
+    // The server echoes identifiers from the statement into its message, so
+    // `SELECT 1 FROM "(code: 08P01)"` fails with 42P01 and this exact text. A
+    // guard that searched the formatted error for `(code: 08P01)` cleared it;
+    // the SQLSTATE the runner reports beside the text is the only thing read.
+    const echoed = failure('relation "(code: 08P01)" does not exist', "42P01");
+    assert.match(echoed.error, /\(code: 08P01\)/, "the fixture must contain the fragment to mean anything");
+    const { run } = fakeRunner(echoed);
+    const out = await assertSingleStatement(run, 'EXPLAIN (FORMAT JSON) SELECT 1 FROM "(code: 08P01)"');
+    assert.equal(out.ok, false, "a 42P01 whose message echoes the 08P01 fragment must still be rejected");
+    assert.match(out.error ?? "", /does not exist/);
+
+    // ...and a failure carrying no SQLSTATE at all (a dead socket) clears nothing.
+    const dead = fakeRunner({ ok: false, error: "Connection terminated unexpectedly (code: 08P01)" });
+    assert.equal((await assertSingleStatement(dead.run, "EXPLAIN (FORMAT JSON) SELECT $1")).ok, false);
   });
 
   it("releases the savepoint on both the success and the failure path", async () => {
@@ -553,7 +729,7 @@ describe("assertSingleStatement: the stacked-query guard", () => {
     await assertSingleStatement(ok.run, "EXPLAIN (FORMAT JSON) SELECT 1");
     assert.equal(ok.calls.filter((c) => /^RELEASE SAVEPOINT/i.test(c.sql)).length, 1);
 
-    const bad = fakeRunner({ ok: false, error: formatPgError(pgError("nope", "42601")) });
+    const bad = fakeRunner(failure("nope", "42601"));
     await assertSingleStatement(bad.run, "EXPLAIN (FORMAT JSON) SELECT 1; SELECT 2;");
     assert.equal(bad.calls.filter((c) => /^ROLLBACK TO SAVEPOINT/i.test(c.sql)).length, 1);
     assert.equal(bad.calls.filter((c) => /^RELEASE SAVEPOINT/i.test(c.sql)).length, 1);
@@ -801,6 +977,49 @@ describe("greedySearch bounded search", () => {
     assert.equal(result.accepted[0]?.costAfter, 10_000);
   });
 
+  it("accepts nothing at minImprovement 0 when no candidate lowers a cost", async () => {
+    // 0 means "accept any gain", not "accept anything". The threshold alone
+    // cannot say so -- an unchanged cost is an improvement of 0, and 0 < 0 is
+    // false -- so every candidate used to be accepted in turn, up to
+    // maxRecommendations, each as a recommendation that helps no statement.
+    const result = await greedySearch({
+      candidates: [candidate("a", ["x"]), candidate("b", ["y"]), candidate("c", ["z"])],
+      currentCosts: [1000],
+      weights: [1],
+      explainBudget: 100,
+      minImprovement: 0,
+      maxRecommendations: 5,
+      evaluate: async () => new Map([[0, 1000]]),
+    });
+    assert.deepEqual(result.accepted, []);
+  });
+
+  it("accepts nothing when the whole workload already costs 0", async () => {
+    const result = await greedySearch({
+      candidates: [candidate("a", ["x"])],
+      currentCosts: [0],
+      weights: [1],
+      explainBudget: 100,
+      minImprovement: 0,
+      maxRecommendations: 5,
+      evaluate: async () => new Map([[0, 0]]),
+    });
+    assert.deepEqual(result.accepted, []);
+  });
+
+  it("still accepts a real gain, however small, at minImprovement 0", async () => {
+    const result = await greedySearch({
+      candidates: [candidate("a", ["x"])],
+      currentCosts: [1000],
+      weights: [1],
+      explainBudget: 100,
+      minImprovement: 0,
+      maxRecommendations: 5,
+      evaluate: async () => new Map([[0, 999]]),
+    });
+    assert.equal(result.accepted.length, 1);
+  });
+
   it("skips a candidate that touches no statement instead of spending budget on it", async () => {
     let called = false;
     const result = await greedySearch({
@@ -891,6 +1110,15 @@ interface StubOptions {
   dieDuring?: { containing: string; ordinal: number };
   /** The plan's Filter. The default names two columns; one column yields a single candidate. */
   planFilter?: string;
+  /** The plan's Sort Key, in ORDER BY order. Absent by default. */
+  planSortKey?: string[];
+  /**
+   * Rows the existing-index catalog read returns for public.users: key columns,
+   * their `indoption` values, and whether the index is partial. None by default.
+   * `columns` may be a string to model what node-pg returns for an unparsed
+   * `name[]`.
+   */
+  existingIndexes?: { columns: (string | null)[] | string; options: number[]; partial: boolean }[];
   /** Make the FIRST hypopg_create_index refuse the index, as HypoPG does for a shape it cannot model. */
   declineCreateOnce?: boolean;
   /**
@@ -990,6 +1218,8 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     dieAfterDrops,
     dieDuring,
     planFilter = "((status = 'active'::text) AND (created_at > '2024-01-01'::date))",
+    planSortKey,
+    existingIndexes = [],
     declineCreateOnce = false,
     failEntryReset,
     failColumnCatalog = false,
@@ -1002,10 +1232,6 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     refuseTerminate = false,
     columns = ["id", "status", "created_at"],
   } = options;
-
-  const originalConnect = pg.Pool.prototype.connect;
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
 
   const statements: StubStatement[] = [];
   const releases: unknown[] = [];
@@ -1089,6 +1315,7 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
         // search still recommends exactly one index -- but a second candidate
         // is what makes "the search stopped sending" observable.
         Filter: planFilter,
+        ...(planSortKey ? { "Sort Key": planSortKey } : {}),
       },
     },
   ];
@@ -1214,9 +1441,12 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     // pg_attribute, so a looser check would swallow it.
     if (sql.includes("FROM pg_catalog.pg_index")) {
       if (failIndexCatalog) throw timeout();
-      return ok("SELECT");
+      return ok(
+        "SELECT",
+        existingIndexes.map((index) => ({ schema: "public", table: "users", ...index })),
+      );
     }
-    if (sql.includes("LEFT JOIN pg_catalog.pg_stats")) {
+    if (sql.includes("FROM pg_catalog.pg_stats")) {
       if (failColumnCatalog) throw timeout();
       const rows = columns.map((column) => ({
         schema: "public",
@@ -1276,43 +1506,34 @@ async function withStubbedServer<T>(options: StubOptions, fn: (session: StubSess
     },
   };
 
-  await shutdown();
-  process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown, params: unknown[] = []) {
-    const text = typeof sql === "string" ? sql : "";
-    statements.push({ sql: text, params, inTransaction: false });
-    if (text.includes("server_version_num")) return Promise.resolve({ rows: [{ v: String(versionNum) }] });
-    if (text.includes("extname = 'hypopg'")) return Promise.resolve({ rows: [{ installed: hypopgInstalled }] });
-    if (text.includes("extname = 'pg_stat_statements'")) return Promise.resolve({ rows: [{ version: "1.10" }] });
-    if (text.includes("FROM pg_stat_statements") && text.includes("ORDER BY")) {
-      return Promise.resolve({ rows: topQueries });
+  return withStubbedPool(async () => {
+    stubPoolQuery(async (text, params) => {
+      statements.push({ sql: text, params, inTransaction: false });
+      if (text.includes("server_version_num")) return { rows: [{ v: String(versionNum) }] };
+      if (text.includes("extname = 'hypopg'")) return { rows: [{ installed: hypopgInstalled }] };
+      if (text.includes("extname = 'pg_stat_statements'")) return { rows: [{ version: "1.10" }] };
+      if (text.includes("FROM pg_stat_statements") && text.includes("ORDER BY")) {
+        return { rows: topQueries };
+      }
+      if (text.includes("pg_stat_user_tables")) {
+        return { rows: [{ schema: "public", table: "users", seq_scan: "500" }] };
+      }
+      return { rows: [] };
+    });
+    stubConnect(() => client);
+    // Captured rather than printed: a discarded connection and a socket death
+    // both log, and the tests assert on those lines instead of reading them in
+    // the runner output.
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      stderr.push(args.map(String).join(" "));
+    };
+    try {
+      return await fn(session);
+    } finally {
+      console.error = originalError;
     }
-    if (text.includes("pg_stat_user_tables")) {
-      return Promise.resolve({ rows: [{ schema: "public", table: "users", seq_scan: "500" }] });
-    }
-    return Promise.resolve({ rows: [] });
-  } as unknown as typeof pg.Pool.prototype.query;
-  pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-    return Promise.resolve(client);
-  } as unknown as typeof pg.Pool.prototype.connect;
-  // Captured rather than printed: a discarded connection and a socket death
-  // both log, and the tests assert on those lines instead of reading them in
-  // the runner output.
-  const originalError = console.error;
-  console.error = (...args: unknown[]) => {
-    stderr.push(args.map(String).join(" "));
-  };
-
-  try {
-    return await fn(session);
-  } finally {
-    console.error = originalError;
-    pg.Pool.prototype.connect = originalConnect;
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  }
+  });
 }
 
 describe("pg_index_advisor input guards", () => {
@@ -1439,7 +1660,9 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
       // Once on entry (a previous call's teardown may have failed) and once in
       // the finally. HypoPG indexes are SESSION-scoped, so the transaction's
       // ROLLBACK does not remove them and this connection goes back to the pool.
-      assert.ok(session.count("hypopg_reset") >= 2, `saw ${session.count("hypopg_reset")} resets`);
+      // Exactly two, and counted as SENT: a third would be a reset inside the
+      // search, which wipes the accepted indexes the next round costs on top of.
+      assert.equal(session.sent("hypopg_reset"), 2, `saw ${session.sent("hypopg_reset")} resets`);
       // The reset must be the LAST hypopg statement, or an index outlives the call.
       const hypoCalls = session.statements.filter((s) => s.sql.includes("hypopg"));
       const last = hypoCalls.at(-1);
@@ -2112,7 +2335,40 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
       // A hypopg_reset() inside the search would wipe previously accepted
       // indexes and silently degrade the greedy search to an independent
       // per-candidate ranking, so each candidate is retired with a targeted drop.
-      assert.ok(session.count("hypopg_drop_index") >= 1);
+      // Three evaluations -- (status) and (status, created_at) in round one, the
+      // loser again in round two -- so three drops, and nothing between the
+      // first create and the last drop may be a reset. Counting drops alone
+      // would pass with a reset beside each one.
+      assert.equal(session.count("hypopg_drop_index"), 3);
+      const texts = session.texts();
+      const firstCreate = texts.findIndex((s) => s.includes("hypopg_create_index"));
+      const lastDrop = texts.map((s) => s.includes("hypopg_drop_index")).lastIndexOf(true);
+      assert.ok(firstCreate > 0 && lastDrop > firstCreate, "the search created and dropped nothing");
+      assert.deepEqual(
+        texts.slice(firstCreate, lastDrop + 1).filter((s) => s.includes("hypopg_reset")),
+        [],
+        "hypopg_reset() ran in the middle of the search",
+      );
+      assert.equal(session.sent("hypopg_reset"), 2, "one reset on the way in, one in the teardown");
+    });
+  });
+
+  it("asks the catalog for one stats row per column, and for what each existing index really covers", async () => {
+    // Both are properties of SQL the stub cannot execute, so the text is what
+    // can be pinned here; the shapes were run against PostgreSQL 18. An
+    // inheritance parent has two pg_stats rows per column (`inherited` false
+    // and true), and a plain join returned both, leaving the key order to
+    // whichever arrived last.
+    await withStubbedServer({}, async (session) => {
+      await pgIndexAdvisor.handler({ statements: ONE_STATEMENT });
+      const stats = session.texts().find((s) => s.includes("FROM pg_catalog.pg_stats"));
+      assert.match(stats ?? "", /LEFT JOIN LATERAL \([\s\S]*ORDER BY st\.inherited\s+LIMIT 1/);
+      const indexes = session.texts().find((s) => s.includes("FROM pg_catalog.pg_index"));
+      assert.match(indexes ?? "", /i\.indpred IS NOT NULL AS partial/);
+      // node-pg does not parse `name[]`: without the cast the key columns
+      // arrive as the string `{status}` and no existing index matches anything.
+      assert.match(indexes ?? "", /SELECT a\.attname::text\s/);
+      assert.match(indexes ?? "", /unnest\(i\.indoption\[0:i\.indnkeyatts - 1\]\)/);
     });
   });
 
@@ -2250,14 +2506,109 @@ describe("pg_index_advisor end-to-end against a stubbed server", () => {
     });
   });
 
-  it("reports skip_scan_available: false and prunes on a pre-PG18 server", async () => {
+  it("reports skip_scan_available: false on a pre-PG18 server, and prunes nothing it can use", async () => {
     await withStubbedServer({ versionNum: 170_000 }, async () => {
       const result = (await pgIndexAdvisor.handler({
         statements: ["SELECT * FROM users WHERE status = 'active'"],
       })) as { ok: boolean; data?: { skip_scan_available: boolean; candidates_pruned_leading_column: number } };
       assert.equal(result.ok, true);
       assert.equal(result.data?.skip_scan_available, false);
-      assert.equal(typeof result.data?.candidates_pruned_leading_column, "number");
+      // (status) and (status, created_at) both lead with a filtered column.
+      assert.equal(result.data?.candidates_pruned_leading_column, 0);
+    });
+  });
+
+  // `SELECT * FROM users ORDER BY created_at, status`: nothing is filtered, so
+  // no candidate has a constrained leading column -- and none needs one.
+  const ORDER_BY_ONLY = {
+    planFilter: "",
+    planSortKey: ["users.created_at", "users.status"],
+    // (created_at) already exists, which leaves the two-column candidate as
+    // the only one and so the one the search has to accept.
+    existingIndexes: [{ columns: ["created_at"], options: [0], partial: false }],
+  };
+  type OrderByResult = {
+    ok: boolean;
+    data?: {
+      recommendations: { columns: string[]; requires_skip_scan: boolean }[];
+      candidates_considered: number;
+      candidates_pruned_leading_column: number;
+      _warnings?: string[];
+    };
+  };
+
+  it("keeps a multi-column ORDER BY index below PG18 instead of pruning it as needing skip scan", async () => {
+    await withStubbedServer({ ...ORDER_BY_ONLY, versionNum: 170_000 }, async () => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users ORDER BY created_at, status"],
+      })) as OrderByResult;
+      assert.equal(result.ok, true);
+      assert.equal(result.data?.candidates_pruned_leading_column, 0);
+      assert.equal(result.data?.candidates_considered, 1);
+      // In ORDER BY order: status is far less selective than created_at here,
+      // and would have led under the old selectivity ordering of sort columns.
+      assert.deepEqual(result.data?.recommendations[0]?.columns, ["created_at", "status"]);
+      assert.ok(
+        !(result.data?._warnings ?? []).some((w) => /skip scan/.test(w)),
+        `an ordering index was reported as a skip-scan casualty: ${JSON.stringify(result.data?._warnings)}`,
+      );
+    });
+  });
+
+  it("does not claim a multi-column ORDER BY index relies on skip scan on PG18", async () => {
+    await withStubbedServer({ ...ORDER_BY_ONLY, versionNum: 180_000 }, async () => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users ORDER BY created_at, status"],
+      })) as OrderByResult;
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.data?.recommendations[0]?.columns, ["created_at", "status"]);
+      assert.equal(result.data?.recommendations[0]?.requires_skip_scan, false);
+    });
+  });
+
+  it("still proposes an index a PARTIAL existing index on the same column cannot stand in for", async () => {
+    // `CREATE INDEX ON users (status) WHERE deleted_at IS NULL` is in place.
+    // It does not answer `WHERE status = 'active'`, so (status) must still be
+    // costed; a plain index on (status) is what legitimately suppresses it.
+    const statements = ["SELECT * FROM users WHERE status = 'active'"];
+    type Result = { ok: boolean; data?: { recommendations: { columns: string[] }[]; candidates_considered: number } };
+    const partial = { columns: ["status"], options: [0], partial: true };
+    await withStubbedServer({ planFilter: "(status = 'active'::text)", existingIndexes: [partial] }, async () => {
+      const result = (await pgIndexAdvisor.handler({ statements })) as Result;
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.data?.recommendations[0]?.columns, ["status"]);
+    });
+    const plain = { ...partial, partial: false };
+    await withStubbedServer({ planFilter: "(status = 'active'::text)", existingIndexes: [plain] }, async () => {
+      const result = (await pgIndexAdvisor.handler({ statements })) as Result;
+      assert.equal(result.ok, true);
+      assert.equal(result.data?.candidates_considered, 0);
+      assert.deepEqual(result.data?.recommendations, []);
+    });
+  });
+
+  it("does not read an unparsed array literal as a list of one-character columns", async () => {
+    // What the catalog read returned before its `::text` cast: the string
+    // `{status}`. Iterated, that is eight one-character "columns"; it must
+    // simply cover nothing and leave the search running.
+    const unparsed = { columns: "{status}", options: [0], partial: false };
+    await withStubbedServer({ planFilter: "(status = 'active'::text)", existingIndexes: [unparsed] }, async () => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users WHERE status = 'active'"],
+      })) as { ok: boolean; error?: string; data?: { candidates_considered: number } };
+      assert.equal(result.ok, true, `expected the search to run, got: ${result.error}`);
+      assert.equal(result.data?.candidates_considered, 1);
+    });
+  });
+
+  it("recommends nothing at min_improvement 0 when no index lowers a cost", async () => {
+    await withStubbedServer({ baselineCost: 1000, indexedCost: 1000 }, async () => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users WHERE status = 'active'"],
+        min_improvement: 0,
+      })) as { ok: boolean; data?: { recommendations: unknown[] } };
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.data?.recommendations, []);
     });
   });
 
@@ -2267,14 +2618,24 @@ describe("pg_index_advisor end-to-end against a stubbed server", () => {
         statements: ["SELECT * FROM users WHERE status = 'active'"],
         max_explains: 1,
         max_candidates: 5,
-      })) as { ok: boolean; data?: { explains_used: number; explain_budget: number } };
+      })) as {
+        ok: boolean;
+        data?: { explains_used: number; explain_budget: number; budget_exhausted: boolean; _warnings?: string[] };
+      };
       assert.equal(result.ok, true);
-      assert.ok((result.data?.explains_used ?? 99) <= 1);
+      // Two candidates, one statement each, and room for one EXPLAIN: the first
+      // is costed, the second would overshoot, and the result has to say so.
+      assert.equal(result.data?.explains_used, 1);
       assert.equal(result.data?.explain_budget, 1);
+      assert.equal(result.data?.budget_exhausted, true);
+      assert.ok(
+        (result.data?._warnings ?? []).some((w) => /stopped at the `max_explains` budget of 1/.test(w)),
+        `no truncation warning in ${JSON.stringify(result.data?._warnings)}`,
+      );
     });
   });
 
-  it("weights a pg_stat_statements workload by its call count", async () => {
+  it("errors when pg_stat_statements is installed but has recorded nothing", async () => {
     await withStubbedServer({}, async () => {
       // No `statements` argument, so the workload comes from pg_stat_statements.
       // The stub's pool query returns no rows for the ranking select, which is
@@ -2285,33 +2646,95 @@ describe("pg_index_advisor end-to-end against a stubbed server", () => {
     });
   });
 
+  it("weights a pg_stat_statements workload by its call count", async () => {
+    // Both rows plan at the stub's 1000 and drop to 10 under an index, so every
+    // total below is the call counts doing the multiplying: 300 + 7 calls.
+    const topQueries = [
+      { query: "SELECT * FROM users WHERE status = $1", calls: "300" },
+      { query: "SELECT * FROM users WHERE created_at > $1", calls: "7" },
+    ];
+    await withStubbedServer({ topQueries }, async () => {
+      const result = (await pgIndexAdvisor.handler({})) as {
+        ok: boolean;
+        error?: string;
+        data?: {
+          recommendations: {
+            workload_cost_before: number;
+            workload_cost_after: number;
+            workload_cost_reduction_pct: number;
+            helps_statements: { statement: number; cost_before: number; cost_after: number }[];
+          }[];
+          statements: { calls: string; baseline_cost: number | null }[];
+          baseline_workload_cost: number;
+          final_workload_cost: number;
+        };
+      };
+      assert.equal(result.ok, true, `expected the call to proceed, got: ${result.error}`);
+      const data = result.data;
+      assert.ok(data);
+      // `calls` goes out as the text postgres sent; the per-statement cost is
+      // the UNWEIGHTED estimate, so the weighting shows only in the totals.
+      assert.deepEqual(
+        data.statements.map((s) => [s.calls, s.baseline_cost]),
+        [
+          ["300", 1000],
+          ["7", 1000],
+        ],
+      );
+      assert.equal(data.baseline_workload_cost, 307_000);
+      assert.equal(data.recommendations.length, 1);
+      const rec = data.recommendations[0];
+      assert.ok(rec);
+      assert.equal(rec.workload_cost_before, 307_000);
+      assert.equal(rec.workload_cost_after, 3070);
+      assert.equal(rec.workload_cost_reduction_pct, 99);
+      assert.deepEqual(rec.helps_statements, [
+        { statement: 0, cost_before: 1000, cost_after: 10 },
+        { statement: 1, cost_before: 1000, cost_after: 10 },
+      ]);
+      assert.equal(data.final_workload_cost, 3070);
+    });
+  });
+
+  it("attempts GENERIC_PLAN when the server version could not be read, instead of blaming the server's age", async () => {
+    // getServerVersionNum answers 0 for a failed probe. Reading that as "older
+    // than 16" skipped every `$n` statement -- a whole pg_stat_statements
+    // workload -- and ended in "No statement in the workload could be planned".
+    await withStubbedServer({ versionNum: 0 }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users WHERE status = $1"],
+      })) as { ok: boolean; error?: string; data?: { statements: { planned: boolean }[]; _warnings?: string[] } };
+      assert.equal(result.ok, true, `expected the statement to be planned, got: ${result.error}`);
+      assert.equal(result.data?.statements[0]?.planned, true);
+      assert.ok(session.sent("GENERIC_PLAN") >= 1, "GENERIC_PLAN was never attempted");
+      assert.ok(!(result.data?._warnings ?? []).some((w) => /this server is older/.test(w)));
+    });
+  });
+
+  it("still skips a parameterized statement on a server KNOWN to predate GENERIC_PLAN", async () => {
+    await withStubbedServer({ versionNum: 150_000 }, async (session) => {
+      const result = (await pgIndexAdvisor.handler({
+        statements: ["SELECT * FROM users WHERE status = $1"],
+      })) as { ok: boolean; error?: string };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /this server is older/);
+      assert.equal(session.sent("GENERIC_PLAN"), 0);
+    });
+  });
+
   it("errors with both fixes named when pg_stat_statements is absent and no statements were given", async () => {
-    const originalConnect = pg.Pool.prototype.connect;
-    const originalQuery = pg.Pool.prototype.query;
-    const originalDbUrl = process.env.DATABASE_URL;
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-    pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
-      const text = typeof sql === "string" ? sql : "";
-      if (text.includes("server_version_num")) return Promise.resolve({ rows: [{ v: "180000" }] });
-      if (text.includes("extname = 'hypopg'")) return Promise.resolve({ rows: [{ installed: true }] });
-      // pg_stat_statements not installed: the extversion probe returns no rows.
-      return Promise.resolve({ rows: [] });
-    } as unknown as typeof pg.Pool.prototype.query;
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.reject(new Error("should not connect"));
-    } as unknown as typeof pg.Pool.prototype.connect;
-    try {
+    await withStubbedPool(async () => {
+      stubPoolQuery(async (text) => {
+        if (text.includes("server_version_num")) return { rows: [{ v: "180000" }] };
+        if (text.includes("extname = 'hypopg'")) return { rows: [{ installed: true }] };
+        // pg_stat_statements not installed: the extversion probe returns no rows.
+        return { rows: [] };
+      });
+      stubConnect(() => Promise.reject(new Error("should not connect")));
       const result = (await pgIndexAdvisor.handler({})) as { ok: boolean; error?: string };
       assert.equal(result.ok, false);
       assert.match(result.error ?? "", /pass `statements` explicitly/);
       assert.match(result.error ?? "", /CREATE EXTENSION pg_stat_statements;/);
-    } finally {
-      pg.Pool.prototype.connect = originalConnect;
-      pg.Pool.prototype.query = originalQuery;
-      await shutdown();
-      if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-      else process.env.DATABASE_URL = originalDbUrl;
-    }
+    });
   });
 });

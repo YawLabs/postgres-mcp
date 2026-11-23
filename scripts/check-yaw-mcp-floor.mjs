@@ -42,9 +42,10 @@
  * a failed release would just get switched off.
  */
 
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { compareVersions, isMainModule, parseVersion } from "./lib/versions.mjs";
 
 /** The Yaw MCP release this server is tested with. Bump both together. */
 export const YAW_MCP_MIN = "1.1.16";
@@ -76,18 +77,6 @@ const SCANNED = ["README.md", "CLAUDE.md"];
  * "Yaw MCP v1.1.13 or newer".
  */
 const CLAIM_RE = /\b(?:Yaw MCP|yaw-mcp)\s+v?(\d+\.\d+\.\d+)\s+or\s+(?:newer|later)\b/gi;
-
-export function parseVersion(text) {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(text).trim());
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-
-export function compareVersions(a, b) {
-  for (let i = 0; i < 3; i++) {
-    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
-  }
-  return 0;
-}
 
 /**
  * The devDependency half: a @yawlabs/mcp-compliance devDependency, when there is
@@ -183,25 +172,8 @@ async function main() {
   process.exit(failed ? 1 : 0);
 }
 
-/**
- * True when `argv1` (process.argv[1]) names the module at `moduleUrl`. Both sides
- * are realpath'd, as in check-oam-floor.mjs: Node realpaths the main module's URL
- * but not argv[1], so from a junctioned checkout a plain compare skipped main()
- * and exited 0 in silence.
- */
-export function isMainModule(argv1, moduleUrl) {
-  if (!argv1) return false;
-  const real = (p) => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return resolve(p);
-    }
-  };
-  return real(argv1) === real(fileURLToPath(moduleUrl));
-}
-
-// Only run when invoked directly, so the helpers above stay importable.
+// Only run when invoked directly, so the helpers above stay importable. The
+// compare realpaths both sides (scripts/lib/versions.mjs says why).
 if (isMainModule(process.argv[1], import.meta.url)) {
   await main();
 }

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it } from "node:test";
-import pg from "pg";
-import { shutdown } from "../api.js";
+import { describe, it } from "node:test";
+import { stubClient, stubConnect, stubPoolQuery, useStubbedPool } from "../test-helpers/pool-stub.js";
 import { healthTools } from "./health.js";
 
 const pgHealth = healthTools.find((t) => t.name === "pg_health")!;
@@ -96,9 +95,9 @@ function rowsFor(sql: string, waitEvent: WaitEventPair = DEFAULT_WAIT_EVENT): Re
         {
           deadlocks: "3",
           temp_files: "2",
-          // Past 2^53 deliberately: the ::text casts exist so node-pg hands
-          // these back as strings instead of silently rounding a long-lived
-          // cluster's temp_bytes.
+          // Past 2^53 deliberately: the ::text casts pin these as strings, so
+          // no int8 type parser can silently round a long-lived cluster's
+          // temp_bytes.
           temp_bytes: "9007199254740993",
           temp_bytes_pretty: "8192 TB",
           conflicts: "0",
@@ -209,10 +208,9 @@ function bucketCounts(predicate: string, state: string | null): boolean {
 }
 
 describe("pg_health (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
   let seen: { sql: string; params: unknown[] }[] = [];
+  /** Sub-queries that succeed with zero rows; reset by every installStub. */
+  let emptyRows: HealthQuery[] = [];
 
   /**
    * @param failing categories whose sub-query throws, standing in for the
@@ -223,52 +221,27 @@ describe("pg_health (stubbed connect, no live DB)", () => {
    */
   function installStub(failing: HealthQuery[] = [], emptyVersionRow = false, waitEvent = DEFAULT_WAIT_EVENT) {
     seen = [];
-    pg.Pool.prototype.query = function queryStub(this: pg.Pool) {
-      return Promise.resolve({ rows: [] });
-    } as unknown as typeof pg.Pool.prototype.query;
+    emptyRows = [];
+    stubPoolQuery(async () => ({ rows: [] }));
 
-    const client = {
-      async query(sql: string, params: unknown[] = []) {
-        seen.push({ sql, params });
-        if (failing.includes(categorize(sql))) throw new Error("permission denied");
-        if (emptyVersionRow && categorize(sql) === "version") return { rows: [] };
-        return { rows: rowsFor(sql, waitEvent) };
-      },
-      release() {
-        /* no-op */
-      },
-      // acquireClient() attaches an 'error' listener for the checked-out lifetime.
-      on() {
-        return this;
-      },
-      removeListener() {
-        return this;
-      },
-    };
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(client);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    const client = stubClient(async (sql: string, params: unknown[] = []) => {
+      seen.push({ sql, params });
+      if (failing.includes(categorize(sql))) throw new Error("permission denied");
+      if (emptyVersionRow && categorize(sql) === "version") return { rows: [] };
+      if (emptyRows.includes(categorize(sql))) return { rows: [] };
+      return { rows: rowsFor(sql, waitEvent) };
+    });
+    stubConnect(() => client);
   }
 
   function sqlFor(category: HealthQuery): string {
     return seen.find((q) => categorize(q.sql) === category)?.sql ?? "";
   }
 
-  beforeEach(async () => {
-    // shutdown() rebuilds the pool against the stub and clears the
-    // process-wide cached server_version_num, so no state leaks between cases
-    // or in from a sibling suite in the same runner process.
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  });
-
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  });
+  // The shutdown() on the way in rebuilds the pool against the stub and clears
+  // the process-wide cached server_version_num, so no state leaks between
+  // cases or in from a sibling suite in the same runner process.
+  useStubbedPool();
 
   it("issues exactly the six documented fanout sub-queries on one shared client", async () => {
     installStub();
@@ -492,10 +465,46 @@ describe("pg_health (stubbed connect, no live DB)", () => {
       assert.match(res.data?.version ?? "", /PostgreSQL 17\.4/);
       for (const [, , other] of PARTIAL) {
         if (other === field) continue;
-        assert.notEqual(res.data?.[other], null, `${other} should still be populated`);
+        // `!= null` semantics spelled out: under node:assert/strict a bare
+        // notEqual(x, null) is `!==`, which `undefined` -- a field dropped
+        // from the response -- passes as "populated".
+        const value = res.data?.[other];
+        assert.ok(value !== null && value !== undefined, `${other} should still be populated`);
       }
     });
   }
+
+  it("a sub-query that succeeds with zero rows yields null, never a dropped key", async () => {
+    // ok-but-empty is not a failure, so no warning fires; without `?? null`
+    // the field is undefined, JSON serialization drops it, and the caller
+    // reads "key missing" with nothing to say why.
+    installStub();
+    emptyRows = ["size", "conns", "dbStats", "tableCount"];
+    const res = (await pgHealth.handler({})) as HealthResponse;
+    assert.equal(res.ok, true);
+    const wire = JSON.parse(JSON.stringify(res.data)) as Record<string, unknown>;
+    for (const field of ["database", "connections", "database_stats", "table_count"]) {
+      assert.ok(Object.hasOwn(wire, field), `${field} was dropped from the serialized response`);
+      assert.equal(wire[field], null);
+    }
+  });
+
+  it("the active-query ages carry no precision cap", async () => {
+    installStub();
+    await pgHealth.handler({});
+    const sql = sqlFor("active");
+    // numeric(10, 2) raises 22003 at 10^8 seconds (3.2 years); one backend
+    // that old would cost the whole active_queries list.
+    assert.match(
+      sql,
+      /round\(EXTRACT\(EPOCH FROM \(now\(\) - query_start\)\)::numeric, 2\)::float8 AS duration_seconds/,
+    );
+    assert.match(
+      sql,
+      /round\(EXTRACT\(EPOCH FROM \(now\(\) - xact_start\)\)::numeric, 2\)::float8 AS transaction_age_seconds/,
+    );
+    assert.doesNotMatch(sql, /numeric\(\d+,\s*\d+\)/);
+  });
 
   it("only the version probe is fatal -- it means connectivity, not permissions", async () => {
     installStub(["version"]);

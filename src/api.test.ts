@@ -2,18 +2,37 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type pg from "pg";
 import {
+  errorMessage,
+  formatPgError,
   getApplicationName,
   getConnectionTimeoutMs,
   getMaxRows,
   getPool,
   getPoolMax,
+  getQueryDeadlineMs,
   getServerVersionNum,
   getSslConfig,
   getStatementTimeoutMs,
   isWritesAllowed,
   safeResolveTypeNames,
   shutdown,
+  toQueryResult,
 } from "./api.js";
+
+/** Runs `fn` with console.error captured, and returns what it was called with. */
+function captureWarnings(fn: () => void): string[] {
+  const originalErr = console.error;
+  const calls: string[] = [];
+  console.error = (msg?: unknown) => {
+    calls.push(String(msg));
+  };
+  try {
+    fn();
+  } finally {
+    console.error = originalErr;
+  }
+  return calls;
+}
 
 describe("isWritesAllowed", () => {
   const original = process.env.ALLOW_WRITES;
@@ -104,11 +123,31 @@ describe("getMaxRows", () => {
     assert.equal(getMaxRows(), 99);
   });
 
-  it("falls back to 1000 for invalid values", () => {
-    for (const v of ["abc", "-5", "0", ""]) {
-      process.env.POSTGRES_MAX_ROWS = v;
-      assert.equal(getMaxRows(), 1000, `POSTGRES_MAX_ROWS=${JSON.stringify(v)} should default`);
-    }
+  it("falls back to 1000 for invalid values, warning once per value", () => {
+    const warnings = captureWarnings(() => {
+      for (const v of ["abc", "-5", "0", "", "30s", "10k", "Infinity"]) {
+        process.env.POSTGRES_MAX_ROWS = v;
+        assert.equal(getMaxRows(), 1000, `POSTGRES_MAX_ROWS=${JSON.stringify(v)} should default`);
+        getMaxRows();
+      }
+    });
+    assert.deepEqual(
+      warnings,
+      ["abc", "-5", "0", "", "30s", "10k", "Infinity"].map(
+        (v) =>
+          `[postgres-mcp] POSTGRES_MAX_ROWS=${JSON.stringify(v)} is not a positive number; using the default of 1000.`,
+      ),
+    );
+  });
+
+  it("does not warn for an unset or accepted value", () => {
+    const warnings = captureWarnings(() => {
+      delete process.env.POSTGRES_MAX_ROWS;
+      getMaxRows();
+      process.env.POSTGRES_MAX_ROWS = "2.5";
+      getMaxRows();
+    });
+    assert.deepEqual(warnings, []);
   });
 });
 
@@ -134,11 +173,31 @@ describe("getPoolMax", () => {
     assert.equal(getPoolMax(), 3);
   });
 
-  it("falls back to 5 for invalid values", () => {
-    for (const v of ["abc", "-5", "0", ""]) {
-      process.env.POSTGRES_POOL_MAX = v;
-      assert.equal(getPoolMax(), 5, `POSTGRES_POOL_MAX=${JSON.stringify(v)} should default`);
-    }
+  it("falls back to 5 for invalid values, warning once per value", () => {
+    const warnings = captureWarnings(() => {
+      for (const v of ["abc", "-5", "0", "", "30s", "10k", "Infinity"]) {
+        process.env.POSTGRES_POOL_MAX = v;
+        assert.equal(getPoolMax(), 5, `POSTGRES_POOL_MAX=${JSON.stringify(v)} should default`);
+        getPoolMax();
+      }
+    });
+    assert.deepEqual(
+      warnings,
+      ["abc", "-5", "0", "", "30s", "10k", "Infinity"].map(
+        (v) =>
+          `[postgres-mcp] POSTGRES_POOL_MAX=${JSON.stringify(v)} is not a positive number; using the default of 5.`,
+      ),
+    );
+  });
+
+  it("does not warn for an unset or accepted value", () => {
+    const warnings = captureWarnings(() => {
+      delete process.env.POSTGRES_POOL_MAX;
+      getPoolMax();
+      process.env.POSTGRES_POOL_MAX = "2.5";
+      getPoolMax();
+    });
+    assert.deepEqual(warnings, []);
   });
 });
 
@@ -169,15 +228,35 @@ describe("getConnectionTimeoutMs", () => {
     assert.equal(getConnectionTimeoutMs(), 2500.5);
   });
 
-  it("falls back to 10000 for invalid values", () => {
-    for (const v of ["abc", "-5", "0", ""]) {
-      process.env.POSTGRES_CONNECTION_TIMEOUT_MS = v;
-      assert.equal(
-        getConnectionTimeoutMs(),
-        10_000,
-        `POSTGRES_CONNECTION_TIMEOUT_MS=${JSON.stringify(v)} should default`,
-      );
-    }
+  it("falls back to 10000 for invalid values, warning once per value", () => {
+    const warnings = captureWarnings(() => {
+      for (const v of ["abc", "-5", "0", "", "30s", "10k", "Infinity"]) {
+        process.env.POSTGRES_CONNECTION_TIMEOUT_MS = v;
+        assert.equal(
+          getConnectionTimeoutMs(),
+          10_000,
+          `POSTGRES_CONNECTION_TIMEOUT_MS=${JSON.stringify(v)} should default`,
+        );
+        getConnectionTimeoutMs();
+      }
+    });
+    assert.deepEqual(
+      warnings,
+      ["abc", "-5", "0", "", "30s", "10k", "Infinity"].map(
+        (v) =>
+          `[postgres-mcp] POSTGRES_CONNECTION_TIMEOUT_MS=${JSON.stringify(v)} is not a positive number; using the default of 10000.`,
+      ),
+    );
+  });
+
+  it("does not warn for an unset or accepted value", () => {
+    const warnings = captureWarnings(() => {
+      delete process.env.POSTGRES_CONNECTION_TIMEOUT_MS;
+      getConnectionTimeoutMs();
+      process.env.POSTGRES_CONNECTION_TIMEOUT_MS = "2.5";
+      getConnectionTimeoutMs();
+    });
+    assert.deepEqual(warnings, []);
   });
 });
 
@@ -198,15 +277,159 @@ describe("getStatementTimeoutMs", () => {
     assert.equal(getStatementTimeoutMs(), 5000);
   });
 
-  it("falls back to 30000 for invalid values", () => {
-    for (const v of ["abc", "-5", "0", ""]) {
-      process.env.POSTGRES_STATEMENT_TIMEOUT_MS = v;
-      assert.equal(
-        getStatementTimeoutMs(),
-        30_000,
-        `POSTGRES_STATEMENT_TIMEOUT_MS=${JSON.stringify(v)} should default`,
-      );
+  it("falls back to 30000 for invalid values, warning once per value", () => {
+    const warnings = captureWarnings(() => {
+      for (const v of ["abc", "-5", "0", "", "30s", "10k", "Infinity"]) {
+        process.env.POSTGRES_STATEMENT_TIMEOUT_MS = v;
+        assert.equal(
+          getStatementTimeoutMs(),
+          30_000,
+          `POSTGRES_STATEMENT_TIMEOUT_MS=${JSON.stringify(v)} should default`,
+        );
+        getStatementTimeoutMs();
+      }
+    });
+    assert.deepEqual(
+      warnings,
+      ["abc", "-5", "0", "", "30s", "10k", "Infinity"].map(
+        (v) =>
+          `[postgres-mcp] POSTGRES_STATEMENT_TIMEOUT_MS=${JSON.stringify(v)} is not a positive number; using the default of 30000.`,
+      ),
+    );
+  });
+
+  it("does not warn for an unset or accepted value", () => {
+    const warnings = captureWarnings(() => {
+      delete process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+      getStatementTimeoutMs();
+      process.env.POSTGRES_STATEMENT_TIMEOUT_MS = "2.5";
+      getStatementTimeoutMs();
+    });
+    assert.deepEqual(warnings, []);
+  });
+});
+
+// The deadline's default is derived from the statement timeout, which has no
+// upper bound of its own. Past 2^31-1 setTimeout does not wait longer: it warns
+// and fires after 1 ms, so every user statement was killed at once.
+describe("getQueryDeadlineMs default", () => {
+  const originalTimeout = process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+  const originalDeadline = process.env.POSTGRES_QUERY_DEADLINE_MS;
+  afterEach(() => {
+    if (originalTimeout === undefined) delete process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
+    else process.env.POSTGRES_STATEMENT_TIMEOUT_MS = originalTimeout;
+    if (originalDeadline === undefined) delete process.env.POSTGRES_QUERY_DEADLINE_MS;
+    else process.env.POSTGRES_QUERY_DEADLINE_MS = originalDeadline;
+  });
+
+  it("sits 5 s past the statement timeout", () => {
+    delete process.env.POSTGRES_QUERY_DEADLINE_MS;
+    process.env.POSTGRES_STATEMENT_TIMEOUT_MS = "1000";
+    assert.equal(getQueryDeadlineMs(), 6_000);
+  });
+
+  it("never exceeds what setTimeout can wait for, even at PostgreSQL's maximum statement timeout", () => {
+    delete process.env.POSTGRES_QUERY_DEADLINE_MS;
+    for (const timeout of ["2147483647", "2147478648", "9999999999"]) {
+      process.env.POSTGRES_STATEMENT_TIMEOUT_MS = timeout;
+      assert.equal(getQueryDeadlineMs(), 2_147_483_647, `POSTGRES_STATEMENT_TIMEOUT_MS=${timeout}`);
     }
+    // The last value that needs no clamp.
+    process.env.POSTGRES_STATEMENT_TIMEOUT_MS = "2147478647";
+    assert.equal(getQueryDeadlineMs(), 2_147_483_647);
+    process.env.POSTGRES_STATEMENT_TIMEOUT_MS = "2147478646";
+    assert.equal(getQueryDeadlineMs(), 2_147_483_646);
+  });
+});
+
+// Node rejects a connect to a name with several addresses with an
+// AggregateError whose message is "", and node-pg passes it through. The shape
+// below is what `new pg.Pool({ connectionString: "postgres://u:p@localhost:9/db" })
+// .connect()` rejected with when it was measured (pg 8.23, Node 26).
+describe("errorMessage / formatPgError on an error with an empty message", () => {
+  function refusedOnBothAddresses(): Error {
+    return Object.assign(
+      new AggregateError(
+        [new Error("connect ECONNREFUSED ::1:5432"), new Error("connect ECONNREFUSED 127.0.0.1:5432")],
+        "",
+      ),
+      { code: "ECONNREFUSED" },
+    );
+  }
+
+  it("uses the per-address failures of an AggregateError", () => {
+    assert.equal(
+      errorMessage(refusedOnBothAddresses()),
+      "connect ECONNREFUSED ::1:5432; connect ECONNREFUSED 127.0.0.1:5432",
+    );
+    assert.equal(
+      formatPgError(refusedOnBothAddresses()),
+      "connect ECONNREFUSED ::1:5432; connect ECONNREFUSED 127.0.0.1:5432 (code: ECONNREFUSED)",
+    );
+  });
+
+  it("falls back to the code, then the name, and never returns an empty string", () => {
+    assert.equal(errorMessage(Object.assign(new AggregateError([], ""), { code: "ECONNREFUSED" })), "ECONNREFUSED");
+    assert.equal(errorMessage(new AggregateError([], "")), "AggregateError");
+    assert.equal(errorMessage(new TypeError("")), "TypeError");
+    // Nested failures that say the same thing are said once.
+    assert.equal(errorMessage(new AggregateError([new Error("down"), new Error("down"), new Error("")], "")), "down");
+  });
+
+  it("leaves an ordinary error and a non-Error throw as they were", () => {
+    assert.equal(errorMessage(new Error("relation does not exist")), "relation does not exist");
+    assert.equal(errorMessage("a bare string"), "a bare string");
+    // A non-empty message wins over nested errors.
+    assert.equal(errorMessage(new AggregateError([new Error("inner")], "outer")), "outer");
+  });
+});
+
+// Every user-SQL runner opens a transaction, so a statement PostgreSQL refuses
+// to run inside one can never succeed here. The message is the server's own
+// (measured on PostgreSQL 18: `BEGIN; SAVEPOINT s; VACUUM;` -> 25001).
+describe("formatPgError on SQLSTATE 25001", () => {
+  it("says the statement cannot run through this server, and keeps the original error", () => {
+    const err = Object.assign(new Error("VACUUM cannot run inside a transaction block"), { code: "25001" });
+    const text = formatPgError(err);
+    assert.match(text, /^VACUUM cannot run inside a transaction block \(code: 25001\)/);
+    assert.match(text, /runs every statement inside a transaction block, with or without ALLOW_WRITES/);
+    assert.match(text, /psql/);
+  });
+
+  it("adds nothing to other errors", () => {
+    const err = Object.assign(new Error('relation "t" does not exist'), { code: "42P01" });
+    assert.equal(formatPgError(err), 'relation "t" does not exist (code: 42P01)');
+  });
+});
+
+// node-pg builds each row as an object keyed by column name, so two columns
+// with one name leave one key. Verified against pg's own Result class: fields
+// [id, id] and parseRow(["1", "2"]) give { id: "2" }.
+describe("toQueryResult flags result columns that share a name", () => {
+  const field = (name: string) => ({ name, dataTypeID: 23 }) as pg.FieldDef;
+  const result = (fields: pg.FieldDef[], rows: Record<string, unknown>[]) =>
+    ({ rows, fields, command: "SELECT", rowCount: rows.length }) as unknown as pg.QueryResult;
+
+  it("warns, naming each repeated column once, while fields still lists every column", () => {
+    const out = toQueryResult(
+      result(
+        [field("id"), field("name"), field("id"), field("id"), field("n"), field("n")],
+        [{ id: 3, name: "a", n: 9 }],
+      ),
+      10,
+      {},
+      true,
+    );
+    assert.equal(out.fields.length, 6);
+    assert.deepEqual(out.rows, [{ id: 3, name: "a", n: 9 }]);
+    assert.equal(out._warnings?.length, 1);
+    assert.match(out._warnings![0]!, /share a name \("id", "n"\)/);
+    assert.match(out._warnings![0]!, /alias/i);
+  });
+
+  it("adds no _warnings key when every column name is distinct", () => {
+    const out = toQueryResult(result([field("id"), field("name")], [{ id: 1, name: "a" }]), 10, {}, true);
+    assert.equal("_warnings" in out, false);
   });
 });
 
@@ -373,8 +596,7 @@ describe("getApplicationName", () => {
 // reason for existing is: a pg_type lookup failure must not lose the user's
 // successful query rows. Engineering that failure against a real DB
 // requires a permission-restricted role; a stub client whose .query rejects
-// is the cleaner path here, and is the only place we cross the "no mocks"
-// boundary in the codebase. The helper is exported from api.ts solely for
+// is the cleaner path here. The helper is exported from api.ts solely for
 // this test.
 describe("safeResolveTypeNames fallback on pg_type failure", () => {
   it("returns {} without throwing when the bootstrap pg_type query rejects", async () => {
