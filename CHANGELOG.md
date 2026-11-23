@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-11-23
+
 ### Security
 - **The read-only statement guard no longer misses three spellings of a blocked call:** `U&"name" UESCAPE '!' (...)`
   (a `U&"..."` identifier is now refused when it carries a `UESCAPE` clause, is called, or follows a dot), attribute
