@@ -1453,15 +1453,40 @@ else
 fi
 
 if [ "${#POST_PUBLISH_PROBLEMS[@]}" -gt 0 ]; then
+  # How to repeat the checks. A re-run of './release.sh ${VERSION}' reaches
+  # steps 8-9 again only while this branch's HEAD is still the tagged commit:
+  # once anything lands on top (routine in a shared checkout), step 4's
+  # tag==HEAD guard refuses it, and a detached checkout at the tag fails the
+  # pre-flight's branch check. So the banner says which case this is, and
+  # always prints the same reads steps 8-9 make, to run by hand.
+  RERUN_HINT="Re-running './release.sh ${VERSION}' will NOT repeat them: HEAD is no longer
+  the v${VERSION} commit, so step 4 refuses the tag. Run the checks by hand:"
+  if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse --verify --quiet "v${VERSION}^{commit}" 2>/dev/null)" ]; then
+    RERUN_HINT="Re-running './release.sh ${VERSION}' repeats them (lint and the suites
+  first) only while HEAD is still the v${VERSION} commit, as it is now; once
+  anything lands on this branch, step 4 refuses the tag. Or run them by hand:"
+  fi
+  MANUAL_REGISTRY_NAME="<server.json name, percent-encoded>"
+  if [ -f server.json ] && command -v jq >/dev/null 2>&1; then
+    MANUAL_REGISTRY_NAME=$(jq -r '.name | @uri' server.json 2>/dev/null || echo "$MANUAL_REGISTRY_NAME")
+  fi
   fail "v${VERSION} IS PUBLISHED -- steps 1-7 completed, so npm, the tag, the GitHub
   release and the MCP Registry publish all ran -- but ${#POST_PUBLISH_PROBLEMS[@]} post-publish check(s)
   did not hold:
 
 $(printf '    - %s\n' "${POST_PUBLISH_PROBLEMS[@]}")
 
-  Do not announce v${VERSION} until these are understood. Re-running
-  './release.sh ${VERSION}' skips what is already done and repeats the checks;
-  a broken tarball needs the next patch version, since npm versions are final."
+  Do not announce v${VERSION} until these are understood.
+  ${RERUN_HINT}
+
+    curl -s -o /dev/null -w '%{http_code}' 'https://registry.npmjs.org/@yawlabs%2Fpostgres-mcp/${VERSION}'
+    npm view @yawlabs/postgres-mcp@${VERSION} version --prefer-online
+    gh release view v${VERSION}
+    curl -s -o /dev/null -w '%{http_code}' 'https://registry.modelcontextprotocol.io/v0/servers/${MANUAL_REGISTRY_NAME}/versions/${VERSION}'
+    bash scripts/post-publish-smoke.sh ${VERSION}
+
+  (Both curls should print 200; npm view lags up to 300s behind the first.)
+  A broken tarball needs the next patch version, since npm versions are final."
 fi
 
 # =============================================================================

@@ -1058,7 +1058,19 @@ describe("pg_advisor sequence_exhaustion (stubbed connect, no live DB)", () => {
     // A bigint sequence past its smallint column reads as a ratio in the
     // hundreds of thousands; numeric(6, 4) would overflow and fail the category.
     assert.doesNotMatch(sql, /numeric\(6, 4\)/);
-    assert.match(sql, /round\(last_value::numeric \/ limit_value::numeric, 4\)::float8 AS pct_used/);
+    assert.match(sql, /round\(last_value::numeric \/ NULLIF\(limit_value, 0\)::numeric, 4\)::float8 AS pct_used/);
+  });
+
+  it("guards both divisions with NULLIF, since a bound of 0 is reachable", async () => {
+    installStub([skippedRow(0)]);
+    await pgAdvisor.handler({});
+    const sql = sequenceSql();
+    // MINVALUE 0 on a countdown (or MAXVALUE 0 ascending) gives limit_value 0,
+    // and the sign() conjunct is not guaranteed to run first: one such
+    // sequence raised division by zero and emptied the whole category.
+    assert.doesNotMatch(sql, /\/ limit_value::numeric/);
+    assert.equal(sql.match(/\/ NULLIF\(limit_value, 0\)::numeric/g)?.length, 2);
+    assert.match(sql, /AND \(last_value::numeric \/ NULLIF\(limit_value, 0\)::numeric\) >= \$1/);
   });
 
   it("the declared outputSchema accepts both the new row shape and a sequence no column owns", () => {

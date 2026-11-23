@@ -6,8 +6,9 @@
  * matched loudly: a rename or reformat fails the caller instead of quietly
  * testing nothing.
  *
- * src/index.test.ts still carries its own copy of extractFromLauncher and of
- * the oam discovery below; this module is the shared one.
+ * Shared by src/index.test.ts and the launcher sandbox integration test, so
+ * the two cannot drift apart on how a declaration is found or which oam the
+ * oam-dependent cases run on.
  *
  * Compiled with the rest of src/ but never shipped (package.json `files`
  * names only dist/index.js) and never run as a test (the runner collects

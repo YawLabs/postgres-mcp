@@ -188,12 +188,25 @@ describe("findBlockedFunction", () => {
       ["SELECT pg_drop_replication_slot('s')", "pg_drop_replication_slot"],
       ["SELECT pg_replication_slot_advance('s', '0/0')", "pg_replication_slot_advance"],
       ["SELECT * FROM pg_logical_slot_get_changes('s', NULL, NULL)", "pg_logical_slot_get_changes"],
+      ["SELECT pg_backup_start('x')", "pg_backup_start"],
+      ["SELECT * FROM pg_backup_stop()", "pg_backup_stop"],
+      ["SELECT pg_start_backup('x')", "pg_start_backup"],
+      ["SELECT * FROM pg_stop_backup(false)", "pg_stop_backup"],
+      ["SELECT pg_log_standby_snapshot()", "pg_log_standby_snapshot"],
+      ["SELECT pg_wal_replay_pause()", "pg_wal_replay_pause"],
+      ["SELECT pg_wal_replay_resume()", "pg_wal_replay_resume"],
+      ["SELECT pg_replication_origin_advance('o', '0/0')", "pg_replication_origin_advance"],
+      ["SELECT pg_replication_origin_session_setup('o')", "pg_replication_origin_session_setup"],
     ];
     for (const [sql, name] of calls) assert.equal(findBlockedFunction(sql), name, sql);
     // The catalog views with neighbouring names stay readable.
     assert.equal(findBlockedFunction("SELECT * FROM pg_catalog.pg_replication_slots"), null);
     assert.equal(findBlockedFunction("SELECT s.stats_reset FROM pg_catalog.pg_stat_replication_slots s"), null);
     assert.equal(findBlockedFunction("SELECT * FROM pg_logical_slot_peek_changes('s', NULL, NULL)"), null);
+    // Read-only progress probes, and the transactional origin create/drop.
+    assert.equal(findBlockedFunction("SELECT pg_replication_origin_progress('o', false)"), null);
+    assert.equal(findBlockedFunction("SELECT pg_replication_origin_create('o')"), null);
+    assert.equal(findBlockedFunction("SELECT pg_is_wal_replay_paused()"), null);
   });
 
   it("ignores strings, dollar quotes, comments and non-call uses", () => {

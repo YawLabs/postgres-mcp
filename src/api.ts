@@ -89,28 +89,45 @@ function getDatabaseUrl(): string {
 /** Raw values of the limits below already warned about, so a per-call read warns once. */
 const warnedLimitValues = new Set<string>();
 
-/** One stderr line per distinct `name=raw`: a limit that is re-read per call must not flood. */
-function warnLimitOnce(name: string, raw: string, problem: string, fallback: number): void {
+/**
+ * One stderr line per distinct `name=raw`: a limit that is re-read per call must
+ * not flood. `used` is the value the setting falls back to.
+ */
+function warnLimitOnce(name: string, raw: string, problem: string, used: string): void {
   const key = `${name}=${raw}`;
   if (warnedLimitValues.has(key)) return;
   warnedLimitValues.add(key);
-  console.error(`[postgres-mcp] ${name}=${JSON.stringify(raw)} ${problem}; using the default of ${fallback}.`);
+  console.error(`[postgres-mcp] ${name}=${JSON.stringify(raw)} ${problem}; using ${used}.`);
 }
 
 /**
  * A positive number from the environment, unfloored, with no upper bound: the
  * older settings' accepted values, kept as they were (a fractional timeout is
- * valid, and a fractional count is floored by its caller). Any set value
- * outside that -- empty, `30s`, `10k`, 0, a negative -- keeps the default as
- * before, and now says so on stderr like positiveIntEnv. 0 in particular does
- * NOT mean "no timeout" here, as it would to PostgreSQL; it means the default.
+ * valid). Any set value outside that -- empty, `30s`, `10k`, 0, a negative --
+ * keeps the default as before, and now says so on stderr like positiveIntEnv.
+ * 0 in particular does NOT mean "no timeout" here, as it would to PostgreSQL;
+ * it means the default.
  */
 function positiveNumberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
   const parsed = Number(raw);
   if (raw.trim() !== "" && Number.isFinite(parsed) && parsed > 0) return parsed;
-  warnLimitOnce(name, raw, "is not a positive number", fallback);
+  warnLimitOnce(name, raw, "is not a positive number", `the default of ${fallback}`);
+  return fallback;
+}
+
+/**
+ * A count (rows, connections): positiveNumberEnv floored, as before, so 99.9
+ * still means 99. A value under 1 floored to 0 and passed unwarned -- every
+ * query then came back empty and truncated, and a pool max of 0 fell through
+ * to pg's own default of 10 -- so it now keeps the default and says so.
+ */
+function positiveCountEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const count = Math.floor(positiveNumberEnv(name, fallback));
+  if (count >= 1 || raw === undefined) return count;
+  warnLimitOnce(name, raw, "is below 1", `the default of ${fallback}`);
   return fallback;
 }
 
@@ -118,16 +135,30 @@ export function getStatementTimeoutMs(): number {
   return positiveNumberEnv("POSTGRES_STATEMENT_TIMEOUT_MS", 30_000);
 }
 
+/**
+ * Capped, not defaulted, above 2^31-1: pg hands this to setTimeout, which
+ * coerces a longer delay to 1 ms, so a large "effectively unlimited" value made
+ * every connect fail at once with a connection-timeout error. The cap is the
+ * longest wait setTimeout can give, the nearest thing to what was asked for.
+ */
 export function getConnectionTimeoutMs(): number {
-  return positiveNumberEnv("POSTGRES_CONNECTION_TIMEOUT_MS", 10_000);
+  const timeout = positiveNumberEnv("POSTGRES_CONNECTION_TIMEOUT_MS", 10_000);
+  if (timeout <= MAX_LIMIT_VALUE) return timeout;
+  warnLimitOnce(
+    "POSTGRES_CONNECTION_TIMEOUT_MS",
+    process.env.POSTGRES_CONNECTION_TIMEOUT_MS ?? "",
+    `is above ${MAX_LIMIT_VALUE}, the longest delay setTimeout can wait`,
+    String(MAX_LIMIT_VALUE),
+  );
+  return MAX_LIMIT_VALUE;
 }
 
 export function getMaxRows(): number {
-  return Math.floor(positiveNumberEnv("POSTGRES_MAX_ROWS", 1000));
+  return positiveCountEnv("POSTGRES_MAX_ROWS", 1000);
 }
 
 export function getPoolMax(): number {
-  return Math.floor(positiveNumberEnv("POSTGRES_POOL_MAX", 5));
+  return positiveCountEnv("POSTGRES_POOL_MAX", 5);
 }
 
 /** 2^31 - 1: the largest delay setTimeout fires at instead of coercing to 1 ms. */
@@ -148,7 +179,7 @@ function positiveIntEnv(name: string, fallback: number): number {
   if (raw.trim() !== "" && Number.isFinite(parsed) && parsed >= 1 && parsed <= MAX_LIMIT_VALUE) {
     return Math.floor(parsed);
   }
-  warnLimitOnce(name, raw, `is not a positive integer up to ${MAX_LIMIT_VALUE}`, fallback);
+  warnLimitOnce(name, raw, `is not a positive integer up to ${MAX_LIMIT_VALUE}`, `the default of ${fallback}`);
   return fallback;
 }
 
@@ -437,7 +468,7 @@ export function getPool(): pg.Pool {
   // pg's Pool emits 'error' for idle client failures. Log to stderr so the
   // stdio MCP protocol channel (stdout) stays clean.
   pool.on("error", (err) => {
-    console.error(`[postgres-mcp] pool error: ${err.message}`);
+    console.error(`[postgres-mcp] pool error: ${errorMessage(err)}`);
   });
   return pool;
 }
@@ -566,7 +597,40 @@ function ownOrNestedMessage(err: unknown): string {
   return [...new Set(nested.map(ownOrNestedMessage).filter((m) => m !== ""))].join("; ");
 }
 
-export function formatPgError(err: unknown): string {
+const NO_TRANSACTION_BLOCK_HINT =
+  "this server runs every statement inside a transaction block, with or without ALLOW_WRITES, " +
+  "so it cannot run this one. Run it outside this server (psql, a migration tool).";
+
+/**
+ * Whether a 25006 (read-only) failure is for a statement that also refuses a
+ * transaction block, so ALLOW_WRITES=1 would only trade it for a 25001.
+ * PostgreSQL checks read-only first for these (measured on PG18 under BEGIN
+ * READ ONLY); VACUUM, ALTER SYSTEM, CLUSTER and REINDEX CONCURRENTLY report
+ * 25001 straight away and need nothing here.
+ *
+ * The command tag in "cannot execute <TAG> in a read-only transaction" is not
+ * translated, so it is read from the message. A database or tablespace is
+ * never created or dropped in a transaction block. For an index or a partition
+ * detach only the CONCURRENTLY form refuses one, and the tag does not show it,
+ * so that needs the SQL; the pattern wants the keyword where the grammar puts
+ * it, and a comment in between just keeps the ALLOW_WRITES advice.
+ */
+function refusesTransactionBlock(message: string, sql: string | undefined): boolean {
+  const tag = /\b(CREATE|DROP|ALTER) (DATABASE|TABLESPACE|INDEX|TABLE)\b/.exec(message);
+  if (tag === null) return false;
+  const [, verb, object] = tag;
+  if (object === "DATABASE" || object === "TABLESPACE") return verb !== "ALTER";
+  if (sql === undefined) return false;
+  if (object === "INDEX") return verb !== "ALTER" && /\bindex\s+concurrently\b/i.test(sql);
+  return verb === "ALTER" && /\bdetach\s+partition\s+\S+\s+concurrently\b/i.test(sql);
+}
+
+/**
+ * `sql`, when given, is the statement that failed: it lets a read-only refusal
+ * of CREATE INDEX CONCURRENTLY get the transaction-block explanation instead of
+ * advice to set ALLOW_WRITES that cannot work.
+ */
+export function formatPgError(err: unknown, sql?: string): string {
   if (!(err instanceof Error)) return String(err);
   // This server's own refusals are already complete sentences.
   if (err instanceof GuardError) return err.message;
@@ -581,16 +645,15 @@ export function formatPgError(err: unknown): string {
   // (VACUUM, CREATE INDEX CONCURRENTLY, CREATE DATABASE, ALTER SYSTEM, ...).
   // Every user-SQL runner here opens one, ALLOW_WRITES or not, so no retry
   // through this server can succeed; say so instead of leaving the raw error.
-  if (errObj.code === "25001") {
-    parts.push(
-      "-- this server runs every statement inside a transaction block, with or without ALLOW_WRITES, " +
-        "so it cannot run this one. Run it outside this server (psql, a migration tool).",
-    );
-  }
+  if (errObj.code === "25001") parts.push(`-- ${NO_TRANSACTION_BLOCK_HINT}`);
 
   // Read-only enforcement: postgres returns SQLSTATE 25006 for writes inside
-  // a READ ONLY transaction. Rewrite that to something the LLM can act on.
+  // a READ ONLY transaction. Rewrite that to something the LLM can act on --
+  // unless the statement is one ALLOW_WRITES would not let through either.
   if (errObj.code === "25006") {
+    if (refusesTransactionBlock(err.message, sql)) {
+      return `Blocked by read-only mode, but ALLOW_WRITES=1 would not help: ${NO_TRANSACTION_BLOCK_HINT} Original error: ${err.message}`;
+    }
     return `Write blocked: this server is in read-only mode. Set ALLOW_WRITES=1 in the MCP server env to enable DML/DDL. Original error: ${err.message}`;
   }
 
@@ -929,10 +992,10 @@ export async function acquireClient(): Promise<Checkout> {
   let closeAction: string | undefined;
   const onError = (err: Error): void => {
     if (closeAction !== undefined) {
-      console.error(`[postgres-mcp] connection closed after this process ${closeAction}: ${err.message}`);
+      console.error(`[postgres-mcp] connection closed after this process ${closeAction}: ${errorMessage(err)}`);
       return;
     }
-    console.error(`[postgres-mcp] connection error on a checked-out client: ${err.message}`);
+    console.error(`[postgres-mcp] connection error on a checked-out client: ${errorMessage(err)}`);
   };
   client.on("error", onError);
   return {
@@ -1012,7 +1075,7 @@ async function terminateOwnBackend(
   } catch (err) {
     const code = sqlState(err);
     if (code === "57P01" || code === undefined) return { terminated: true };
-    return { terminated: false, error: err instanceof Error ? err.message : String(err) };
+    return { terminated: false, error: errorMessage(err) };
   }
 }
 
@@ -1037,7 +1100,7 @@ async function resetSession(client: pg.PoolClient): Promise<Error | undefined> {
     await client.query(SESSION_RESET_SQL);
     return undefined;
   } catch (err) {
-    return new Error(`session reset failed: ${err instanceof Error ? err.message : String(err)}`);
+    return new Error(`session reset failed: ${errorMessage(err)}`);
   }
 }
 
@@ -1084,7 +1147,9 @@ async function terminateBackend(pid: number, stillWanted: () => boolean = () => 
     return res.rows[0]?.terminated === true;
   } catch (err) {
     console.error(
-      `[postgres-mcp] could not terminate backend ${pid}: ${err instanceof Error ? err.message : String(err)}`,
+      // errorMessage: this connect is a fresh one, and a refused connect to a
+      // dual-stack `localhost` is an AggregateError with an empty message.
+      `[postgres-mcp] could not terminate backend ${pid}: ${errorMessage(err)}`,
     );
     return false;
   } finally {
@@ -1299,7 +1364,7 @@ async function finishTransaction(
       return true;
     } catch (err) {
       lastError = err;
-      const message = `${what} failed: ${err instanceof Error ? err.message : String(err)}`;
+      const message = `${what} failed: ${errorMessage(err)}`;
       // Every failure is logged; the first one is the discard reason.
       if (failure) console.error(`[postgres-mcp] ${message}`);
       failure ??= new Error(message);
@@ -1352,7 +1417,7 @@ async function finishTransaction(
           }
           refusal = outcome.error;
         } else {
-          refusal = `the transaction could not be cleared first: ${lastError instanceof Error ? lastError.message : String(lastError)}`;
+          refusal = `the transaction could not be cleared first: ${errorMessage(lastError)}`;
         }
         console.error(`[postgres-mcp] own backend NOT terminated -- ${refusal}`);
         await attempt("ROLLBACK", () => client.query("ROLLBACK"));
@@ -1418,7 +1483,7 @@ async function runUserSqlInTransaction(
       });
     });
   } catch (err) {
-    failed = { ok: false, error: formatPgError(err) };
+    failed = { ok: false, error: formatPgError(err, sql) };
     aborted = err instanceof StatementAbortError ? err : undefined;
   }
   // No connection: the pool refused one, or DATABASE_URL is unset. Returned
@@ -1739,7 +1804,7 @@ export async function withSharedClient<T>(
         const failed = connectFailed();
         if (failed !== undefined && err === failed.error) throw err;
         const code = sqlState(err);
-        return { ok: false, error: formatPgError(err), serverError: code !== undefined, code };
+        return { ok: false, error: formatPgError(err, sql), serverError: code !== undefined, code };
       }
     };
     return await fn(runOnClient, controls);

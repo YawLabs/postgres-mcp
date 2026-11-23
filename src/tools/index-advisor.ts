@@ -342,7 +342,17 @@ export function classifyRole(column: string, condition: string): "equality" | "r
   // alternative matches its second (which is how `'x' <> col` slipped through
   // as a range even after the `<` was guarded). `<=` and `>=` are listed first
   // so the alternation prefers them over the guarded single-character forms.
-  const rangeOps = "(?:<=|>=|<(?!>)|(?<!<)>|~~)";
+  //
+  // The same prefix trap applies to every longer operator that starts or ends
+  // with one of these characters, and the cast tail below reaches them for any
+  // cast column: `~~*` (ILIKE, which a btree cannot bound) starts with `~~`,
+  // `<@`/`<<`/`<->`/`<%` start with `<`, `@>`/`>>`/`->`/`%>` end with `>`, and
+  // `<<=`/`>>=` contain `<=`/`>=`. Each alternative is therefore fenced on both
+  // sides against the characters that would make it part of a longer operator.
+  // A `-` after `>` is NOT fenced, so a bare negative bound (`n > -5`) still
+  // reads as a range; VERBOSE quotes it as `'-5'` anyway.
+  const rangeOps =
+    "(?:(?<![<&|])<=(?!>)|(?<![>])>=|(?<![<&|])<(?![<>@\\-^#+~%|=])|(?<![<>@\\-#=~+%|&])>(?![>^|=])|(?<![!~])~~(?!\\*))";
   // `(u.name)::text`, `((u.n)::text)::bigint`: each closing paren must carry a
   // cast, so the paren that closes a FUNCTION call (`lower(u.name) > 'm'`, which
   // a plain btree on the column cannot bound) still reads as "no operator here".
@@ -550,6 +560,11 @@ export function normalizeDistinct(nDistinct: number | null, reltuples: number | 
  * them, NOT by selectivity: a btree on (b, a) cannot serve ORDER BY a, b, so
  * reordering them builds an index for a different query.
  *
+ * `sortOrder` is the order to lay the sort columns in: one statement's own
+ * harvest order, so a key merged from several statements can still follow each
+ * statement's ORDER BY. Sort columns it does not name follow in `columns`'
+ * order. Absent, the sort columns keep `columns`' order.
+ *
  * A column that appeared in several roles is placed by its strongest one
  * (equality, then range, then sort), because that is the position from which
  * the index can serve every one of its uses.
@@ -558,6 +573,7 @@ export function orderCandidateColumns(
   columns: Map<string, Set<PredicateRole>>,
   stats: Map<string, ColumnStats>,
   maxColumns: number,
+  sortOrder: Iterable<string> = [],
 ): string[] {
   const equality: string[] = [];
   const range: string[] = [];
@@ -578,8 +594,13 @@ export function orderCandidateColumns(
   equality.sort(bySelectivity);
   range.sort(bySelectivity);
   // `sort` keeps its first-seen order: the Map preserves insertion order, and
-  // harvestPlanPredicates records a Sort Key's entries in array order.
-  return [...equality, ...range.slice(0, 1), ...sort].slice(0, maxColumns);
+  // harvestPlanPredicates records a Sort Key's entries in array order. Columns
+  // `sortOrder` names move to the front, in its order.
+  const sortOnly = new Set(sort);
+  const leading = [...new Set(sortOrder)].filter((column) => sortOnly.has(column));
+  const placed = new Set(leading);
+  const ordered = [...leading, ...sort.filter((column) => !placed.has(column))];
+  return [...equality, ...range.slice(0, 1), ...ordered].slice(0, maxColumns);
 }
 
 /**
@@ -655,15 +676,20 @@ const INDOPTION_DESC_NULLS_FIRST = 3;
  *   the mirror ordering, so all-ASC and all-DESC (with their default NULLS
  *   placement) are interchangeable -- but (a, b DESC) cannot return ORDER BY
  *   a, b, and neither can a column whose NULLS placement was flipped.
- *
- * Operator class and collation are deliberately NOT compared. Erring this way
- * costs one EXPLAIN on a candidate HypoPG then declines; erring the other way
- * silently hides a recommendation, which is the defect this function fixes.
+ * - A non-default operator class or collation ends the prefix as well.
+ *   `plain[position]` is false there: (email text_pattern_ops) answers `=` but
+ *   neither `email > 'm'` nor ORDER BY email, and (email COLLATE "C") orders by
+ *   a different collation than the column's own. Counting either as covering
+ *   would drop the plain candidate before it is ever costed, silently hiding a
+ *   recommendation; ending the prefix costs at most one EXPLAIN on a candidate
+ *   HypoPG then declines. A position `plain` does not reach reads as default,
+ *   the behaviour before it was read.
  */
 export function coveredIndexPrefix(
   columns: readonly (string | null)[],
   options: readonly (number | null)[],
   partial: boolean,
+  plain: readonly (boolean | null)[] = [],
 ): string[] {
   if (partial) return [];
   const lead = options[0] ?? INDOPTION_ASC_NULLS_LAST;
@@ -672,6 +698,7 @@ export function coveredIndexPrefix(
   for (const [position, column] of columns.entries()) {
     if (typeof column !== "string") break;
     if ((options[position] ?? INDOPTION_ASC_NULLS_LAST) !== lead) break;
+    if (plain[position] === false) break;
     covered.push(column);
   }
   return covered;
@@ -734,31 +761,40 @@ export function buildCandidates(options: {
   const seen = new Set<string>();
   for (const [key, predicates] of merged) {
     const stats = columnStats.get(key) ?? new Map<string, ColumnStats>();
-    const ordered = orderCandidateColumns(predicates.columns, stats, maxIndexColumns);
-    if (ordered.length === 0) continue;
     const statements = [...(touchedBy.get(key) ?? [])].sort((a, b) => a - b);
-    for (let width = 1; width <= ordered.length; width++) {
-      const columns = ordered.slice(0, width);
-      const dedupeKey = candidateKey(predicates.schema, predicates.table, columns);
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-      // An existing index whose key STARTS with these columns already answers
-      // everything this candidate would. Checking prefixes rather than exact
-      // equality is what catches "you already have (a, b), stop proposing (a)".
-      if (existingIndexPrefixes.has(dedupeKey)) continue;
-      const constrained = (column: string | undefined): boolean => {
-        const roles = column === undefined ? undefined : predicates.columns.get(column);
-        return roles !== undefined && (roles.has("equality") || roles.has("range"));
-      };
-      candidates.push({
-        schema: predicates.schema,
-        table: predicates.table,
-        columns,
-        leadingConstrained: constrained(columns[0]),
-        trailingConstrained: columns.slice(1).some(constrained),
-        statements,
-        seqScans: seqScans.get(key) ?? 0,
-      });
+    // One key per statement's own sort order. The merged Map holds sort columns
+    // in first-seen order ACROSS the workload, so ORDER BY b in one statement
+    // and ORDER BY a, b in the next would otherwise only ever yield (b, a),
+    // which serves neither the second statement's ORDER BY nor the order the
+    // description promises. Statements that agree produce the same key, and the
+    // `seen` check folds those together.
+    const orderings = statements.map((index) =>
+      orderCandidateColumns(predicates.columns, stats, maxIndexColumns, perStatement[index]?.get(key)?.columns.keys()),
+    );
+    for (const ordered of orderings) {
+      for (let width = 1; width <= ordered.length; width++) {
+        const columns = ordered.slice(0, width);
+        const dedupeKey = candidateKey(predicates.schema, predicates.table, columns);
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
+        // An existing index whose key STARTS with these columns already answers
+        // everything this candidate would. Checking prefixes rather than exact
+        // equality is what catches "you already have (a, b), stop proposing (a)".
+        if (existingIndexPrefixes.has(dedupeKey)) continue;
+        const constrained = (column: string | undefined): boolean => {
+          const roles = column === undefined ? undefined : predicates.columns.get(column);
+          return roles !== undefined && (roles.has("equality") || roles.has("range"));
+        };
+        candidates.push({
+          schema: predicates.schema,
+          table: predicates.table,
+          columns,
+          leadingConstrained: constrained(columns[0]),
+          trailingConstrained: columns.slice(1).some(constrained),
+          statements,
+          seqScans: seqScans.get(key) ?? 0,
+        });
+      }
     }
   }
 
@@ -1134,7 +1170,8 @@ export const indexAdvisorTools = [
       "deliberately loose (a token matching a real column name on a different table can slip through); " +
       "HypoPG is the arbiter, and anything that does not lower cost is discarded. Column ORDER within " +
       "each candidate is equality columns first (most selective first, from `pg_stats`), then at most " +
-      "one range column, then sort columns in the order the planner sorts by them. Candidates are " +
+      "one range column, then sort columns in the order the planner sorts by them (one ordering per " +
+      "statement, so two statements that sort the same table differently each get their own). Candidates are " +
       "plain btree indexes on the relations the plan SCANS, so for a partitioned table they name each " +
       "leaf partition rather than the parent.\n" +
       "The search is greedy and BOUNDED. Each accepted index stays in place while the rest are " +
@@ -1746,6 +1783,7 @@ export const indexAdvisorTools = [
             table: string;
             columns: (string | null)[] | null;
             options: (number | null)[] | null;
+            plain: (boolean | null)[] | null;
             partial: boolean | null;
           }>(
             run,
@@ -1763,6 +1801,16 @@ export const indexAdvisorTools = [
                         FROM unnest(i.indoption[0:i.indnkeyatts - 1]) WITH ORDINALITY AS k(opt, ord)
                        ORDER BY k.ord
                     ) AS options,
+                    ARRAY(
+                      SELECT COALESCE(oc.opcdefault AND k.coll = a.attcollation, false)
+                        FROM unnest(i.indkey[0:i.indnkeyatts - 1],
+                                    i.indclass[0:i.indnkeyatts - 1],
+                                    i.indcollation[0:i.indnkeyatts - 1]) WITH ORDINALITY AS k(attnum, opc, coll, ord)
+                        LEFT JOIN pg_catalog.pg_attribute a
+                          ON a.attrelid = c.oid AND a.attnum = k.attnum
+                        LEFT JOIN pg_catalog.pg_opclass oc ON oc.oid = k.opc
+                       ORDER BY k.ord
+                    ) AS plain,
                     i.indpred IS NOT NULL AS partial
                FROM pg_catalog.pg_index i
                JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
@@ -1781,8 +1829,9 @@ export const indexAdvisorTools = [
             for (const row of idxRes.data ?? []) {
               const key = `${row.schema}.${row.table}`;
               if (!relationNames.has(key)) continue;
-              // A partial index, an expression position and a change of sort
-              // direction each limit what the index stands in for; see
+              // A partial index, an expression position, a change of sort
+              // direction and a non-default opclass or collation (`plain`
+              // false) each limit what the index stands in for; see
               // coveredIndexPrefix. `partial` is tested with `=== true` so a
               // row of an unexpected shape reads as "covers" -- the behaviour
               // before the flag existed -- rather than as partial.
@@ -1797,6 +1846,7 @@ export const indexAdvisorTools = [
                 Array.isArray(row.columns) ? row.columns : [],
                 Array.isArray(row.options) ? row.options : [],
                 row.partial === true,
+                Array.isArray(row.plain) ? row.plain : [],
               );
               // Every PREFIX of the covered key is covered by that index, so
               // each one blocks a candidate.

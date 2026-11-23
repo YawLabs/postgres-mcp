@@ -1002,7 +1002,11 @@ export const adminTools = [
             // alone. The ratio's sign check keeps the measure meaningful: a
             // descending sequence bounded at a POSITIVE min_value (or an
             // ascending one at a negative max) has no last_value / bound
-            // reading, and is left out as before.
+            // reading, and is left out as before. That check does NOT guard
+            // the divisions -- PostgreSQL may evaluate the WHERE conjuncts in
+            // any order -- so both divide by NULLIF(limit_value, 0): a bound of
+            // 0 (MINVALUE 0 countdown, MAXVALUE 0 ascending) would otherwise
+            // raise division by zero and fail the whole category.
             //
             // Divide in `numeric`, not `float8`: BIGINT sequences past 2^53 lose
             // precision in float8, and the danger zone (>= threshold) is exactly
@@ -1069,11 +1073,11 @@ export const adminTools = [
                  CASE WHEN limit_value = seq_bound THEN 'sequence' ELSE 'column' END AS limited_by,
                  owned_by,
                  owned_by_type,
-                 round(last_value::numeric / limit_value::numeric, 4)::float8 AS pct_used
+                 round(last_value::numeric / NULLIF(limit_value, 0)::numeric, 4)::float8 AS pct_used
                FROM seq
                WHERE last_value IS NOT NULL
                  AND sign(limit_value) = sign(increment_by)
-                 AND (last_value::numeric / limit_value::numeric) >= $1
+                 AND (last_value::numeric / NULLIF(limit_value, 0)::numeric) >= $1
                ORDER BY pct_used DESC NULLS LAST
                LIMIT $2
              )

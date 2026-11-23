@@ -1017,9 +1017,9 @@ describe("a statement that never ran still gets its audit line (#42)", () => {
 // The server-version probe is an internal line (#42, found in review).
 //
 // pg_explain with a version-floored option, and the tools that probe before
-// checking out their shared connection (pg_describe_table, pg_health,
-// pg_advisor, pg_replication_status, pg_seq_scan_tables, pg_unused_indexes,
-// pg_io_stats), run getServerVersionNum() before anything else reaches
+// checking out their shared connection (pg_describe_table, pg_advisor,
+// pg_table_bloat, pg_seq_scan_tables, pg_unused_indexes, pg_io_stats,
+// pg_index_advisor), run getServerVersionNum() before anything else reaches
 // the database, and it swallows every failure into the 0 sentinel. Unaudited,
 // a refused connection under any of them wrote no line: the fix above moved
 // the checkout into the agent statement's span, and this path never reached

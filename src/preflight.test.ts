@@ -52,12 +52,20 @@ describe("analyzeRole", () => {
         dangerous_memberships: ["pg_read_server_files", "pg_write_all_data"],
         settable_roles: ["app_owner"],
         settable_count: 1,
-        standard_conforming_strings: false,
       },
       false,
     );
     assert.equal(findings.length, 1, JSON.stringify(findings));
     assert.match(findings[0] ?? "", /SUPERUSER/);
+  });
+
+  it("warns about standard_conforming_strings=off for a superuser too", () => {
+    // A session setting, not a privilege: the statement guard misreads
+    // backslashes whatever the role, so the SUPERUSER gate must not hide it.
+    const findings = analyzeRole({ ...leastPrivilege, superuser: true, standard_conforming_strings: false }, false);
+    assert.equal(findings.length, 2, JSON.stringify(findings));
+    assert.match(findings[0] ?? "", /SUPERUSER/);
+    assert.match(findings[1] ?? "", /standard_conforming_strings=off/);
   });
 
   it("reads standard_conforming_strings, which the statement guard assumes is on", () => {

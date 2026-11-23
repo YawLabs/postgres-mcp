@@ -100,10 +100,24 @@ const BLOCKED_FUNCTIONS: ReadonlySet<string> = new Set([
   "pg_stat_file",
   // WAL-level effects that a rollback does not undo.
   "pg_create_restore_point",
+  "pg_log_standby_snapshot",
   "pg_logical_emit_message",
   "pg_switch_wal",
-  // Other effects a rollback does not undo: promotion, discarded statistics,
-  // and replication slots created, dropped, advanced or consumed.
+  // A backup forces a checkpoint and stays open on the session, and DISCARD ALL
+  // does not end it, so the pooled connection carries it on. pg_start_backup
+  // and pg_stop_backup are the PG14 names.
+  "pg_backup_start",
+  "pg_backup_stop",
+  "pg_start_backup",
+  "pg_stop_backup",
+  // Other effects a rollback does not undo: promotion, paused or resumed WAL
+  // replay, discarded statistics, replication slots created, dropped, advanced
+  // or consumed, and replication-origin progress or session state. Creating or
+  // dropping an origin is transactional, so those two stay callable.
+  "pg_wal_replay_pause",
+  "pg_wal_replay_resume",
+  "pg_replication_origin_advance",
+  "pg_replication_origin_session_setup",
   "pg_copy_logical_replication_slot",
   "pg_copy_physical_replication_slot",
   "pg_create_logical_replication_slot",

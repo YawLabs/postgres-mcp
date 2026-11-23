@@ -117,6 +117,25 @@ describe("classifyRole", () => {
     assert.equal(classifyRole("status", "(status <> 'active'::text)"), "equality");
   });
 
+  it("does not read ILIKE, NOT LIKE or a longer operator starting or ending in < > as a range", () => {
+    // Rendered by EXPLAIN VERBOSE on PostgreSQL 18. `~~*` begins with LIKE's
+    // `~~`, and `<@`/`<<`/`@>`/`>>` begin or end with a comparison character;
+    // the cast tail reaches every one of them on a cast column, and none can
+    // bound a btree scan, so each must leave the single range slot alone.
+    assert.equal(classifyRole("name", "((u.name)::text ~~* 'abc%'::text)"), "equality");
+    assert.equal(classifyRole("t", "(u.t ~~* 'x%'::text)"), "equality");
+    assert.equal(classifyRole("name", "((u.name)::text !~~ 'q%'::text)"), "equality");
+    assert.equal(classifyRole("n", "((u.n)::bigint <@ u.r)"), "equality");
+    assert.equal(classifyRole("r", "((u.r)::int4range << u.s)"), "equality");
+    assert.equal(classifyRole("r", "(u.s @> (u.r)::int4range)"), "equality");
+    assert.equal(classifyRole("r", "(u.s >> u.r)"), "equality");
+    assert.equal(classifyRole("a", "((u.a)::inet <<= u.b)"), "equality");
+    assert.equal(classifyRole("v", "(u.v <-> '[1,2]'::vector)"), "equality");
+    // LIKE itself, and a negative bound, still read as range.
+    assert.equal(classifyRole("name", "((u.name)::text ~~ 'x%'::text)"), "range");
+    assert.equal(classifyRole("n", "(u.n > '-5'::integer)"), "range");
+  });
+
   it("falls back to equality when no operator sits beside the column", () => {
     assert.equal(classifyRole("email", "(lower(email) = 'x'::text)"), "equality");
   });
@@ -346,6 +365,28 @@ describe("buildCandidates", () => {
     );
   });
 
+  it("follows each statement's own ORDER BY when statements sort the same table differently", () => {
+    // [`ORDER BY email`, `WHERE status = 'x' ORDER BY created_at, email`]. The
+    // merged Map meets email first, so first-seen order alone built only
+    // (status, email, created_at), and (status, created_at, email) -- the one
+    // key that serves the second ORDER BY -- was never generated.
+    const candidates = buildCandidates({
+      perStatement: [
+        predicates("public", "users", { email: ["sort"] }),
+        predicates("public", "users", { status: ["equality"], created_at: ["sort"], email: ["sort"] }),
+      ],
+      columnStats: stats,
+      existingIndexPrefixes: new Set(),
+      seqScans: new Map(),
+      maxIndexColumns: 3,
+    });
+    const keys = candidates.map((c) => c.columns.join(","));
+    assert.ok(keys.includes("status,created_at,email"), `got ${JSON.stringify(keys)}`);
+    assert.ok(keys.includes("status,email,created_at"), `got ${JSON.stringify(keys)}`);
+    // The shared prefix is generated once, not once per statement.
+    assert.equal(keys.filter((k) => k === "status").length, 1);
+  });
+
   it("harvests a Sort Key in the planner's order, which is what the candidate key then follows", () => {
     const plan = [
       {
@@ -496,6 +537,15 @@ describe("coveredIndexPrefix: what an existing index really stands in for", () =
 
   it("reads a missing option as the default rather than as a mismatch", () => {
     assert.deepEqual(coveredIndexPrefix(["a", "b"], [], false), ["a", "b"]);
+  });
+
+  it("stops at a non-default operator class or collation", () => {
+    // (email text_pattern_ops) answers `=` but neither `email > 'm'` nor ORDER
+    // BY email (measured on PostgreSQL 18: Seq Scan and Sort), so it must not
+    // suppress the plain (email) candidate before HypoPG can cost it.
+    assert.deepEqual(coveredIndexPrefix(["email"], [0], false, [false]), []);
+    assert.deepEqual(coveredIndexPrefix(["a", "b", "c"], [0, 0, 0], false, [true, false, true]), ["a"]);
+    assert.deepEqual(coveredIndexPrefix(["a", "b"], [0, 0], false, [true, true]), ["a", "b"]);
   });
 });
 
@@ -1114,11 +1164,17 @@ interface StubOptions {
   planSortKey?: string[];
   /**
    * Rows the existing-index catalog read returns for public.users: key columns,
-   * their `indoption` values, and whether the index is partial. None by default.
-   * `columns` may be a string to model what node-pg returns for an unparsed
-   * `name[]`.
+   * their `indoption` values, whether each key position has the default opclass
+   * and collation (`plain`, omitted reads as all default), and whether the
+   * index is partial. None by default. `columns` may be a string to model what
+   * node-pg returns for an unparsed `name[]`.
    */
-  existingIndexes?: { columns: (string | null)[] | string; options: number[]; partial: boolean }[];
+  existingIndexes?: {
+    columns: (string | null)[] | string;
+    options: number[];
+    plain?: boolean[];
+    partial: boolean;
+  }[];
   /** Make the FIRST hypopg_create_index refuse the index, as HypoPG does for a shape it cannot model. */
   declineCreateOnce?: boolean;
   /**
@@ -2369,6 +2425,12 @@ describe("pg_index_advisor HypoPG session hygiene", () => {
       // arrive as the string `{status}` and no existing index matches anything.
       assert.match(indexes ?? "", /SELECT a\.attname::text\s/);
       assert.match(indexes ?? "", /unnest\(i\.indoption\[0:i\.indnkeyatts - 1\]\)/);
+      // Opclass and collation per key position, shape run against PostgreSQL 18.
+      assert.match(indexes ?? "", /COALESCE\(oc\.opcdefault AND k\.coll = a\.attcollation, false\)/);
+      assert.match(
+        indexes ?? "",
+        /i\.indcollation\[0:i\.indnkeyatts - 1\]\) WITH ORDINALITY AS k\(attnum, opc, coll, ord\)/,
+      );
     });
   });
 
@@ -2584,6 +2646,21 @@ describe("pg_index_advisor end-to-end against a stubbed server", () => {
       assert.equal(result.ok, true);
       assert.equal(result.data?.candidates_considered, 0);
       assert.deepEqual(result.data?.recommendations, []);
+    });
+  });
+
+  it("still costs a plain candidate when the existing index has a non-default opclass or collation", async () => {
+    // `CREATE INDEX ON users (status text_pattern_ops)` cannot serve a range or
+    // an ORDER BY, so it must not suppress the plain (status) candidate.
+    const statements = ["SELECT * FROM users WHERE status = 'active'"];
+    const pattern = { columns: ["status"], options: [0], plain: [false], partial: false };
+    await withStubbedServer({ planFilter: "(status = 'active'::text)", existingIndexes: [pattern] }, async () => {
+      const result = (await pgIndexAdvisor.handler({ statements })) as {
+        ok: boolean;
+        data?: { candidates_considered: number };
+      };
+      assert.equal(result.ok, true);
+      assert.equal(result.data?.candidates_considered, 1);
     });
   });
 

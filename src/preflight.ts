@@ -126,9 +126,9 @@ export function analyzeRole(facts: RoleFacts, writesAllowed: boolean): string[] 
   if (facts.superuser) {
     findings.push("is a SUPERUSER: it can run server programs, read server files and bypass every permission check");
   }
-  // Everything below is gated on !superuser: pg_has_role() answers true for a
-  // superuser on every role, so the SQL reports memberships and SET reach it
-  // does not hold, and the SUPERUSER line already covers all of it.
+  // The privilege findings below are gated on !superuser: pg_has_role() answers
+  // true for a superuser on every role, so the SQL reports memberships and SET
+  // reach it does not hold, and the SUPERUSER line already covers all of it.
   if (!facts.superuser && facts.can_set_superuser) findings.push("can SET ROLE to a superuser");
   if (!facts.superuser && facts.dangerous_memberships.length > 0) {
     findings.push(`is a member of ${facts.dangerous_memberships.join(", ")}`);
@@ -156,7 +156,10 @@ export function analyzeRole(facts: RoleFacts, writesAllowed: boolean): string[] 
         "SECURITY DEFINER function can step outside it)",
     );
   }
-  if (!facts.superuser && facts.standard_conforming_strings === false) {
+  // Not gated on !superuser: this is a session setting the statement guard
+  // depends on whatever the role, and a superuser connection still relies on
+  // the guard for its read-only checks.
+  if (facts.standard_conforming_strings === false) {
     findings.push(
       "connects with standard_conforming_strings=off, so the read-only statement checks misread a backslash in a " +
         "string literal and a blocked call can hide behind one (`ALTER ROLE ... SET standard_conforming_strings = on`)",

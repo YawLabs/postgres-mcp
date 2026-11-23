@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   functions that create, copy, drop, advance, sync or consume a slot, and the SQL-from-text functions `crosstab`,
   `crosstab2`-`crosstab4`, `connectby` and `xpath_table`.** The `pg_replication_slots` view and the `peek` functions
   stay readable.
+- **The read-only guard also refuses the backup functions `pg_backup_start` / `pg_backup_stop` (and the PostgreSQL 14
+  names `pg_start_backup` / `pg_stop_backup`), `pg_log_standby_snapshot`, `pg_wal_replay_pause` /
+  `pg_wal_replay_resume`, `pg_replication_origin_advance` and `pg_replication_origin_session_setup`,** whose effects a
+  rollback does not undo: a backup stays open on the pooled connection, which `DISCARD ALL` does not end. Creating or
+  dropping a replication origin is transactional, so `pg_replication_origin_create` / `_drop` stay callable.
 - **The server refuses to start when `POSTGRES_MCP_SANDBOX` is on but it was started without its launcher**
   (`node dist/index.js`, `npm start`, an `oam compile` binary). It used to serve unsandboxed without a word. Only an
   absent variable or an explicit `0`, `false` or `off` lets it start.
@@ -28,14 +33,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `pg_explain` refuses `hypothetical_indexes` together with `analyze: true`. HypoPG ignores hypothetical
   indexes under `EXPLAIN ANALYZE`, so the call used to return the real plan as if the index did not help;
   `costs: false` still works with them.
+- **Breaking:** value types change in every tool result: `float4` / `float8` `NaN`, `Infinity` and `-Infinity` come
+  back as the strings `"NaN"`, `"Infinity"` and `"-Infinity"` instead of `null`, and `bytea` values as PostgreSQL's
+  `\x` hex string instead of `{"type":"Buffer","data":[...]}`, one array element per byte. A client that tested for
+  `null` or read `data` gets a string.
+- **Breaking:** with `POSTGRES_MCP_SANDBOX` on, starting the server without its launcher (`node dist/index.js`,
+  `npm start`, an `oam compile` binary) exits with an error instead of serving unsandboxed (see Security).
 - The startup role check warns when the connection has `standard_conforming_strings=off`, under which the statement
-  guard misreads backslashes in string literals. The fix is `ALTER ROLE ... SET standard_conforming_strings = on`.
+  guard misreads backslashes in string literals, for a superuser connection too. The fix is
+  `ALTER ROLE ... SET standard_conforming_strings = on`.
 - SQLSTATE 25001 errors (`VACUUM`, `CREATE INDEX CONCURRENTLY`, `CREATE DATABASE`, `ALTER SYSTEM`, ...) now add that
   this server runs every statement inside a transaction block, with or without `ALLOW_WRITES`, and to run them with
   psql or a migration tool; the `pg_query` description says the same. The read-only refusal of `VACUUM` no longer
-  recommends `pg_query` with `ALLOW_WRITES=1`, which cannot run it either.
-- The warning for an out-of-range `POSTGRES_MAX_RESULT_BYTES` / `POSTGRES_QUERY_DEADLINE_MS` names the 2147483647
-  maximum.
+  recommends `pg_query` with `ALLOW_WRITES=1`, which cannot run it either. In read-only mode, where PostgreSQL refuses
+  `CREATE` / `DROP INDEX CONCURRENTLY`, `DETACH PARTITION CONCURRENTLY` and `CREATE` / `DROP DATABASE` or `TABLESPACE`
+  as writes (25006) before reaching the transaction-block check, the error says `ALLOW_WRITES=1 would not help` and
+  gives the same psql advice, instead of telling you to set `ALLOW_WRITES=1`.
+- `pg_advisor` `sequence_exhaustion` measures each sequence against the bound it is heading for, `limit_value`:
+  `max_value` when ascending, `min_value` when descending (descending sequences used to be left out), narrowed to the
+  owning column's range when the sequence is `OWNED BY` (SERIAL, IDENTITY) a `smallint` or `integer` column. A
+  pre-PG10 SERIAL feeding an `int4` column from a bigint sequence used to read as about 0% used until the column
+  overflowed; `pct_used` is now `last_value / limit_value` and can exceed 1 for a sequence already past its column's
+  range. Rows gain `increment_by`, `limit_value`, `limited_by` (`sequence` or `column`), `owned_by` and
+  `owned_by_type`. Sequences the role cannot read are counted in a `_warnings` entry instead of being treated as
+  healthy, and a sequence whose bound is 0 (a countdown to `MINVALUE 0`, an ascending one with `MAXVALUE 0`) is left
+  out without failing the category.
+- `POSTGRES_STATEMENT_TIMEOUT_MS`, `POSTGRES_CONNECTION_TIMEOUT_MS`, `POSTGRES_MAX_ROWS` and `POSTGRES_POOL_MAX` print
+  one stderr warning when set to a value they cannot use (empty, non-numeric, 0, negative) and use the default, as
+  they did silently before. The warning for an out-of-range `POSTGRES_MAX_RESULT_BYTES` /
+  `POSTGRES_QUERY_DEADLINE_MS` names the 2147483647 maximum.
+- When a release publishes but a post-publish check fails, `release.sh`'s FAILED banner says whether re-running
+  `./release.sh <version>` will repeat the checks (only while `HEAD` is still the tagged commit) and prints the npm,
+  GitHub, MCP Registry and smoke-test commands to run by hand.
 - `pg_index_advisor`'s generated index names keep non-ASCII letters and digits instead of turning them into
   underscores.
 - Tool descriptions corrected: `pg_top_queries` shows constants as `$1`, `$2`, ..., not `?`; `pg_index_advisor` says
@@ -48,8 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The README's least-privilege role passes the startup role check cleanly.** The plain
   `GRANT pg_read_all_data TO mcp_reader` also grants `SET`, and the check warned `can SET ROLE to pg_read_all_data`.
   A predefined `pg_` role whose privileges the role already inherits is no longer named; one granted without
-  inheritance, and any ordinary role, still is. For a superuser the check prints the single SUPERUSER finding instead
-  of also listing memberships and `SET ROLE` reach that `pg_has_role()` reports for every role.
+  inheritance, and any ordinary role, still is. For a superuser the check prints the SUPERUSER finding (plus the
+  `standard_conforming_strings=off` one when that applies) instead of also listing role attributes, memberships and
+  `SET ROLE` reach that `pg_has_role()` reports for every role.
 - **With `POSTGRES_MCP_SANDBOX=1` the launcher passes `POSTGRES_MAX_RESULT_BYTES` and `POSTGRES_QUERY_DEADLINE_MS` to
   the sandboxed server.** oam dropped both, so the server silently ran on its defaults.
 - **A `pg_query` write that fails at `COMMIT`** (a deferred constraint, a serialization failure) leaves an `ok: false`
@@ -61,20 +91,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stack trace.
 - A refused connection to a host name with several addresses (`localhost` on a dual-stack machine) reports the
   per-address failures (`connect ECONNREFUSED ::1:5432; connect ECONNREFUSED 127.0.0.1:5432`) instead of an empty
-  `Error: `.
+  `Error: `. The same goes for the stderr line when the server cannot connect to terminate a statement that ran past
+  its deadline, which used to end in a blank reason.
 - With `POSTGRES_STATEMENT_TIMEOUT_MS` near PostgreSQL's maximum and `POSTGRES_QUERY_DEADLINE_MS` unset, the derived
   client-side deadline overflowed Node's timer and failed every statement after 1 ms; it is now capped at 2147483647.
-- `float4` / `float8` `NaN`, `Infinity` and `-Infinity` come back as the strings `"NaN"`, `"Infinity"` and
-  `"-Infinity"` instead of `null`, and `bytea` values as PostgreSQL's `\x` hex string instead of one array element
-  per byte.
+- `POSTGRES_CONNECTION_TIMEOUT_MS` above 2147483647 is capped at 2147483647 with a stderr warning. Node's timer turned
+  it into 1 ms, so every connect failed with a connection-timeout error.
+- `POSTGRES_MAX_ROWS` or `POSTGRES_POOL_MAX` values that floor to 0 (such as `0.5`) print a stderr warning and use the
+  default (1000 rows, 5 connections). Every query used to come back empty and truncated, and the pool silently used
+  pg's own default of 10.
 - A result whose columns share a name carries a `_warnings` entry saying the earlier columns are missing from `rows`
   and to alias them.
 - `pg_index_advisor`: existing indexes are recognised again (node-pg returned their key columns as an unparsed array
-  string, so none ever suppressed a duplicate candidate), and a partial index or one with a different sort direction
-  no longer hides a candidate it cannot serve; multi-column `ORDER BY` candidates keep the query's sort order instead
-  of being reordered by selectivity; an index made only of `ORDER BY` / `GROUP BY` columns is no longer pruned or
-  flagged `requires_skip_scan`; `min_improvement: 0` no longer returns recommendations that lower no cost; reversed
-  (`5 < col`) and cast-wrapped comparisons count as range predicates; a failed server-version probe no longer skips
+  string, so none ever suppressed a duplicate candidate), and a partial index, one with a different sort direction, or
+  one with a non-default operator class or collation (`text_pattern_ops`, `COLLATE "C"`) no longer hides a candidate
+  it cannot serve; multi-column `ORDER BY` candidates keep the query's sort order instead of being reordered by
+  selectivity, and statements that sort the same table in different orders each get a candidate in their own order;
+  an index made only of `ORDER BY` / `GROUP BY` columns is no longer pruned or flagged `requires_skip_scan`;
+  `min_improvement: 0` no longer returns recommendations that lower no cost; reversed (`5 < col`) and cast-wrapped
+  comparisons count as range predicates, while `ILIKE`, `NOT LIKE` and operators such as `<@`, `<<`, `@>` and `>>` no
+  longer take the candidate's single range slot; a failed server-version probe no longer skips
   every parameterized statement and blames the server's age; and an inheritance parent's columns read one `pg_stats`
   row each, so candidate column order is stable between calls.
 - `pg_advisor` `wraparound_risk` measures each table against the LOWER of its per-table
@@ -91,7 +127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10^8, and `pg_health`'s `active_queries` ages no longer overflow for a backend older than about 3.2 years.
   `pg_health`'s `database`, `connections` and `table_count` read `null` instead of vanishing when a sub-query returns
   no rows.
-- `pg_unused_indexes` no longer offers indexes that back an `EXCLUDE` constraint as drop candidates.
+- `pg_unused_indexes` no longer offers indexes that back an `EXCLUDE` constraint as drop candidates; unique indexes
+  stay left out as before.
 - `pg_top_queries` works when `pg_stat_statements` is installed in a schema outside the role's `search_path`, instead
   of failing with `relation "pg_stat_statements" does not exist` right after its install check passed.
 

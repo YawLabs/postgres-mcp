@@ -22,6 +22,18 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  ATLEAST_DECL,
+  type Candidate,
+  extractFromLauncher,
+  LAUNCHER,
+  loadPickNewest,
+  OAM_MIN_DECL,
+  resolveOam,
+  SANDBOX_ENDPOINT_DECL,
+  SANDBOX_ENV_DECL,
+  SANDBOX_FLAGS_DECL,
+} from "./test-helpers/launcher-extract.js";
 
 // Resolve the sibling emitted entrypoint. This file runs from dist/, so
 // index.js sits next to it regardless of where the repo lives.
@@ -672,8 +684,6 @@ describe("CLI: audit attribution", () => {
 // bin/, not src/), so nothing else in the suite would notice it breaking.
 // ─────────────────────────────────────────────────────────────────────────
 
-const LAUNCHER = fileURLToPath(new URL("../bin/postgres-mcp.mjs", import.meta.url));
-
 /**
  * Run the launcher with an env overlay. `undefined` deletes a key.
  *
@@ -732,9 +742,10 @@ const NO_OAM = process.platform === "win32" ? "C:\\__no_such_oam__\\oam.exe" : "
  * at an empty directory, so the installed locations are empty, and PATH holds
  * only the directory of the Node running this test. Discovery scans past an
  * unusable OAM_BIN, so pointing OAM_BIN at a missing path no longer keeps a real
- * oam on the developer's box out of reach -- this does. The selection variables
- * are deleted so a POSTGRES_MCP_* exported by the developer's shell cannot
- * change what is being asserted.
+ * oam on the developer's box out of reach -- this does. OAM_INSTALL_DIR is
+ * deleted too: discovery checks it first. The selection variables are deleted
+ * so a POSTGRES_MCP_* exported by the developer's shell cannot change what is
+ * being asserted.
  */
 function noOamAnywhere(extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   const empty = mkdtempSync(join(tmpdir(), "postgres-mcp-launcher-home-"));
@@ -743,44 +754,11 @@ function noOamAnywhere(extra: Record<string, string | undefined> = {}): Record<s
     HOME: empty,
     USERPROFILE: empty,
     LOCALAPPDATA: empty,
+    OAM_INSTALL_DIR: undefined,
     OAM_BIN: undefined,
     POSTGRES_MCP_RUNTIME: undefined,
     POSTGRES_MCP_SANDBOX: undefined,
     ...extra,
-  };
-}
-
-/** Pull named declarations out of the launcher source, loudly. */
-function extractFromLauncher(patterns: RegExp[]): string {
-  const source = readFileSync(LAUNCHER, "utf8");
-  return patterns
-    .map((pattern) => {
-      const match = source.match(pattern);
-      assert.ok(match, `could not extract ${pattern} from bin/postgres-mcp.mjs -- renamed or reformatted?`);
-      return match[0];
-    })
-    .join("\n");
-}
-
-const OAM_MIN_DECL = /const OAM_MIN = \[[^\]]*\];/;
-const ATLEAST_DECL = /function atLeast\(v, min\) \{[\s\S]*?\r?\n\}/;
-
-type Candidate = { path: string; version: number[] | null };
-type PickNewest = (candidates: Candidate[]) => Candidate | null;
-
-/**
- * Evaluate the REAL `pickNewest` source, with the floor it closes over. See
- * loadRuntimePlan for why the launcher is read as text rather than imported.
- */
-function loadPickNewest(): { pickNewest: PickNewest; floor: number[] } {
-  const pieces = extractFromLauncher([
-    OAM_MIN_DECL,
-    ATLEAST_DECL,
-    /function pickNewest\(candidates\) \{[\s\S]*?\r?\n\}/,
-  ]);
-  return new Function(`${pieces}\nreturn { pickNewest, floor: OAM_MIN };`)() as {
-    pickNewest: PickNewest;
-    floor: number[];
   };
 }
 
@@ -865,23 +843,7 @@ describe("launcher: runtime selection", () => {
 // the newest oam at or above the launcher's floor, with the launcher's own
 // pickNewest: the first binary on PATH may be an older copy the launcher would
 // pass over, which would make these tests exercise discovery instead.
-const oamBin = (() => {
-  const isWin = process.platform === "win32";
-  const name = isWin ? "oam.exe" : "oam";
-  const paths = [
-    process.env.OAM_BIN,
-    ...(process.env.PATH ?? "")
-      .split(isWin ? ";" : ":")
-      .filter(Boolean)
-      .map((d) => `${d}${isWin ? "\\" : "/"}${name}`),
-  ].filter((c): c is string => Boolean(c) && existsSync(c as string));
-  const candidates = paths.map((path) => {
-    const out = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 5_000, windowsHide: true }).stdout ?? "";
-    const m = /(\d+)\.(\d+)\.(\d+)/.exec(out);
-    return { path, version: m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null };
-  });
-  return loadPickNewest().pickNewest(candidates)?.path ?? null;
-})();
+const oamBin = resolveOam();
 
 // node:test spells conditional skips `{ skip: <reason> }` -- there is no
 // it.skipIf here (that is vitest). A string reason shows up in the TAP output,
@@ -1107,12 +1069,12 @@ type SandboxFns = {
 function loadSandboxFns(): SandboxFns {
   const pieces = extractFromLauncher([
     /function parseSandboxSetting\(raw\) \{[\s\S]*?\r?\n\}/,
-    /function sandboxEndpoint\(dsn, pghost, pgport\) \{[\s\S]*?\r?\n\}/,
+    SANDBOX_ENDPOINT_DECL,
     /function endpointProblem\(\{ code, part, host, port, from, hint \}\) \{[\s\S]*?\r?\n\}/,
     /function sandboxRefusal\(shown, \{ problem, details = \[\], remedy \}\) \{[\s\S]*?\r?\n\}/,
     /function sandboxChildEnv\(source, names, platform\) \{[\s\S]*?\r?\n\}/,
-    /const SANDBOX_ENV = \[[^\]]*\];/,
-    /function sandboxFlags\(grant\) \{[\s\S]*?\r?\n\}/,
+    SANDBOX_ENV_DECL,
+    SANDBOX_FLAGS_DECL,
   ]);
   return new Function(
     `${pieces}\nreturn { parseSandboxSetting, sandboxEndpoint, endpointProblem, sandboxRefusal, sandboxChildEnv, sandboxFlags, SANDBOX_ENV };`,
@@ -1676,6 +1638,28 @@ const PACKAGE_VERSION = (
 ).version;
 
 /**
+ * Preload text that answers the launcher's `--version` probe of the pinned
+ * Node (OAM_BIN) at once, with what running it would print. Every other
+ * execFileSync call goes through untouched. Bindings are prefixed so the
+ * preload can share a module with spawnPreload's imports.
+ */
+function pinnedNodeProbe(): string {
+  return [
+    'import probeChildProcess from "node:child_process";',
+    'import { syncBuiltinESMExports as probeSyncExports } from "node:module";',
+    "const probeReal = probeChildProcess.execFileSync;",
+    "probeChildProcess.execFileSync = function (cmd, args, opts) {",
+    `  if (cmd === ${JSON.stringify(process.execPath)} && args?.length === 1 && args[0] === "--version") {`,
+    '    return opts?.encoding ? process.version + "\\n" : Buffer.from(process.version + "\\n");',
+    "  }",
+    "  return probeReal.apply(this, arguments);",
+    "};",
+    "probeSyncExports();",
+    "",
+  ].join("\n");
+}
+
+/**
  * Run the REAL launcher under Node, optionally posing as oam by preloading a
  * `process.versions.oam` key.
  *
@@ -1688,11 +1672,18 @@ const PACKAGE_VERSION = (
  * OAM_BIN is pinned to the Node binary running this test, which makes the two
  * outcomes unmistakable without a real oam. In-process, `version` reaches
  * dist/index.js and prints the package version with exit 0. On the discovery
- * path, the pinned Node answers `--version` with v22.x, which clears the floor,
- * so it is chosen and the launcher spawns `node [flags] run <entry>` -- which
- * has no `run` subcommand, prints no version and exits non-zero. A usable
- * OAM_BIN is taken before discovery runs, so a real oam on the developer's box
- * is never reached either.
+ * path, the pinned Node "answers" `--version` with its own version, which
+ * clears the floor, so it is chosen and the launcher spawns
+ * `node [flags] run <entry>` -- which has no `run` subcommand, prints no
+ * version and exits non-zero.
+ *
+ * That answer comes from a stub, not from running Node. The launcher bounds
+ * each `--version` probe at 5 s, and a bare Node start has been measured at
+ * ~11 s on a contended box; a timed-out probe rejects OAM_BIN, discovery then
+ * picks the developer's installed ~/.oam/bin/oam, and the assertions fail on a
+ * spawn of the wrong binary. So the preload answers the probe for this one
+ * path instantly, and every run starts from noOamAnywhere(), so even a probe
+ * that fails some other way finds no real oam to fall back to.
  *
  * Every run also reports, at exit, what the LAUNCHER process's argv[1] ended up
  * as. runInProcess points it at dist/index.js; a spawn or handoff leaves it on
@@ -1715,10 +1706,11 @@ function runAsHost(
     hostOam === undefined
       ? ""
       : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`;
-  const nodeArgs = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}${extraPreload}`)}`];
+  const preload = `${exitMarker}${posing}${pinnedNodeProbe()}${extraPreload}`;
+  const nodeArgs = ["--import", `data:text/javascript,${encodeURIComponent(preload)}`];
   return runLauncher(
     ["version"],
-    { POSTGRES_MCP_RUNTIME: undefined, POSTGRES_MCP_SANDBOX: undefined, OAM_BIN: process.execPath, ...overlay },
+    noOamAnywhere({ OAM_BIN: process.execPath, ...overlay }),
     // Each case boots one to three Node processes, and a bare Node start has
     // been measured at ~11s on a contended Windows box.
     { nodeArgs, timeoutMs: 90_000 },
