@@ -6,7 +6,7 @@
 // removing those shared singletons.
 
 import assert from "node:assert/strict";
-import { after, before, describe, it } from "node:test";
+import { after, before, describe, it, type TestContext } from "node:test";
 import pg from "pg";
 import { getApplicationName, runInternal, shutdown, withSharedClient } from "../api.js";
 import { explainTools } from "../tools/explain.js";
@@ -18,6 +18,7 @@ import {
   FIXTURE_OTHER_DB,
   FIXTURE_OTHER_DB_MARKER,
   FIXTURE_SCHEMA,
+  hypopgAvailable,
   integrationEnabled,
   runMarkerQueryInOtherDatabase,
   setupFixtures,
@@ -27,9 +28,44 @@ import {
 const pgReadonly = queryTools.find((t) => t.name === "pg_readonly");
 const pgQuery = queryTools.find((t) => t.name === "pg_query");
 if (!pgReadonly || !pgQuery) throw new Error("pg_readonly and pg_query must be defined");
-const pgExplain = explainTools[0];
-const pgHealth = healthTools[0];
-const pgTopQueries = statsTools[0];
+/** By name, not position: a reordered tool list must not hand back the wrong tool. */
+function byName<T extends { name: string }>(tools: readonly T[], name: string): T {
+  const tool = tools.find((t) => t.name === name);
+  if (!tool) throw new Error(`${name} must be defined`);
+  return tool;
+}
+const pgExplain = byName(explainTools, "pg_explain");
+const pgHealth = byName(healthTools, "pg_health");
+const pgTopQueries = byName(statsTools, "pg_top_queries");
+
+// A capability-gated test skips at RUNTIME with `t.skip`, never a bare
+// `return`: a test that returns before its first assertion is reported as a
+// PASS, so a cluster missing the extension would show a green run that proved
+// nothing. (A `{ skip }` option cannot do it -- it is evaluated before
+// `before(setupFixtures)` has probed anything.)
+const HYPOPG_MISSING = "HypoPG is not installed on this cluster";
+const PG_STAT_STATEMENTS_MISSING = "pg_stat_statements is not installed and loaded on this cluster";
+
+/**
+ * Whether pg_stat_statements can be READ here, decided without the handler
+ * under test: the extension row exists AND the view answers (it raises unless
+ * the library is in shared_preload_libraries). The pg_top_queries tests used to
+ * take any handler error that mentioned `pg_stat_statements` as "not
+ * installed" -- and a regression in the handler's own SQL names that view too
+ * (`column pg_stat_statements.callz does not exist`), so every one of them
+ * went green with the tool broken.
+ */
+async function pgStatStatementsReadable(): Promise<boolean> {
+  // Schema-qualified from the catalog, so an extension installed off the
+  // search_path still counts as readable.
+  const ext = await runInternal<{ schema: string }>(
+    `SELECT extnamespace::regnamespace::text AS schema
+       FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
+  );
+  const schema = ext.ok ? ext.data?.[0]?.schema : undefined;
+  if (schema === undefined) return false;
+  return (await runInternal(`SELECT 1 FROM ${schema}.pg_stat_statements LIMIT 1`)).ok;
+}
 
 // One setup/teardown for the whole file - every describe below shares the
 // same fixture schema, so running DROP/CREATE per-describe is wasted work.
@@ -187,6 +223,58 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /syntax|42601/i);
     });
 
+    // node-pg builds each row as an object keyed by column name, so the second
+    // `a` overwrites the first while `fields` still lists both. The unit test
+    // stubs `fields`; only a live server proves the driver really hands back
+    // the collapsed row this warning describes.
+    it("warns when result columns share a name, since rows keep only the last one", async () => {
+      const res = (await pgQuery.handler({ sql: "SELECT 1 AS a, 2 AS a" })) as {
+        ok: boolean;
+        error?: string;
+        data?: { rows: Record<string, unknown>[]; fields: { name: string }[]; _warnings?: string[] };
+      };
+      assert.equal(res.ok, true, res.error);
+      assert.deepEqual(
+        res.data?.fields.map((f) => f.name),
+        ["a", "a"],
+      );
+      assert.deepEqual(res.data?.rows, [{ a: 2 }], "the driver keeps the LAST column of a repeated name");
+      assert.equal(res.data?._warnings?.length, 1, `expected one warning, got ${JSON.stringify(res.data?._warnings)}`);
+      assert.match(
+        res.data?._warnings?.[0] ?? "",
+        /^Result columns share a name \("a"\), so each row holds only the LAST/,
+      );
+      assert.match(res.data?._warnings?.[0] ?? "", /distinct alias/);
+
+      const distinct = (await pgQuery.handler({ sql: "SELECT 1 AS a, 2 AS b" })) as { data?: { _warnings?: string[] } };
+      assert.equal(distinct.data?._warnings, undefined, "distinct names must not carry the warning");
+    });
+
+    // VACUUM gets past the guard only with ALLOW_WRITES=1 (read-only paths
+    // refuse it by keyword), and then the server rejects it with 25001 because
+    // runReadWrite wraps it in BEGIN. The error must say no retry through this
+    // server can work, not leave the agent to try again with other settings.
+    it("explains SQLSTATE 25001 when VACUUM runs through pg_query with ALLOW_WRITES=1", async () => {
+      const original = process.env.ALLOW_WRITES;
+      process.env.ALLOW_WRITES = "1";
+      try {
+        const res = (await pgQuery.handler({ sql: `VACUUM ${FIXTURE_SCHEMA}.users` })) as {
+          ok: boolean;
+          error?: string;
+        };
+        assert.equal(res.ok, false, "VACUUM cannot run inside a transaction block");
+        assert.match(res.error ?? "", /VACUUM cannot run inside a transaction block/);
+        assert.match(res.error ?? "", /\(code: 25001\)/);
+        assert.match(
+          res.error ?? "",
+          /this server runs every statement inside a transaction block, with or without ALLOW_WRITES, so it cannot run this one\. Run it outside this server \(psql, a migration tool\)\./,
+        );
+      } finally {
+        if (original === undefined) delete process.env.ALLOW_WRITES;
+        else process.env.ALLOW_WRITES = original;
+      }
+    });
+
     it("non-cursorable DDL falls back to direct exec from the DECLARE-failure path", async () => {
       // The fallback runs for exactly two SQLSTATEs (NOT_CURSORABLE_SQLSTATES in
       // api.ts), and this test sends one statement for each against a LIVE
@@ -217,7 +305,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
         assert.equal(cte.data?.rows[0]?.n, 1);
 
         // DML without RETURNING -- DECLARE fails with 42601, fallback runs
-        // the INSERT directly. Two-row count survives the round-trip.
+        // the INSERT directly. The one-row count survives the round-trip.
         const insert = (await pgQuery.handler({
           sql: `INSERT INTO ${FIXTURE_SCHEMA}.posts (user_id, title) VALUES (1, 'fallback-canary')`,
         })) as { ok: boolean; data?: { rowCount: number | null } };
@@ -260,7 +348,10 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
 
         const before = (await runInternal<{ v: string }>(
           `SELECT last_value::text AS v FROM ${FIXTURE_SCHEMA}.fetch_probe_seq`,
-        )) as { ok: boolean; data?: { v: string }[] };
+        )) as { ok: boolean; error?: string; data?: { v: string }[] };
+        // Both reads are asserted: a failed read defaults to "0" below, and a
+        // failed `after` would make delta <= 0 and pass without measuring.
+        assert.equal(before.ok, true, `sequence read before the call failed: ${before.error}`);
         const beforeVal = Number(before.data?.[0]?.v ?? "0");
 
         // Cursorable (a plain SELECT), so DECLARE succeeds and FETCH executes.
@@ -277,12 +368,14 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
 
         const after = (await runInternal<{ v: string }>(
           `SELECT last_value::text AS v FROM ${FIXTURE_SCHEMA}.fetch_probe_seq`,
-        )) as { ok: boolean; data?: { v: string }[] };
+        )) as { ok: boolean; error?: string; data?: { v: string }[] };
+        assert.equal(after.ok, true, `sequence read after the call failed: ${after.error}`);
         const delta = Number(after.data?.[0]?.v ?? "0") - beforeVal;
 
         // <= 1 rather than === 1: whether nextval evaluates before pg_sleep in
         // the target list is not guaranteed, so 0 is a legal outcome. The
         // property under test is that it never runs TWICE.
+        assert.ok(delta >= 0, `the sequence went backwards (${delta}): the reads measured nothing`);
         assert.ok(
           delta <= 1,
           `statement executed more than once after a FETCH-time failure (sequence advanced by ${delta})`,
@@ -385,7 +478,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     });
 
     // Not tool-level arity validation: the handler defaults params to [] when
-    // omitted (query.ts:62, `runReadOnly(sql, params ?? [])`), so postgres
+    // omitted (pg_query's handler, `runReadOnly(sql, params ?? [])`), so postgres
     // receives a $1 placeholder with an empty values array and raises the
     // bind-time error itself. This pins that postgres's error is surfaced
     // verbatim rather than being swallowed or rewritten by the handler.
@@ -796,12 +889,11 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /EXPLAIN/);
     });
 
-    it("hypothetical_indexes returns a friendly error when HypoPG is not installed", async () => {
-      const check = (await runInternal<{ installed: boolean }>(
-        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
-      )) as { ok: boolean; data?: { installed: boolean }[] };
-      const installed = check.ok && check.data?.[0]?.installed === true;
-      if (installed) return; // positive-path test below covers this case
+    it("hypothetical_indexes returns a friendly error when HypoPG is not installed", async (t) => {
+      if (hypopgAvailable()) {
+        t.skip("HypoPG is installed on this cluster; the positive-path tests below cover it");
+        return;
+      }
 
       const res = (await pgExplain.handler({
         sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE user_id = 1`,
@@ -813,17 +905,16 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.error ?? "", /HypoPG|CREATE EXTENSION hypopg/i);
     });
 
-    it("hypothetical_indexes defaults using=btree when the field is omitted", async () => {
+    it("hypothetical_indexes defaults using=btree when the field is omitted", async (t) => {
       // Regression test: a unit-test-style direct handler call bypasses the
       // MCP framework's Zod parse, so `using` arrives as undefined. The
       // defensive default in buildHypopgHooks must turn that back into "btree"
       // -- otherwise the generated SQL is `USING undefined` and hypopg returns
       // a confusing syntax error.
-      const check = (await runInternal<{ installed: boolean }>(
-        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
-      )) as { ok: boolean; data?: { installed: boolean }[] };
-      const installed = check.ok && check.data?.[0]?.installed === true;
-      if (!installed) return; // negative-path test already covers the absent case
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       const res = (await pgExplain.handler({
         sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE body = 'world'`,
@@ -835,12 +926,11 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.data?.plan ?? "", /Index|Bitmap/i);
     });
 
-    it("hypothetical_indexes flips a seq scan to an index scan when HypoPG is installed", async () => {
-      const check = (await runInternal<{ installed: boolean }>(
-        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
-      )) as { ok: boolean; data?: { installed: boolean }[] };
-      const installed = check.ok && check.data?.[0]?.installed === true;
-      if (!installed) return; // negative-path test above covers this case
+    it("hypothetical_indexes flips a seq scan to an index scan when HypoPG is installed", async (t) => {
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       // Baseline: explain without a hypothetical index over `body` (no real
       // index exists for this column in the fixture).
@@ -902,12 +992,11 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     // but every other hypothetical_indexes test passes exactly one entry. A
     // regression that swaps the loop for `indexes[0]` would silently ignore
     // every entry past the first.
-    it("supports multiple hypothetical_indexes in a single call", async () => {
-      const check = (await runInternal<{ installed: boolean }>(
-        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
-      )) as { ok: boolean; data?: { installed: boolean }[] };
-      const installed = check.ok && check.data?.[0]?.installed === true;
-      if (!installed) return;
+    it("supports multiple hypothetical_indexes in a single call", async (t) => {
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
 
       const res = (await pgExplain.handler({
         sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE body = 'world' AND title = 'hello'`,
@@ -928,18 +1017,33 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       );
     });
 
-    // analyze=true + ALLOW_WRITES=1 + hypothetical_indexes routes through
-    // runReadWriteRollback instead of runReadOnly. The hooks (setup +
-    // teardown) must still install + reset the HypoPG indexes inside the
-    // write-path transaction. A regression in the hooks plumbing specific
-    // to the write path wouldn't be caught by any other test in the suite.
-    it("hypothetical_indexes work on an EXPLAIN ANALYZE write (writes path, not read-only path)", async () => {
-      const check = (await runInternal<{ installed: boolean }>(
-        `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'hypopg') AS installed`,
-      )) as { ok: boolean; data?: { installed: boolean }[] };
-      const installed = check.ok && check.data?.[0]?.installed === true;
-      if (!installed) return;
+    // `costs: false` is deliberately NOT refused alongside hypothetical_indexes:
+    // HypoPG only stands down for an `analyze` key, and COSTS OFF plans still
+    // use the hypothetical index. Pins that so a later "refuse COSTS OFF too"
+    // has to argue with a red test.
+    it("hypothetical_indexes still flip the plan under costs: false", async (t) => {
+      if (!hypopgAvailable()) {
+        t.skip(HYPOPG_MISSING);
+        return;
+      }
+      const res = (await pgExplain.handler({
+        sql: `SELECT * FROM ${FIXTURE_SCHEMA}.posts WHERE body = 'world'`,
+        costs: false,
+        format: "text",
+        hypothetical_indexes: [{ table: `${FIXTURE_SCHEMA}.posts`, columns: ["body"], using: "btree" }],
+      })) as { ok: boolean; data?: { plan: string }; error?: string };
+      assert.equal(res.ok, true, res.error);
+      assert.match(res.data?.plan ?? "", /Index|Bitmap/i, "expected the hypothetical index under COSTS OFF");
+      assert.doesNotMatch(res.data?.plan ?? "", /cost=/, "COSTS OFF did not reach the server");
+    });
 
+    // analyze=true + hypothetical_indexes is refused: HypoPG stands down for
+    // any EXPLAIN whose option list carries an `analyze` key, so this call
+    // used to run EXPLAIN ANALYZE and return the REAL plan with ok:true (this
+    // test once asserted exactly that, checking only /Insert/). The refusal
+    // comes before the HypoPG check and the statement, so it holds on every
+    // cluster, and the write must not have run at all.
+    it("hypothetical_indexes combined with analyze is refused and executes nothing", async () => {
       const original = process.env.ALLOW_WRITES;
       process.env.ALLOW_WRITES = "1";
       try {
@@ -955,20 +1059,14 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           format: "text",
           hypothetical_indexes: [{ table: `${FIXTURE_SCHEMA}.posts`, columns: ["body"], using: "btree" }],
         })) as { ok: boolean; data?: { plan: string }; error?: string };
-        assert.equal(res.ok, true, `expected ok on analyze+writes+hypo, got error: ${res.error}`);
-        assert.match(res.data?.plan ?? "", /Insert/i);
+        assert.equal(res.ok, false, "analyze + hypothetical_indexes must be refused, not answered with the real plan");
+        assert.match(res.error ?? "", /`hypothetical_indexes` cannot be combined with `analyze: true`/);
 
-        // Hooks teardown (hypopg_reset) ran AND the rollback path persisted
-        // nothing: same row count.
         const after = (await pgQuery.handler({
           sql: `SELECT count(*)::int AS c FROM ${FIXTURE_SCHEMA}.posts`,
         })) as { ok: boolean; data?: { rows: { c: number }[] } };
         assert.equal(after.ok, true);
-        assert.equal(
-          after.data?.rows[0]?.c,
-          beforeCount,
-          "INSERT under EXPLAIN ANALYZE must roll back even with hypothetical_indexes hooks",
-        );
+        assert.equal(after.data?.rows[0]?.c, beforeCount, "the refused INSERT must not have run");
       } finally {
         if (original === undefined) delete process.env.ALLOW_WRITES;
         else process.env.ALLOW_WRITES = original;
@@ -1116,7 +1214,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       try {
         const pid = (await side.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]!.pid;
         await side.query("BEGIN");
-        // Touch a real relation so the transaction is unambiguously underway.
+        // Run one statement so the transaction is unambiguously underway.
         await side.query("SELECT 1");
         return await fn(pid);
       } finally {
@@ -1142,16 +1240,27 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match(res.data?.version ?? "", /PostgreSQL/);
       assert.ok(res.data?.database.database);
       assert.ok(Array.isArray(res.data?.active_queries));
+      assert.match(res.data?.connections.total ?? "", /^\d+$/);
+      assert.match(res.data?.table_count ?? "", /^\d+$/);
     });
 
     it("respects activeQueryLimit", async () => {
-      const res = (await pgHealth.handler({ activeQueryLimit: 1 })) as {
-        ok: boolean;
-        data?: { active_queries: unknown[] };
-      };
-      assert.equal(res.ok, true);
-      // May be 0 if no concurrent activity; must be <= 1.
-      assert.ok((res.data?.active_queries ?? []).length <= 1);
+      // Two parked `idle in transaction` backends pass the handler's
+      // `state <> 'idle'` filter, so the list has at least two candidates.
+      // Without them a quiet cluster returns zero rows and a dropped LIMIT
+      // would still satisfy "at most one".
+      await withOpenTransaction(() =>
+        withOpenTransaction(async () => {
+          type Res = { ok: boolean; error?: string; data?: { active_queries: unknown[] } };
+          const unlimited = (await pgHealth.handler({ activeQueryLimit: 10 })) as Res;
+          assert.equal(unlimited.ok, true, unlimited.error);
+          assert.ok((unlimited.data?.active_queries ?? []).length >= 2, "both parked backends should be listed");
+
+          const res = (await pgHealth.handler({ activeQueryLimit: 1 })) as Res;
+          assert.equal(res.ok, true, res.error);
+          assert.equal((res.data?.active_queries ?? []).length, 1);
+        }),
+      );
     });
 
     // The six buckets are documented to RECONCILE, and that sum is the only
@@ -1308,8 +1417,9 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     });
 
     // Every counter in this rollup is a bigint carried as ::text on purpose:
-    // node-pg would hand back a JS number that silently loses precision past
-    // 2^53 on a long-lived cluster's temp_bytes. Asserting the digit-string
+    // a JS number would silently lose precision past 2^53 on a long-lived
+    // cluster's temp_bytes, and the cast pins the string whatever int8 type
+    // parser is installed. Asserting the digit-string
     // form is what catches a revert to the raw bigint, which would arrive here
     // as a number and fail the regex rather than pass a loose typeof check.
     it("database_stats returns the pg_stat_database rollup with lossless counters", async () => {
@@ -1400,23 +1510,34 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
   });
 
   describe("pg_top_queries", () => {
+    /**
+     * Gate for the handler-calling tests below, decided by
+     * pgStatStatementsReadable() rather than by the handler's own error: when
+     * the view is readable every call must succeed, and when it is not the
+     * test is reported as SKIPPED rather than a silent pass.
+     */
+    async function requireStatements(t: TestContext): Promise<boolean> {
+      const readable = await pgStatStatementsReadable();
+      if (!readable) t.skip(PG_STAT_STATEMENTS_MISSING);
+      return readable;
+    }
+
     it("returns rows from pg_stat_statements when installed", async () => {
       // scripts/wsl-pg-setup.sh adds pg_stat_statements to
-      // shared_preload_libraries so the matrix exercises the real path; on a
-      // cluster without it we accept the "not installed" error as valid.
-      // NOTE: when the extension is absent, EVERY test in this describe takes
-      // that early return and proves nothing about the tool's SQL -- if you are
-      // relying on this suite for pg_top_queries coverage, confirm the
-      // extension is actually present first.
+      // shared_preload_libraries so the matrix exercises the real path. On a
+      // cluster without it, the handler must say so in ITS words -- not just
+      // any error that happens to name the view.
       const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as {
         ok: boolean;
         data?: { rows: { query: string; calls: string }[] };
         error?: string;
       };
-      if (!res.ok) {
-        assert.match(res.error ?? "", /pg_stat_statements/);
+      if (!(await pgStatStatementsReadable())) {
+        assert.equal(res.ok, false);
+        assert.match(res.error ?? "", /extension is not installed|must be loaded via "?shared_preload_libraries/);
         return;
       }
+      assert.equal(res.ok, true, res.error);
       // The success shape is the {rows, stats_reset, ...} stats-window envelope,
       // not a bare row array -- `data` itself is never an array.
       assert.ok(Array.isArray(res.data?.rows), `expected data.rows array, got ${JSON.stringify(res.data)}`);
@@ -1431,7 +1552,8 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     // because the handler has to dodge an alias-shadowing trap -- the SELECT
     // aliases `calls::text AS calls`, and postgres resolves a bare `ORDER BY
     // calls` to that TEXT alias first, which sorts "9" above "10".
-    it("ranks DESC by the requested orderBy column (total_time / mean_time / calls)", async () => {
+    it("ranks DESC by the requested orderBy column (total_time / mean_time / calls)", async (t) => {
+      if (!(await requireStatements(t))) return;
       type TopQueryRow = { query: string; calls: string; total_time_ms: number; mean_time_ms: number };
       const rankOf = {
         total_time: (r: TopQueryRow) => r.total_time_ms,
@@ -1444,11 +1566,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           data?: { rows: TopQueryRow[] };
           error?: string;
         };
-        // Either installed-and-ok, or extension missing - both acceptable.
-        if (!res.ok) {
-          assert.match(res.error ?? "", /pg_stat_statements/);
-          continue;
-        }
+        assert.equal(res.ok, true, `orderBy=${orderBy} failed: ${res.error}`);
         const rows = res.data?.rows;
         assert.ok(
           Array.isArray(rows),
@@ -1473,17 +1591,14 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       }
     });
 
-    it("includes io_read_time_ms / io_write_time_ms when pg_stat_statements >= 1.10", async () => {
+    it("includes io_read_time_ms / io_write_time_ms when pg_stat_statements >= 1.10", async (t) => {
+      if (!(await requireStatements(t))) return;
       const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as {
         ok: boolean;
         data?: { rows: { query: string; io_read_time_ms?: number | null; io_write_time_ms?: number | null }[] };
         error?: string;
       };
-      if (!res.ok) {
-        // pg_stat_statements not installed -- acceptable, skip the column check.
-        assert.match(res.error ?? "", /pg_stat_statements/);
-        return;
-      }
+      assert.equal(res.ok, true, res.error);
       // Check the installed version. If < 1.10 the columns are absent (not a bug).
       // If >= 1.10, every row must have the keys present (null is fine -- means
       // track_io_timing=off or the query did no measurable IO; absent means the
@@ -1520,9 +1635,13 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
     // the same view under a different dbid -- and must not come back here.
     // Dropping the WHERE clause restores the leak silently; nothing else in
     // the suite would notice.
-    it("excludes queries from other databases in the same cluster (dbid scoping)", async () => {
+    it("excludes queries from other databases in the same cluster (dbid scoping)", async (t) => {
+      if (!(await requireStatements(t))) return;
       const staged = await runMarkerQueryInOtherDatabase();
-      if (!staged) return; // no pg_stat_statements or no CREATEDB -- nothing to assert
+      if (!staged) {
+        t.skip("could not stage a marker query in a second database (no CREATEDB?)");
+        return;
+      }
 
       try {
         // Ask for a large limit so the marker isn't merely ranked off the end.
@@ -1531,10 +1650,7 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
           data?: { rows: { query: string }[] };
           error?: string;
         };
-        if (!res.ok) {
-          assert.match(res.error ?? "", /pg_stat_statements/);
-          return;
-        }
+        assert.equal(res.ok, true, res.error);
         const leaked = (res.data?.rows ?? []).filter((r) => r.query.includes(FIXTURE_OTHER_DB_MARKER));
         assert.deepEqual(
           leaked,
@@ -1579,12 +1695,10 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       error?: string;
     };
 
-    it("carries stats_reset / stats_reset_age_seconds / dealloc on pg_stat_statements >= 1.9", async () => {
+    it("carries stats_reset / stats_reset_age_seconds / dealloc on pg_stat_statements >= 1.9", async (t) => {
+      if (!(await requireStatements(t))) return;
       const res = (await pgTopQueries.handler({ orderBy: "total_time", limit: 5 })) as TopQueriesEnvelope;
-      if (!res.ok) {
-        assert.match(res.error ?? "", /pg_stat_statements/);
-        return;
-      }
+      assert.equal(res.ok, true, res.error);
 
       // Same capability gate the io-timing test above uses: probe extversion,
       // then bail when the extension predates the view rather than asserting
@@ -1664,17 +1778,14 @@ describe("integration: query / explain / health / top_queries", { skip: !integra
       assert.match((data._warnings ?? []).join(" "), /pg_stat_statements_info/);
     });
 
-    // Note: an integration test for the orderBy=calls numeric-vs-lexical
-    // sort (alias-shadowing trap called out in stats.ts:60-67) was attempted
-    // across 0.6.7-0.6.9 and could not be made environment-independent.
-    // pg_stat_statements in PG17/18 fingerprints `SELECT 1 AS x_a` and
+    // Note on the orderBy=calls alias-shadowing trap (commented at the
+    // `orderCol` choice in pg_top_queries' handler): the "ranks DESC" test
+    // above checks that whatever rows come back are in numeric DESC order of
+    // `calls`, so a lexical sort shows up only when the live ranking happens to
+    // hold counts that sort differently as text ("9" vs "10"). Staging such
+    // counts deterministically was tried in 0.6.7-0.6.9 and dropped:
+    // pg_stat_statements on PG17/18 fingerprints `SELECT 1 AS x_a` and
     // `SELECT 2 AS x_b` to the SAME query id (column aliases drop out of the
-    // jumble even though they're preserved in the displayed query text), so
-    // staging two markers with different aliases produces one merged entry
-    // and the ordering assertion has nothing to compare against. Local WSL
-    // clusters happen to differentiate; CI does not. The trap remains a
-    // regression vector but the SQL pattern is well-commented at the call
-    // site and a regression would require actively removing the
-    // `pg_stat_statements.` qualifier.
+    // jumble), so two markers merge into one entry.
   });
 });

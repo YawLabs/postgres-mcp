@@ -72,11 +72,18 @@ for V in "${PG_VERSIONS[@]}"; do
   PGCONF=/etc/postgresql/${V}/main/postgresql.conf
   HBACONF=/etc/postgresql/${V}/main/pg_hba.conf
 
-  # DEV/CI ONLY: bind to all interfaces and accept md5 password auth from any
-  # source. Safe inside WSL (the network namespace is host-local) but lethal as
-  # a production template -- do not copy this stanza outside this matrix script.
-  sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" "$PGCONF"
-  grep -q '0.0.0.0/0' "$HBACONF" || echo 'host all all 0.0.0.0/0 md5' >> "$HBACONF"
+  # Every consumer connects to localhost (wsl-test-matrix.sh, the check at the
+  # bottom), which the packaged defaults already allow with password auth, so
+  # the clusters stay on localhost. This used to bind every interface and
+  # accept password auth for 0.0.0.0/0 with the superuser password 'postgres',
+  # which under WSL mirrored networking means the host's own interfaces.
+  # WSL_PG_LISTEN_ALL=1 opts back in (e.g. a client reaching WSL by its IP);
+  # it is a dev-only stanza, never a template for a real server. Turning it off
+  # here does not undo it on a cluster an earlier run already configured.
+  if [ "${WSL_PG_LISTEN_ALL:-}" = "1" ]; then
+    sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" "$PGCONF"
+    grep -q '0.0.0.0/0' "$HBACONF" || echo 'host all all 0.0.0.0/0 md5' >> "$HBACONF"
+  fi
 
   # pg_stat_statements needs to be PRELOADED -- `CREATE EXTENSION` alone fails
   # with "pg_stat_statements must be loaded via shared_preload_libraries".

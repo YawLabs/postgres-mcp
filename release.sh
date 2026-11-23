@@ -4,17 +4,20 @@
 # =============================================================================
 # Usage:
 #   ./release.sh <new-version>    - full release from local machine
-#   ./release.sh                  - CI mode (derives version from git tag)
+#
+# This workstation is the only release path: the repo has no CI, and the old
+# CI mode (CI=true, version from the pushed tag) is gone with it.
 #
 # If interrupted, re-run with the same version - each step is idempotent.
 #
 # Prerequisites:
 #   - Node.js 20+ and npm installed
 #   - npm automation token in ~/.npmrc (npmjs.com -> Access Tokens -> Generate
-#     -> Automation), or NODE_AUTH_TOKEN set when running as CI. Do NOT use
+#     -> Automation). Do NOT use
 #     `npm login --auth-type=web` -- it OVERWRITES the automation token with a
 #     2FA-bound web session and the next publish EOTPs on a WebAuthn challenge.
 #   - gh CLI authenticated (or GITHUB_TOKEN set)
+#   - jq (server.json is rewritten and read with it)
 #
 # Reading the result:
 #   Every terminal path prints exactly one sentinel as its FINAL line --
@@ -22,6 +25,9 @@
 #   to stdout AND stderr. Grep for that line. Do NOT judge a run by a trailing
 #   `echo "RELEASE_EXIT=$?"` (that reports echo's status) or by the exit code
 #   of a pipeline like `./release.sh 1.2.3 | tail` (that reports tail's).
+#   SUCCESS means every step ran AND the read-backs in step 8 and the smoke in
+#   step 9 passed. A release that published but failed one of those ends
+#   FAILED, with the banner saying what is already public.
 # =============================================================================
 
 set -euo pipefail
@@ -153,14 +159,20 @@ changelog_prev_tag() {
 }
 
 # The body of a generated entry: one bullet per commit subject since the
-# previous tag, newest first, with version-bump commits dropped.
+# previous tag, newest first, with version-bump commits dropped. A `fix:` /
+# `fix(scope):` subject goes under `### Fixed` and the rest under
+# `### Changed`: 0.13.6 shipped its one fix filed under Changed.
 changelog_generated_body() {
-  local prev=$1 range subjects
+  local prev=$1 range subjects fixed changed
   if [ -n "$prev" ]; then range="${prev}..HEAD"; else range="HEAD"; fi
   subjects=$(git log --no-merges --format='%s' "$range" 2>/dev/null \
     | grep -vE '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^/- /' || true)
   [ -n "$subjects" ] || subjects="- Maintenance release; no changes since ${prev:-the previous release}."
-  printf '### Changed\n%s\n' "$subjects"
+  fixed=$(printf '%s\n' "$subjects" | grep -E '^- fix(\([^)]*\))?!?:' || true)
+  changed=$(printf '%s\n' "$subjects" | grep -vE '^- fix(\([^)]*\))?!?:' || true)
+  if [ -n "$changed" ]; then printf '### Changed\n%s\n' "$changed"; fi
+  if [ -n "$changed" ] && [ -n "$fixed" ]; then printf '\n'; fi
+  if [ -n "$fixed" ]; then printf '### Fixed\n%s\n' "$fixed"; fi
 }
 
 # Keep-a-Changelog link references, when the file uses them: [Unreleased]
@@ -317,19 +329,13 @@ TOTAL_STEPS=9
 # ---- Resolve version + optional pre-release commit message ----
 VERSION="${1:-}"
 PRE_COMMIT_MSG="${2:-}"
-IS_CI="${CI:-false}"
 
 if [ -z "$VERSION" ]; then
-  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-    VERSION="${GITHUB_REF_NAME#v}"
-    info "CI mode - version $VERSION from tag $GITHUB_REF_NAME"
-  else
-    echo "Usage: ./release.sh <version> [\"commit message\"]"
-    echo "  e.g. ./release.sh 0.1.0"
-    echo "       ./release.sh 0.1.0 \"feat: add foo\"   # commits tracked changes first"
-    FAIL_MSG="No version argument given. Pass the version to release, e.g. ./release.sh 0.1.0"
-    exit 1
-  fi
+  echo "Usage: ./release.sh <version> [\"commit message\"]"
+  echo "  e.g. ./release.sh 0.1.0"
+  echo "       ./release.sh 0.1.0 \"feat: add foo\"   # commits tracked changes first"
+  FAIL_MSG="No version argument given. Pass the version to release, e.g. ./release.sh 0.1.0"
+  exit 1
 fi
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -359,6 +365,15 @@ cd "$SCRIPT_DIR"
 
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
+# gh and jq are first needed late -- jq in step 3, after `npm version` has
+# rewritten package.json, and gh in step 6, after npm has published -- so a
+# missing one used to surface with the release half done. `gh auth token` is
+# the same read step 7 falls back on, and answers from GITHUB_TOKEN too.
+command -v gh >/dev/null   || fail "gh not installed -- step 6 (GitHub release) and step 7 (MCP Registry login) need it"
+gh auth token >/dev/null 2>&1 || fail "gh is not authenticated -- run 'gh auth login' (or set GITHUB_TOKEN) and re-run"
+if [ -f server.json ]; then
+  command -v jq >/dev/null || fail "jq not installed -- step 3 syncs server.json with it"
+fi
 
 # ---- oam floor: drift and staleness ----
 # The drift half also runs in the unit suite (src/oam-floor.test.ts). This adds
@@ -387,18 +402,35 @@ if [ -f scripts/check-yaw-mcp-floor.mjs ]; then
   fi
 fi
 
-CURRENT_VERSION=$(node -p "require('./package.json').version")
 RESUMING=false
 
 # The branch to push to. Every push below used to hardcode `main`, so running
 # this from any other branch pushed a STALE local main -- and if that main was
 # behind origin, the push was rejected and the release died with a generic
 # "git push failed" while the actual commit sat unpushed on the real branch.
-# Resolve it once, here, from the branch actually checked out.
+# Resolve it here, from the branch actually checked out -- and re-read it at
+# every later point that commits or pushes (assert_release_branch below).
 RELEASE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 if [ -z "$RELEASE_BRANCH" ] || [ "$RELEASE_BRANCH" = "HEAD" ]; then
   fail "Could not determine the current branch (detached HEAD?). Check out a branch and re-run."
 fi
+
+# assert_release_branch <when>: fail unless the branch checked out NOW is still
+# the one resolved above. Lint, the suite and the WSL matrix take minutes, and
+# this checkout is shared: another session switching branch meanwhile used to
+# put the bump commit and the tag on ITS branch while this script pushed the
+# name cached above -- a no-op push that exits 0, and --follow-tags does not
+# send a tag the pushed ref cannot reach. npm then published a version whose
+# tag was not on origin.
+assert_release_branch() {
+  local now
+  now=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  [ "$now" = "$RELEASE_BRANCH" ] && return 0
+  fail "The checked-out branch changed from '$RELEASE_BRANCH' to '${now:-unknown}' while the release was running ($1).
+  Another session switched branches in this checkout. Nothing has been pushed
+  or published by this step. Check out '$RELEASE_BRANCH' again (or release from
+  a worktree of your own) and re-run './release.sh ${VERSION}'."
+}
 
 # Releasing from a non-default branch tags a commit that is not on the default
 # branch, which is almost always a mistake -- but not always (hotfix branches
@@ -416,12 +448,13 @@ fi
 # .env / secrets. Push, then fall through to the existing clean-tree path
 # below. The integration matrix runs again in step 2; we skip it here to
 # keep the pre-commit fast (matrix gates the tag, not the feature commit).
-if [ "$IS_CI" != "true" ] && [ -n "$PRE_COMMIT_MSG" ] && [ -n "$(git status --porcelain)" ]; then
+if [ -n "$PRE_COMMIT_MSG" ] && [ -n "$(git status --porcelain)" ]; then
   CURRENT_STEP="pre-release commit (before step 1)"
   echo -e "${CYAN}Committing tracked changes before release...${NC}"
   npm run lint:fix >/dev/null || fail "lint:fix failed -- fix and re-run"
   npx tsc --noEmit         || fail "tsc failed -- fix type errors and re-run"
   npm test                 || fail "unit tests failed -- fix and re-run"
+  assert_release_branch "before the pre-release commit"
   git add -u || fail "git add -u failed"
   if [ -z "$(git diff --cached --name-only)" ]; then
     info "Nothing staged after lint:fix -- skipping pre-release commit"
@@ -443,19 +476,36 @@ if [ "$IS_CI" != "true" ] && [ -n "$PRE_COMMIT_MSG" ] && [ -n "$(git status --po
   fi
 fi
 
+# Read here, after the optional pre-release commit, and again at step 3: the
+# version on disk is what decides between a fresh release and a resume.
+CURRENT_VERSION=$(node -p "require('./package.json').version")
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   RESUMING=true
+  # A resume may carry the files step 3 rewrites (the previous run can have
+  # died before step 4 committed them) and nothing else. Step 4 commits only
+  # those files, while `npm publish` rebuilds from the working tree, so any
+  # other edit made between the two runs would be published without being in
+  # the tagged commit.
+  RESUME_DIRT=$(git status --porcelain | grep -vE '^.. (package\.json|package-lock\.json|server\.json|CHANGELOG\.md)$' || true)
+  if [ -n "$RESUME_DIRT" ]; then
+    fail "Resuming v${VERSION}, but the working tree has changes beyond the version-bump files:
+
+$RESUME_DIRT
+
+  Step 4 commits only package.json, package-lock.json, server.json and
+  CHANGELOG.md, and npm publishes what is on disk -- these changes would ship
+  without being in the tagged commit. Commit them (or pass \"commit message\"
+  as the 2nd arg), or stash them, then re-run."
+  fi
   info "Already at v${VERSION} - resuming"
 else
-  if [ "$IS_CI" != "true" ]; then
-    if [ -n "$(git status --porcelain)" ]; then
-      fail "Working directory not clean. Commit or stash changes first (or pass \"commit message\" as the 2nd arg)."
-    fi
+  if [ -n "$(git status --porcelain)" ]; then
+    fail "Working directory not clean. Commit or stash changes first (or pass \"commit message\" as the 2nd arg)."
   fi
   info "Current: v${CURRENT_VERSION} -> v${VERSION}"
 fi
 
-if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
+if [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Run lint + tests"
@@ -513,18 +563,13 @@ npm run build || fail "Build failed"
 npm test || fail "Tests failed"
 info "Unit tests passed"
 
-# Integration matrix against PG17 + PG18, run inside WSL Ubuntu (Windows-only
-# until the matrix runner is portable to native Linux/Mac). Aborts the release
-# on failure -- it's the only place the matrix has a real consumer.
-#
-# In CI, this step is intentionally skipped: GitHub Actions runners don't
-# have WSL, and release.yml does not spin up PG service containers. The
-# matrix is now a LOCAL pre-tag gate only -- if you tag without running
-# scripts/wsl-test-matrix.sh first, you're publishing without PG-version
-# coverage (unit tests + prepublishOnly are still the CI gates).
-if [ "$IS_CI" = "true" ]; then
-  info "CI mode -- integration matrix is a local-only pre-tag gate, skipping in CI"
-elif command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\0' | grep -q Ubuntu; then
+# Integration matrix against PG15 + PG17 + PG18, run inside WSL Ubuntu
+# (Windows-only until the matrix runner is portable to native Linux/Mac).
+# Aborts the release on failure -- it's the only place the matrix has a real
+# consumer, and this script is the only gate there is: a release cut on a
+# machine without WSL Ubuntu ships without PG-version coverage (see the
+# REQUIRE_MATRIX note below).
+if command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\0' | grep -q Ubuntu; then
   # Translate the repo path into its WSL form (/mnt/<drive>/...). Ask MSYS for
   # the Windows path (`pwd -W`; `cygpath -m` under Cygwin) rather than
   # rewriting the POSIX one: Git Bash mounts more than drive letters -- /tmp is
@@ -540,7 +585,7 @@ elif command -v wsl >/dev/null 2>&1 && wsl --list --quiet 2>/dev/null | tr -d '\
 elif [ "${REQUIRE_MATRIX:-}" = "1" ]; then
   # REQUIRE_MATRIX=1 turns the "WSL not detected" warning into a hard fail.
   # Default is still warn-only so contributors without WSL can tag -- the
-  # unit tests + prepublishOnly are the CI gates, and the matrix is a
+  # unit suite above is then the only gate, and the matrix is a
   # pre-tag-best-effort on top. Set REQUIRE_MATRIX=1 when you specifically
   # want a real-PG-major signal before cutting a release.
   fail "REQUIRE_MATRIX=1 set but WSL Ubuntu not detected -- run scripts/wsl-test-matrix.sh manually or install WSL"
@@ -553,6 +598,11 @@ fi
 # =============================================================================
 step 3 "Bump version to $VERSION"
 
+# Steps 1 and 2 took minutes. Re-read what they could have outlived before
+# anything is written: the branch (see assert_release_branch) and the version
+# on disk, which the pre-flight read is no longer evidence of.
+assert_release_branch "before the version bump"
+CURRENT_VERSION=$(node -p "require('./package.json').version")
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} - skipping"
 else
@@ -570,8 +620,13 @@ fi
 if [ -f server.json ]; then
   CURRENT_SERVER_VERSION=$(jq -r '.version' server.json 2>/dev/null || echo "")
   if [ "$CURRENT_SERVER_VERSION" != "$VERSION" ]; then
-    jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
-    mv server.tmp server.json
+    # Through mktemp, not a server.tmp beside it: a jq that failed here left an
+    # empty untracked server.tmp in the repo, under `set -e` with package.json
+    # already bumped.
+    SERVER_TMP=$(mktemp)
+    jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > "$SERVER_TMP" \
+      || { rm -f "$SERVER_TMP"; fail "jq could not rewrite server.json to $VERSION -- see its error above"; }
+    mv "$SERVER_TMP" server.json
     info "server.json synced to $VERSION"
   fi
 fi
@@ -592,53 +647,58 @@ assert_changelog_promoted
 # =============================================================================
 step 4 "Commit, tag, and push"
 
-if [ "$IS_CI" = "true" ]; then
-  info "CI mode - skipping commit/tag/push (already tagged)"
-else
-  BUMP_FILES="package.json package-lock.json"
-  [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
-  # CHANGELOG.md is bumped above (Unreleased -> this version) and must ride
-  # the same commit, or the promotion is left as uncommitted working-tree dirt.
-  [ -f CHANGELOG.md ] && BUMP_FILES="$BUMP_FILES CHANGELOG.md"
-  if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
-    git add $BUMP_FILES
-    git commit -m "v${VERSION}"
-    info "Committed version bump"
-  else
-    info "Nothing to commit"
-  fi
+# Re-read, do not trust step 3's view: the commit lands on whatever is checked
+# out NOW and carries whatever package.json says NOW.
+assert_release_branch "before the bump commit"
+PKG_VERSION_NOW=$(node -p "require('./package.json').version")
+if [ "$PKG_VERSION_NOW" != "$VERSION" ]; then
+  fail "package.json says ${PKG_VERSION_NOW}, not ${VERSION}, at the commit step -- something rewrote it after step 3. Nothing was committed, tagged or published. Check 'git status' and re-run."
+fi
 
-  RELEASE_SHA=$(git rev-parse HEAD)
-  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-    # Re-entrancy guard. A run that dies between `git tag` and `git push`
-    # leaves the tag behind; the operator then fetches and rebases or resets --
-    # exactly what the push-rejected remedy below tells them to do -- which
-    # rewrites or discards the commit that tag points at. On the re-run the tag
-    # is an ORPHAN, and "tag already exists" used to be treated as success:
-    # npm would publish THIS working tree while step 6 cut the GitHub release
-    # from a commit that is on no branch. Two artifacts, two different trees,
-    # one version number.
-    TAG_COMMIT=$(git rev-parse "v${VERSION}^{}")
-    if [ "$TAG_COMMIT" != "$RELEASE_SHA" ]; then
-      if git merge-base --is-ancestor "$TAG_COMMIT" "$RELEASE_SHA"; then
-        DRIFT="behind HEAD (still an ancestor -- commits were added after the tag was created)"
-      else
-        DRIFT="NOT an ancestor of HEAD -- its commit was rewritten or discarded (rebase / reset / amend) and is now orphaned"
-      fi
-      # Whether the tag also reached origin decides which recovery is safe, so
-      # look it up instead of making the operator guess. Best-effort: a network
-      # failure here must not replace the real error with a git one.
-      TAG_ON_ORIGIN=$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | awk '{print $1}' || true)
-      if [ -n "$TAG_ON_ORIGIN" ]; then
-        REMOTE_STATE="  origin ALSO has tag v${VERSION}, at ${TAG_ON_ORIGIN}. Anything built from it
+BUMP_FILES="package.json package-lock.json"
+[ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
+# CHANGELOG.md is bumped above (Unreleased -> this version) and must ride
+# the same commit, or the promotion is left as uncommitted working-tree dirt.
+[ -f CHANGELOG.md ] && BUMP_FILES="$BUMP_FILES CHANGELOG.md"
+if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
+  git add $BUMP_FILES
+  git commit -m "v${VERSION}"
+  info "Committed version bump"
+else
+  info "Nothing to commit"
+fi
+
+RELEASE_SHA=$(git rev-parse HEAD)
+if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+  # Re-entrancy guard. A run that dies between `git tag` and `git push`
+  # leaves the tag behind; the operator then fetches and rebases or resets --
+  # exactly what the push-rejected remedy below tells them to do -- which
+  # rewrites or discards the commit that tag points at. On the re-run the tag
+  # is an ORPHAN, and "tag already exists" used to be treated as success:
+  # npm would publish THIS working tree while step 6 cut the GitHub release
+  # from a commit that is on no branch. Two artifacts, two different trees,
+  # one version number.
+  TAG_COMMIT=$(git rev-parse "v${VERSION}^{}")
+  if [ "$TAG_COMMIT" != "$RELEASE_SHA" ]; then
+    if git merge-base --is-ancestor "$TAG_COMMIT" "$RELEASE_SHA"; then
+      DRIFT="behind HEAD (still an ancestor -- commits were added after the tag was created)"
+    else
+      DRIFT="NOT an ancestor of HEAD -- its commit was rewritten or discarded (rebase / reset / amend) and is now orphaned"
+    fi
+    # Whether the tag also reached origin decides which recovery is safe, so
+    # look it up instead of making the operator guess. Best-effort: a network
+    # failure here must not replace the real error with a git one.
+    TAG_ON_ORIGIN=$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | awk '{print $1}' || true)
+    if [ -n "$TAG_ON_ORIGIN" ]; then
+      REMOTE_STATE="  origin ALSO has tag v${VERSION}, at ${TAG_ON_ORIGIN}. Anything built from it
   downstream (GitHub release, MCP Registry entry, anyone who fetched) already
   points at the wrong commit -- prefer cutting the next patch version over
   moving a tag that is already public."
-      else
-        REMOTE_STATE="  origin does NOT have tag v${VERSION} yet, so nothing downstream has seen it
+    else
+      REMOTE_STATE="  origin does NOT have tag v${VERSION} yet, so nothing downstream has seen it
   -- deleting and recreating it locally is safe."
-      fi
-      fail "Local tag v${VERSION} points at ${TAG_COMMIT}, but the commit about to be
+    fi
+    fail "Local tag v${VERSION} points at ${TAG_COMMIT}, but the commit about to be
   released is ${RELEASE_SHA}. The tag is ${DRIFT}.
 
 ${REMOTE_STATE}
@@ -656,40 +716,57 @@ ${REMOTE_STATE}
 
   Refusing to publish npm from ${RELEASE_SHA} while the GitHub release would be
   cut from ${TAG_COMMIT}."
-    fi
-    info "Tag v${VERSION} already exists and points at the commit being released"
-  else
-    # Annotated (-a) so --follow-tags below picks it up; lightweight tags are
-    # ignored by --follow-tags and would silently fail to publish.
-    git tag -a "v${VERSION}" -m "v${VERSION}"
-    info "Tag v${VERSION} created"
   fi
+  info "Tag v${VERSION} already exists and points at the commit being released"
+else
+  # Annotated (-a) so --follow-tags below picks it up; lightweight tags are
+  # ignored by --follow-tags and would silently fail to publish. On
+  # RELEASE_SHA explicitly, so the tag is the commit every check above saw.
+  git tag -a "v${VERSION}" -m "v${VERSION}" "$RELEASE_SHA"
+  info "Tag v${VERSION} created"
+fi
 
-  # --follow-tags pushes only annotated tags reachable from the pushed commits,
-  # not every local tag. Avoids accidentally publishing dangling experimental
-  # tags that happen to be lying around.
-  # Tag-drift safety: refuse to push if origin already has a tag at this name
-  # pointing to a different commit (rewound tag elsewhere, parallel release race).
-  # Without this check, `git push --follow-tags` SILENTLY skips updating the
-  # tag on origin (the tag exists, no fast-forward happens). The main push
-  # reports success, but origin's tag stays at the old SHA -- and the later
-  # `gh release create` step then creates a GitHub release linked to that
-  # stale commit while npm carries the new one.
-  # No stderr suppression and an explicit failure branch: under `set -euo
-  # pipefail` a failing ls-remote (network blip, auth) inside the command
-  # substitution would otherwise kill the script with only the generic
-  # ERR-trap line and git's actual error discarded.
-  ORIGIN_TAG_SHA=$(git ls-remote --tags origin "refs/tags/v${VERSION}" | awk '{print $1}') \
-    || fail "Could not query origin for tag v${VERSION} (network or auth failure -- see git's error above). Resolve and re-run."
-  if [ -n "$ORIGIN_TAG_SHA" ]; then
-    LOCAL_TAG_SHA=$(git rev-parse "v${VERSION}")
-    if [ "$ORIGIN_TAG_SHA" != "$LOCAL_TAG_SHA" ]; then
-      fail "Tag v${VERSION} exists on origin at $ORIGIN_TAG_SHA but local tag points to $LOCAL_TAG_SHA -- resolve the drift before re-running"
-    fi
+# The object origin has under refs/tags/v<version>, or nothing. Matched on the
+# ref name, so a peeled `^{}` line can never be read as the tag. A failing
+# ls-remote fails the pipeline (pipefail): each caller says what that means.
+origin_tag_sha() {
+  git ls-remote --tags origin "refs/tags/v${VERSION}" | awk -v ref="refs/tags/v${VERSION}" '$2 == ref {print $1}'
+}
+
+# --follow-tags pushes only annotated tags reachable from the pushed commits,
+# not every local tag. Avoids accidentally publishing dangling experimental
+# tags that happen to be lying around.
+# Tag-drift safety: refuse to push if origin already has a tag at this name
+# pointing to a different commit (rewound tag elsewhere, parallel release race).
+# Without this check, `git push --follow-tags` SILENTLY skips updating the
+# tag on origin (the tag exists, no fast-forward happens). The main push
+# reports success, but origin's tag stays at the old SHA -- and the later
+# `gh release create` step then creates a GitHub release linked to that
+# stale commit while npm carries the new one.
+# No stderr suppression and an explicit failure branch: under `set -euo
+# pipefail` a failing ls-remote (network blip, auth) inside the command
+# substitution would otherwise kill the script with only the generic
+# ERR-trap line and git's actual error discarded.
+ORIGIN_TAG_SHA=$(origin_tag_sha) \
+  || fail "Could not query origin for tag v${VERSION} (network or auth failure -- see git's error above). Resolve and re-run."
+LOCAL_TAG_SHA=$(git rev-parse "v${VERSION}")
+if [ -n "$ORIGIN_TAG_SHA" ]; then
+  if [ "$ORIGIN_TAG_SHA" != "$LOCAL_TAG_SHA" ]; then
+    fail "Tag v${VERSION} exists on origin at $ORIGIN_TAG_SHA but local tag points to $LOCAL_TAG_SHA -- resolve the drift before re-running"
   fi
+fi
 
-  git push origin "$RELEASE_BRANCH" --follow-tags \
-    || fail "git push of '$RELEASE_BRANCH' was REJECTED. The recurring cause is non-fast-forward:
+# Last look before the push: the branch name pushed below must still be the
+# one checked out, and its tip the commit that was tagged. Otherwise the push
+# sends a ref the tag is not reachable from, exits 0, and leaves the tag here.
+assert_release_branch "before the push"
+HEAD_NOW=$(git rev-parse HEAD)
+if [ "$HEAD_NOW" != "$RELEASE_SHA" ]; then
+  fail "HEAD moved from ${RELEASE_SHA} to ${HEAD_NOW} between tagging and pushing -- another session committed or reset in this checkout. Nothing was pushed or published. Inspect 'git log --oneline -5', then re-run './release.sh ${VERSION}' (it refuses a tag that no longer matches HEAD and says how to recover)."
+fi
+
+git push origin "$RELEASE_BRANCH" --follow-tags \
+  || fail "git push of '$RELEASE_BRANCH' was REJECTED. The recurring cause is non-fast-forward:
   another session pushed to '$RELEASE_BRANCH' while this release was running.
 
   Nothing after this ran -- npm publish, the GitHub release and the MCP Registry
@@ -720,92 +797,53 @@ ${REMOTE_STATE}
   Delete the tag in EITHER path: rebase and reset both move the commit out from
   under it, and the re-run refuses to proceed on a tag that no longer matches
   the commit being released."
-  info "Pushed $RELEASE_BRANCH + tag v${VERSION} to origin"
+
+# The push exiting 0 is not the tag being on origin: --follow-tags sends a tag
+# only when the pushed ref reaches it, and a protected-tag rule can refuse the
+# tag while accepting the branch. Everything after this publishes under the
+# version, and step 6 would otherwise create a missing tag itself, from the
+# default branch head. Read it back.
+PUSHED_TAG_SHA=$(origin_tag_sha) \
+  || fail "Could not read tag v${VERSION} back from origin after the push (network or auth failure -- see git's error above). Nothing is published yet. Re-run once origin answers."
+if [ "$PUSHED_TAG_SHA" != "$LOCAL_TAG_SHA" ]; then
+  fail "The push exited 0, but origin has ${PUSHED_TAG_SHA:-no tag} for v${VERSION} where the local tag is ${LOCAL_TAG_SHA}.
+  npm publish, the GitHub release and the MCP Registry publish have NOT run.
+  Push the tag itself, read git's answer, then re-run:
+
+      git push origin refs/tags/v${VERSION}
+      ./release.sh ${VERSION}"
 fi
+info "Pushed $RELEASE_BRANCH + tag v${VERSION} to origin (tag read back: ${PUSHED_TAG_SHA})"
 
 # =============================================================================
 # Step 5: Publish to npm
 # =============================================================================
 step 5 "Publish to npm"
-# Three publish paths, picked by environment:
-#   1. IS_CI=true                    -> WE are CI. Do the publish (NODE_AUTH_TOKEN
-#                                       is set; --provenance for sigstore).
-#   2. IS_CI=false + release.yml     -> CI will publish on the tag we just pushed.
-#      exists with CI publish path      Watch `gh run watch` for that run and
-#                                       verify npm serves it. Workstation MUST
-#                                       NOT also publish -- stale ~/.npmrc fails
-#                                       E404, valid one races CI for the same
-#                                       version. CI is authoritative.
-#   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
-#      path                             with EOTP retry for fresh WebAuthn sessions.
+# One publish path: this workstation, with the automation token in ~/.npmrc.
+# There is no CI to hand off to.
 if npm_version_live; then PUBLISHED_VERSION="$VERSION"; else PUBLISHED_VERSION=""; fi
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm - skipping"
-  # Resume-path safety: a prior interrupted run may have published but never
-  # observed `gh run watch` to completion. Later CI steps (smoke test, MCP
-  # Registry publish, attestation upload) could have failed silently. Look
-  # up the most recent Release run for this tag and warn if its conclusion
-  # was non-success. Best-effort -- if the tag isn't on origin yet or the
-  # run isn't visible, the warn just doesn't fire.
-  if [ "$IS_CI" != "true" ] && [ -f ".github/workflows/release.yml" ]; then
-    RESUME_TAG_SHA=$(git rev-parse "v${VERSION}^{}" 2>/dev/null || echo "")
-    if [ -n "$RESUME_TAG_SHA" ]; then
-      RESUME_CONCLUSION=$(gh run list --workflow=Release --event=push --commit="$RESUME_TAG_SHA" --limit=1 --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
-      if [ -n "$RESUME_CONCLUSION" ] && [ "$RESUME_CONCLUSION" != "success" ]; then
-        warn "Prior CI Release run for v${VERSION} ended with conclusion='$RESUME_CONCLUSION' (not 'success'). A post-publish step (smoke test, MCP Registry publish, attestation) may have failed silently. Inspect: gh run list --workflow=Release --commit=$RESUME_TAG_SHA --limit=3"
-      fi
-    fi
-  fi
-elif [ "$IS_CI" = "true" ]; then
-  npm publish --access public --provenance
-  info "Published @yawlabs/postgres-mcp@${VERSION} to npm (with provenance)"
-elif [ -f ".github/workflows/release.yml" ] && grep -q "npm publish\|NODE_AUTH_TOKEN" .github/workflows/release.yml; then
-  info "CI release.yml fires on v* tag push -- workstation hands off to CI"
-  # Verify the tag landed on origin BEFORE looking up the CI run. A local
-  # push that succeeded but the remote rejected (protected-tag rule, network
-  # blip) would otherwise dead-end in the lookup loop with a misleading
-  # "Push may have failed" error 62s later. ls-remote is one round-trip --
-  # cheap relative to gh run watch.
-  if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -q "refs/tags/v${VERSION}$"; then
-    fail "Tag v${VERSION} not visible on origin. Step 4's 'git push --follow-tags' may have failed silently (protected-tag rule, network blip), or the tag was deleted between push and now. Re-run step 4."
-  fi
-  TAG_SHA=$(git rev-parse "v${VERSION}^{}")
-  RUN_ID=""
-  # Exponential backoff: 2+4+8+16+32 = 62s upper bound on GitHub's
-  # tag-push -> actions queue visibility lag. Cheap relative to the CI run
-  # itself (~6 min on aws-mcp).
-  DELAY=2
-  for i in 1 2 3 4 5; do
-    RUN_ID=$(gh run list --workflow=Release --event=push --commit="$TAG_SHA" --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
-    [ -n "$RUN_ID" ] && break
-    sleep $DELAY
-    DELAY=$((DELAY * 2))
-  done
-  if [ -z "$RUN_ID" ]; then
-    fail "Could not find Release workflow run for tag v${VERSION} (commit $TAG_SHA) after 62s of polling. The actions queue may be backed up; check 'gh run list --limit 5' and rerun the script to retry."
-  fi
-  info "Watching CI Release run $RUN_ID"
-  gh run watch "$RUN_ID" --exit-status || fail "CI Release run $RUN_ID failed. See 'gh run view $RUN_ID --log-failed'."
-  # CI is authoritative on the publish itself -- if `gh run watch` exited 0,
-  # the package is live on npm regardless of how long the registry mirror
-  # takes to surface it. Verification here is a courtesy check; warn rather
-  # than fail when the mirror lags (existing memory: lag can exceed a minute).
-  NPM_NOW=""
-  for i in $(seq 1 100); do
-    if npm_version_live; then NPM_NOW="$VERSION"; else NPM_NOW=""; fi
-    [ "$NPM_NOW" = "$VERSION" ] && break
-    sleep 6
-  done
-  if [ "$NPM_NOW" = "$VERSION" ]; then
-    info "Published @yawlabs/postgres-mcp@${VERSION} via CI Release run $RUN_ID"
-  else
-    DISPLAY_NPM="${NPM_NOW:-(not found)}"
-    warn "CI Release run $RUN_ID succeeded but npm registry still shows '$DISPLAY_NPM' for @yawlabs/postgres-mcp@${VERSION} after 600s. Likely registry propagation lag -- verify with 'curl -sI https://registry.npmjs.org/@yawlabs%2Fpostgres-mcp/${VERSION}' (expect 200) in a minute. Publish is authoritative on CI's exit code."
-  fi
 else
-  # Workstation IS the publisher (no CI fallback). Retry only on EOTP/EAUTH/OTP
-  # for fresh WebAuthn sessions; an E403 "cannot publish over" is the skip
-  # above arriving late; fail fast on everything else.
+  # `npm publish` packs the WORKING TREE (prepublishOnly rebuilds dist from
+  # it), not the tag. Re-read both right here: what is about to be published
+  # must be the tagged commit with nothing on top.
+  PUBLISH_HEAD=$(git rev-parse HEAD)
+  PUBLISH_TAG_COMMIT=$(git rev-parse "v${VERSION}^{}")
+  if [ "$PUBLISH_HEAD" != "$PUBLISH_TAG_COMMIT" ]; then
+    fail "HEAD is ${PUBLISH_HEAD}, but tag v${VERSION} is ${PUBLISH_TAG_COMMIT} -- the checkout moved after the tag was pushed. npm has NOT been published. Check out v${VERSION}'s commit (or its branch) and re-run './release.sh ${VERSION}'."
+  fi
+  PUBLISH_DIRT=$(git status --porcelain)
+  if [ -n "$PUBLISH_DIRT" ]; then
+    fail "The working tree changed after v${VERSION} was tagged, and npm publishes what is on disk:
+
+$PUBLISH_DIRT
+
+  npm has NOT been published. Commit or stash these, check that HEAD is still
+  the tagged commit, and re-run './release.sh ${VERSION}'."
+  fi
+  # Retry only on EOTP/EAUTH/OTP for fresh WebAuthn sessions; an E403 "cannot
+  # publish over" is the skip above arriving late; fail fast on everything else.
   ATTEMPT=1
   MAX_ATTEMPTS=3
   NPM_ALREADY_THERE=false
@@ -849,7 +887,7 @@ else
 
   Do NOT run 'npm login --auth-type=web'. It OVERWRITES the automation token
   with a 2FA-bound web session; the next publish then EOTPs on a WebAuthn
-  challenge, and any CI sharing that token starts failing too."
+  challenge no script can answer."
     fi
     rm -f "$PUBLISH_LOG"
     if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
@@ -884,7 +922,11 @@ else
   # mcp-compliance hit it at 62kB. A file has no such limit anywhere.
   NOTES_FILE=$(mktemp)
   printf '%s\n' "$NOTES" > "$NOTES_FILE"
+  # --verify-tag: without it gh CREATES a tag that origin lacks, from the
+  # default branch head -- a commit without the bump. Step 4 read the tag back
+  # from origin; this keeps step 6 from papering over it if that ever regresses.
   gh release create "v${VERSION}" \
+    --verify-tag \
     --title "v${VERSION}" \
     --notes-file "$NOTES_FILE"
   rm -f "$NOTES_FILE"
@@ -1041,22 +1083,92 @@ step 7 "Publish to MCP Registry"
 if [ ! -f server.json ]; then
   info "No server.json -- not an MCP server, skipping registry publish"
 else
-  # mcp-publisher binary cached at ~/.local/bin. Pinned to "latest" upstream;
-  # if the registry's CLI introduces a breaking change, the next release will
-  # surface it. The OS/arch detection handles Linux, macOS, and Git Bash on
-  # Windows (MINGW/MSYS uname -s starts with "mingw" / "msys").
+  # server.json is what mcp-publisher sends, and steps 3-6 ran in between, so
+  # read it again here rather than trusting step 3's write: a registry entry
+  # for a version npm does not have is not something a re-run can take back.
+  SERVER_VERSION_NOW=$(jq -r '"\(.version) \(.packages[0].version)"' server.json 2>/dev/null || echo "")
+  if [ "$SERVER_VERSION_NOW" != "$VERSION $VERSION" ]; then
+    fail "server.json says '${SERVER_VERSION_NOW}' (version, packages[0].version), not ${VERSION} for both, at step 7 -- something rewrote it after step 3. npm + GitHub release succeeded, the MCP Registry step did not run: restore server.json and re-run."
+  fi
+
+  # mcp-publisher, pinned to one release and checked against that release's
+  # sha256 before it ever runs. It used to come from releases/latest with no
+  # checksum: the release took whatever upstream had published that hour, and
+  # a swapped asset would have run with the registry token. 1.7.9 is the
+  # binary cached in ~/.local/bin on the release machine (built 2026-05-12),
+  # which this step reuses whenever it is there, so it is the one that
+  # published v0.14.1 and the releases before it. The hashes are the release's own
+  # registry_1.7.9_checksums.txt, which agree with the asset digests GitHub
+  # reports (gh api repos/modelcontextprotocol/registry/releases/tags/v1.7.9).
+  # To move the pin, take all six from the new release's checksums file. The
+  # OS/arch detection handles Linux, macOS, and Git Bash on Windows (MINGW/MSYS
+  # uname -s starts with "mingw" / "msys").
+  MCP_PUBLISHER_VERSION="1.7.9"
+  mcp_publisher_sha256() {
+    case "$1" in
+      darwin_amd64)  echo 8250b61c7530960fbb54f99daa91001004e365c604cb305b13fc072ea3f5cca9 ;;
+      darwin_arm64)  echo 5925c8d2c942b2a0330b979530b5d70284c3bdb03850a3cd1032685b80ddc2e3 ;;
+      linux_amd64)   echo ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac ;;
+      linux_arm64)   echo 04f5199b3deef8e6fc4d6ed98c56a74f799def53edca3fe6d4862ecd4397c172 ;;
+      windows_amd64) echo aa7c3e014a38b427171b5c6d2c034551daa6fd822ce4a00d1dee2dbf7a21c118 ;;
+      windows_arm64) echo 10cc090b0727ea088dd5543ae6736f885fb9705176cd2d14314c3fcaa2acbe7e ;;
+      *) return 1 ;;
+    esac
+  }
+  # The version line a pinned binary prints: "<date> <time> mcp-publisher
+  # 1.7.9 (commit: ...)". Empty when it prints nothing or will not run.
+  mcp_publisher_version_line() {
+    "$1" --version 2>&1 | grep -m1 -o "mcp-publisher [0-9][0-9.]* " || true
+  }
+  # MCP_PUBLISHER names a binary deliberately, so it is used as given. The
+  # default cache is replaced when it holds any other version: the pin would
+  # mean nothing on the one machine that already has a binary.
   MP="${MCP_PUBLISHER:-$HOME/.local/bin/mcp-publisher}"
+  MP_NEED_DOWNLOAD=false
   if ! [ -x "$MP" ]; then
-    info "mcp-publisher not found at $MP -- downloading"
+    [ -z "${MCP_PUBLISHER:-}" ] || fail "MCP_PUBLISHER=$MP is not an executable file -- unset it to download the pinned mcp-publisher ${MCP_PUBLISHER_VERSION}"
+    info "mcp-publisher not found at $MP -- downloading ${MCP_PUBLISHER_VERSION}"
+    MP_NEED_DOWNLOAD=true
+  elif [ -z "${MCP_PUBLISHER:-}" ]; then
+    MP_HAVE=$(mcp_publisher_version_line "$MP")
+    if [ "$MP_HAVE" != "mcp-publisher ${MCP_PUBLISHER_VERSION} " ]; then
+      info "mcp-publisher at $MP is '${MP_HAVE:-no version output}', not ${MCP_PUBLISHER_VERSION} -- replacing it"
+      MP_NEED_DOWNLOAD=true
+    fi
+  else
+    warn "MCP_PUBLISHER=$MP -- using it as given, without the ${MCP_PUBLISHER_VERSION} pin or its checksum"
+  fi
+  if [ "$MP_NEED_DOWNLOAD" = "true" ]; then
     mkdir -p "$(dirname "$MP")"
     OS_RAW=$(uname -s | tr '[:upper:]' '[:lower:]')
     case "$OS_RAW" in mingw*|msys*|cygwin*) OS=windows ;; *) OS="$OS_RAW" ;; esac
     ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    MP_WANT_SHA=$(mcp_publisher_sha256 "${OS}_${ARCH}") \
+      || fail "No pinned mcp-publisher ${MCP_PUBLISHER_VERSION} checksum for ${OS}/${ARCH} -- install one yourself and point MCP_PUBLISHER at it"
+    if command -v sha256sum >/dev/null; then
+      MP_SHA_CMD="sha256sum"
+    elif command -v shasum >/dev/null; then
+      MP_SHA_CMD="shasum -a 256"
+    else
+      fail "Neither sha256sum nor shasum is on PATH -- cannot verify the mcp-publisher download, so it was not run"
+    fi
     TMP=$(mktemp -d)
-    curl -sL -o "$TMP/mp.tar.gz" \
-      "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${OS}_${ARCH}.tar.gz" \
-      || fail "Failed to download mcp-publisher (${OS}/${ARCH})"
-    tar xzf "$TMP/mp.tar.gz" -C "$TMP" || fail "Failed to extract mcp-publisher tarball"
+    # -f: without it a 404 (an OS/arch the release has no asset for) saves the
+    # error page, exits 0, and surfaces below as a checksum mismatch.
+    curl -fsSL -o "$TMP/mp.tar.gz" \
+      "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/mcp-publisher_${OS}_${ARCH}.tar.gz" \
+      || { rm -rf "$TMP"; fail "Failed to download mcp-publisher ${MCP_PUBLISHER_VERSION} (${OS}/${ARCH})"; }
+    # Fail closed: an empty or unreadable hash is a mismatch too. Checked on
+    # the tarball before tar reads it, so nothing from a bad download is
+    # extracted, let alone run.
+    # On stdin, so the output is "<hash>  -": sha256sum prefixes the line with
+    # a backslash for a file name that holds one.
+    MP_GOT_SHA=$($MP_SHA_CMD < "$TMP/mp.tar.gz" 2>/dev/null | cut -d' ' -f1 || true)
+    if [ "$MP_GOT_SHA" != "$MP_WANT_SHA" ]; then
+      rm -rf "$TMP"
+      fail "mcp-publisher ${MCP_PUBLISHER_VERSION} (${OS}/${ARCH}) checksum mismatch: expected ${MP_WANT_SHA}, got ${MP_GOT_SHA:-nothing} -- not installed and not run. npm + GitHub release succeeded; the MCP Registry step did not."
+    fi
+    tar xzf "$TMP/mp.tar.gz" -C "$TMP" || { rm -rf "$TMP"; fail "Failed to extract mcp-publisher tarball"; }
     if [ -f "$TMP/mcp-publisher.exe" ]; then
       mv "$TMP/mcp-publisher.exe" "$MP"
     else
@@ -1064,6 +1176,11 @@ else
     fi
     rm -rf "$TMP"
     chmod +x "$MP" 2>/dev/null || true
+    # Read back what was installed, not what was meant to be.
+    MP_HAVE=$(mcp_publisher_version_line "$MP")
+    [ "$MP_HAVE" = "mcp-publisher ${MCP_PUBLISHER_VERSION} " ] \
+      || fail "Installed mcp-publisher at $MP reports '${MP_HAVE:-no version output}', not ${MCP_PUBLISHER_VERSION}"
+    info "mcp-publisher ${MCP_PUBLISHER_VERSION} installed at $MP (sha256 verified)"
   fi
 
   # OIDC auth (used by the old release.yml) only works inside Actions; locally
@@ -1231,6 +1348,18 @@ fi
 # =============================================================================
 step 8 "Verify"
 
+# Every check in steps 8 and 9 that does not hold is recorded here, and the run
+# ends FAILED if there is one. These used to be warnings followed by an
+# unconditional RELEASE_RESULT=SUCCESS, so a version npm never served, or a
+# published tarball whose bin does not start, ended in the sentinel the header
+# tells callers to grep for. Both steps still run to the end first, so one
+# failed read does not hide the others.
+POST_PUBLISH_PROBLEMS=()
+post_publish_problem() {
+  POST_PUBLISH_PROBLEMS+=("$1")
+  warn "$1"
+}
+
 # Registry propagation can lag minutes after publish succeeds, so poll up to
 # 120 times 5s apart (about 600s of sleeps, plus each read) instead of five
 # reads 5s apart: the @yawlabs/fetch-mcp 0.8.2 release (2026-09-29) spent
@@ -1245,28 +1374,58 @@ done
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "npm: @yawlabs/postgres-mcp@${NPM_VERSION}"
 else
-  warn "npm shows ${NPM_VERSION:-nothing} (expected $VERSION - may still be propagating)"
+  post_publish_problem "npm does not serve @yawlabs/postgres-mcp@${VERSION} after 600s (it may still be propagating)"
 fi
 
 PKG_VERSION=$(node -p "require('./package.json').version")
 if [ "$PKG_VERSION" = "$VERSION" ]; then
   info "package.json: ${PKG_VERSION}"
 else
-  warn "package.json shows ${PKG_VERSION} (expected $VERSION)"
+  post_publish_problem "package.json shows ${PKG_VERSION} (expected $VERSION)"
 fi
 
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-  info "git tag: v${VERSION}"
+# The tag, locally AND on origin, read again rather than carried from step 4.
+VERIFY_LOCAL_TAG=$(git rev-parse --verify --quiet "refs/tags/v${VERSION}" || true)
+if [ -z "$VERIFY_LOCAL_TAG" ]; then
+  post_publish_problem "git tag v${VERSION} not found locally"
 else
-  warn "git tag v${VERSION} not found"
+  info "git tag: v${VERSION}"
+  VERIFY_ORIGIN_TAG=$(origin_tag_sha 2>/dev/null || true)
+  if [ "$VERIFY_ORIGIN_TAG" = "$VERIFY_LOCAL_TAG" ]; then
+    info "origin tag: v${VERSION} (${VERIFY_ORIGIN_TAG})"
+  else
+    post_publish_problem "origin has ${VERIFY_ORIGIN_TAG:-no tag (or could not be reached)} for v${VERSION}; the local tag is ${VERIFY_LOCAL_TAG}"
+  fi
 fi
 
-if [ "$IS_CI" = "true" ]; then
-  ATTEST=$(npm view "@yawlabs/postgres-mcp@${VERSION}" dist.attestations.provenance.predicateType 2>/dev/null || echo "")
-  if [ -n "$ATTEST" ]; then
-    info "provenance attestation: $ATTEST"
+if gh release view "v${VERSION}" >/dev/null 2>&1; then
+  info "GitHub release: v${VERSION}"
+else
+  post_publish_problem "'gh release view v${VERSION}' found no GitHub release (or gh could not reach GitHub)"
+fi
+
+# The MCP Registry entry, read back from the registry's public API rather than
+# taken from mcp-publisher's exit code: GET /v0/servers/<name>/versions/<version>
+# answers 200 for a version it holds and 404 otherwise. The name is the
+# server.json one, percent-encoded (its slash becomes %2F). A few tries, since
+# this follows the publish by seconds.
+if [ -f server.json ]; then
+  if command -v curl >/dev/null 2>&1; then
+    REGISTRY_NAME=$(jq -r '.name | @uri' server.json)
+    REGISTRY_CODE=""
+    for i in 1 2 3 4 5 6; do
+      REGISTRY_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+        "https://registry.modelcontextprotocol.io/v0/servers/${REGISTRY_NAME}/versions/${VERSION}" 2>/dev/null || true)
+      [ "$REGISTRY_CODE" = "200" ] && break
+      if [ "$i" -lt 6 ]; then sleep 5; fi
+    done
+    if [ "$REGISTRY_CODE" = "200" ]; then
+      info "MCP Registry: $(jq -r '.name' server.json)@${VERSION}"
+    else
+      post_publish_problem "the MCP Registry does not serve $(jq -r '.name' server.json)@${VERSION} (HTTP ${REGISTRY_CODE:-none} from /v0/servers/${REGISTRY_NAME}/versions/${VERSION})"
+    fi
   else
-    warn "no provenance attestation found on v${VERSION} (expected in CI publish)"
+    post_publish_problem "curl not found -- the MCP Registry entry for v${VERSION} was not read back"
   fi
 fi
 
@@ -1279,14 +1438,55 @@ step 9 "Post-publish smoke"
 # the registry metadata, which can show the right version even when the
 # tarball or its dependencies aren't installable -- and CDN edges desync
 # enough that a real `npx`/install probe catches things a metadata read misses.
-if [ -x "${SCRIPT_DIR}/scripts/post-publish-smoke.sh" ]; then
-  if "${SCRIPT_DIR}/scripts/post-publish-smoke.sh" "$VERSION"; then
+# Run through `bash` and tested with -f, not -x: the script is committed as
+# mode 100644, which only Git Bash reads as executable (it goes by the
+# shebang). On Linux, macOS or WSL the -x test was false and the smoke was
+# skipped.
+if [ -f "${SCRIPT_DIR}/scripts/post-publish-smoke.sh" ]; then
+  if bash "${SCRIPT_DIR}/scripts/post-publish-smoke.sh" "$VERSION"; then
     info "post-publish smoke: passed"
   else
-    warn "post-publish smoke failed -- investigate before announcing v${VERSION}"
+    post_publish_problem "post-publish smoke failed -- the published @yawlabs/postgres-mcp@${VERSION} did not install and report its version (output above)"
   fi
 else
-  warn "scripts/post-publish-smoke.sh not found or not executable -- skipping smoke"
+  post_publish_problem "scripts/post-publish-smoke.sh not found -- the published tarball was never run"
+fi
+
+if [ "${#POST_PUBLISH_PROBLEMS[@]}" -gt 0 ]; then
+  # How to repeat the checks. A re-run of './release.sh ${VERSION}' reaches
+  # steps 8-9 again only while this branch's HEAD is still the tagged commit:
+  # once anything lands on top (routine in a shared checkout), step 4's
+  # tag==HEAD guard refuses it, and a detached checkout at the tag fails the
+  # pre-flight's branch check. So the banner says which case this is, and
+  # always prints the same reads steps 8-9 make, to run by hand.
+  RERUN_HINT="Re-running './release.sh ${VERSION}' will NOT repeat them: HEAD is no longer
+  the v${VERSION} commit, so step 4 refuses the tag. Run the checks by hand:"
+  if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse --verify --quiet "v${VERSION}^{commit}" 2>/dev/null)" ]; then
+    RERUN_HINT="Re-running './release.sh ${VERSION}' repeats them (lint and the suites
+  first) only while HEAD is still the v${VERSION} commit, as it is now; once
+  anything lands on this branch, step 4 refuses the tag. Or run them by hand:"
+  fi
+  MANUAL_REGISTRY_NAME="<server.json name, percent-encoded>"
+  if [ -f server.json ] && command -v jq >/dev/null 2>&1; then
+    MANUAL_REGISTRY_NAME=$(jq -r '.name | @uri' server.json 2>/dev/null || echo "$MANUAL_REGISTRY_NAME")
+  fi
+  fail "v${VERSION} IS PUBLISHED -- steps 1-7 completed, so npm, the tag, the GitHub
+  release and the MCP Registry publish all ran -- but ${#POST_PUBLISH_PROBLEMS[@]} post-publish check(s)
+  did not hold:
+
+$(printf '    - %s\n' "${POST_PUBLISH_PROBLEMS[@]}")
+
+  Do not announce v${VERSION} until these are understood.
+  ${RERUN_HINT}
+
+    curl -s -o /dev/null -w '%{http_code}' 'https://registry.npmjs.org/@yawlabs%2Fpostgres-mcp/${VERSION}'
+    npm view @yawlabs/postgres-mcp@${VERSION} version --prefer-online
+    gh release view v${VERSION}
+    curl -s -o /dev/null -w '%{http_code}' 'https://registry.modelcontextprotocol.io/v0/servers/${MANUAL_REGISTRY_NAME}/versions/${VERSION}'
+    bash scripts/post-publish-smoke.sh ${VERSION}
+
+  (Both curls should print 200; npm view lags up to 300s behind the first.)
+  A broken tarball needs the next patch version, since npm versions are final."
 fi
 
 # =============================================================================
@@ -1299,6 +1499,7 @@ echo -e "  npm: https://www.npmjs.com/package/@yawlabs/postgres-mcp"
 echo -e "  git: https://github.com/YawLabs/postgres-mcp/releases/tag/v${VERSION}"
 echo ""
 # Counterpart to the FAILED banner and the last line of a successful run. Only
-# reachable when every step above ran, so a caller that cannot trust `$?`
-# (pipeline, trailing echo) can grep for this and get a true answer.
+# reachable when every step above ran and every check in steps 8 and 9 held,
+# so a caller that cannot trust `$?` (pipeline, trailing echo) can grep for
+# this and get a true answer.
 echo "RELEASE_RESULT=SUCCESS version=${VERSION}"

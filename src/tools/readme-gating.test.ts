@@ -12,16 +12,21 @@ import { statsTools } from "./stats.js";
 
 // Mirrors `allTools` in index.ts, like tools.test.ts does and for the same
 // reason: index.ts starts the server on import, so it cannot be imported here.
-const allTools = [
-  ...queryTools,
-  ...schemaTools,
-  ...explainTools,
-  ...indexAdvisorTools,
-  ...healthTools,
-  ...statsTools,
-  ...ioTools,
-  ...adminTools,
-];
+// Keyed by the module's export name so the first test below can hold this list
+// against the spreads index.ts actually registers, the same check tools.test.ts
+// makes: a module added only to index.ts would otherwise have its tools escape
+// the gating lists below entirely.
+const toolModules = {
+  queryTools,
+  schemaTools,
+  explainTools,
+  indexAdvisorTools,
+  healthTools,
+  statsTools,
+  ioTools,
+  adminTools,
+};
+const allTools = Object.values(toolModules).flat();
 
 /**
  * The README's "Per-tool gating in the host" section splits every tool into
@@ -156,6 +161,17 @@ describe("README and tool text do not oversell read-only", () => {
 });
 
 describe("README per-tool gating lists", () => {
+  it("check every tool module index.ts registers, in the same order", () => {
+    // Read as text for the reason above. Runs from dist/tools/, two levels
+    // below the repo root.
+    const indexSrc = readFileSync(new URL("../../src/index.ts", import.meta.url), "utf8");
+    const block = /const allTools = \[([^\]]*)\];/.exec(indexSrc)?.[1];
+    assert.ok(block !== undefined, "index.ts no longer declares `const allTools = [...]`");
+    const registered = [...block.matchAll(/\.\.\.(\w+)/g)].map((m) => m[1]);
+    assert.ok(registered.length > 0, "no ...xxxTools spreads found in index.ts's allTools");
+    assert.deepEqual(Object.keys(toolModules), registered);
+  });
+
   it("parse to a plausible number of names, so a reworded line cannot make this test vacuous", () => {
     const { autoAllow, alwaysPrompt } = lists();
     assert.ok(autoAllow.length >= 10, `Auto-allow parsed to ${autoAllow.length} names: ${autoAllow.join(", ")}`);

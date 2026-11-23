@@ -20,10 +20,11 @@
 // gh auth). Without --push it writes the files and prints the git commands.
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './lib/versions.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
@@ -98,18 +99,29 @@ end
 `;
 }
 
+// Commit one manifest file in a sibling repo and push it (SSH gh_woods, like
+// release.sh). The commit comes BEFORE the rebase: the caller has just written
+// `file` into the working tree, and `git pull --rebase` refuses to start on a
+// tracked file with unstaged changes -- which is every release after the first.
+// `git` is injectable so the order is testable without a repository.
+const SSH = 'ssh -i ~/.ssh/gh_woods -o IdentitiesOnly=yes';
+export function commitPush(
+  dir,
+  file,
+  msg,
+  git = (...a) => execFileSync('git', ['-C', dir, ...a], { stdio: 'inherit', env: { ...process.env, GIT_SSH_COMMAND: SSH } }),
+) {
+  git('add', file);
+  git('commit', '-m', msg);
+  git('pull', '--rebase', 'origin', 'main');
+  git('push', 'origin', 'main');
+}
+
 // Only run the release side effects when executed as a script, so a test can
 // import the helpers without triggering `gh release download`. Real paths on
 // both sides, so the check still fires when the script is reached through a
 // junction or symlink (argv[1] keeps the link path, import.meta.url does not).
-function invokedDirectly() {
-  try {
-    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-if (invokedDirectly()) main();
+if (isMainModule(process.argv[1], import.meta.url)) main();
 
 function main() {
   const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
@@ -216,15 +228,7 @@ function main() {
   console.log(`wrote ${scoopPath}`);
   console.log(`wrote ${formulaPath}`);
 
-  // 5. Commit + push (SSH gh_woods, like release.sh) only with --push.
-  const SSH = 'ssh -i ~/.ssh/gh_woods -o IdentitiesOnly=yes';
-  function commitPush(dir, file, msg) {
-    const git = (...a) => execFileSync('git', ['-C', dir, ...a], { stdio: 'inherit', env: { ...process.env, GIT_SSH_COMMAND: SSH } });
-    git('pull', '--rebase', 'origin', 'main');
-    git('add', file);
-    git('commit', '-m', msg);
-    git('push', 'origin', 'main');
-  }
+  // 5. Commit + push only with --push.
   if (push) {
     commitPush(scoopDir, scoopRel, `${cmd} ${version}`);
     commitPush(homebrewDir, formulaRel, `${cmd} ${version}`);

@@ -8,12 +8,10 @@ import { identSchema } from "./params.js";
  * constraints lists in pg_describe_table -- all three select the same
  * `constraintMetaCols` fragment, so all three carry the same fields.
  *
- * `validated` is REQUIRED and the other two are optional, which is not the
- * split the tool's description advertises: `convalidated` predates the PG18
- * additions and is selected unconditionally, while only `conenforced` /
- * `conperiod` are version-gated out. The `_warnings` text the handler emits on
- * an unknown server version already names just those two, so this matches the
- * code rather than the prose.
+ * `validated` is REQUIRED and the other two are optional: `convalidated`
+ * predates the PG18 additions and is selected unconditionally, while only
+ * `conenforced` / `conperiod` are version-gated out. The `_warnings` text the
+ * handler emits on an unknown server version names just those two.
  */
 const constraintMetaFields = {
   validated: z.boolean().describe("False for a NOT VALID constraint: existing rows were never checked against it."),
@@ -155,9 +153,12 @@ export const schemaTools = [
       "can write to the relation. Generated columns (`generated`: 'stored' / 'virtual') and " +
       "`identity`: 'always' columns are NOT writable -- omit them from INSERT/UPDATE column lists; " +
       "a generated column's expression is reported as `generation_expression`, never as " +
-      "`default_value`. On PostgreSQL 18+ constraints also report `validated` / `enforced` / " +
+      "`default_value`. Constraints report `validated` on every version (false = NOT VALID, " +
+      "existing rows were never checked). On PostgreSQL 18+ they also report `enforced` / " +
       "`has_period`, and columns report `not_null_validated` -- a NOT VALID not-null constraint " +
-      "means `nullable: false` can still hide NULLs.",
+      "means `nullable: false` can still hide NULLs. A foreign key to or from a partitioned table " +
+      "is listed once, as declared, not once per partition; `referenced_by` on a partition " +
+      "includes the foreign keys that reference its partitioned parent.",
     annotations: {
       title: "Describe table",
       readOnlyHint: true,
@@ -232,7 +233,10 @@ export const schemaTools = [
             ...constraintMetaFields,
           }),
         )
-        .describe("Other tables whose foreign keys point AT this one."),
+        .describe(
+          "Other tables whose foreign keys point AT this one -- or, for a partition, at a partitioned " +
+            "table it belongs to. One row per declared foreign key.",
+        ),
       constraints: z
         .array(
           z.object({
@@ -384,6 +388,16 @@ export const schemaTools = [
         ? ", con.convalidated, con.conenforced, con.conperiod"
         : ", con.convalidated";
 
+      // A foreign key that references a PARTITIONED table is stored as one
+      // pg_constraint row for the declared constraint plus one internal clone
+      // per partition of the referenced table, all on the referencing table
+      // (`conrelid`), each clone pointing at its parent through conparentid.
+      // Unfiltered, a reference to a 500-partition table read as 501 foreign
+      // keys, 500 of them aimed at individual partitions. A clone is the row
+      // whose parent constraint sits on the SAME table. `conparentid = 0`
+      // alone would be wrong here: a partition's own copy of its parent's
+      // foreign key also has a parent, on a different table, and is the real
+      // constraint on that partition.
       const foreignKeysQuery = `
         SELECT
           con.conname AS constraint_name,
@@ -407,6 +421,10 @@ export const schemaTools = [
         WHERE n.nspname = $1
           AND c.relname = $2
           AND con.contype = 'f'
+          AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_constraint parent
+            WHERE parent.oid = con.conparentid AND parent.conrelid = con.conrelid
+          )
         GROUP BY con.conname, cl.relname, fn.nspname${constraintMetaGroupBy}
         ORDER BY con.conname
       `;
@@ -451,6 +469,16 @@ export const schemaTools = [
       // "what depends on this table?" -- a routine question before a
       // destructive change. None of the surveyed competing MCP servers
       // expose this; in psql you'd run \d+ on the parent and squint.
+      //
+      // Matches psql's "Referenced by": the DECLARED constraints
+      // (conparentid = 0) that reference this relation or, when it is a
+      // partition, any partitioned table above it. Joining on confrelid alone
+      // showed a partition the internal per-partition clone (`orders_fk_1`)
+      // instead of the constraint an operator can actually name, and showed a
+      // referenced table one extra row per partition of a partitioned
+      // REFERENCING table. pg_partition_ancestors returns no rows for a
+      // relation outside any partition tree, hence the UNION with the relation
+      // itself.
       const referencedByQuery = `
         SELECT
           con.conname AS constraint_name,
@@ -458,11 +486,16 @@ export const schemaTools = [
           src.relname AS "table",
           array_agg(srcatt.attname::text ORDER BY u.attposition) AS columns,
           array_agg(refatt.attname::text ORDER BY u.attposition) AS referenced_columns${constraintMetaCols}
-        FROM pg_catalog.pg_constraint con
+        FROM pg_catalog.pg_class ref
+        JOIN pg_catalog.pg_namespace refn ON refn.oid = ref.relnamespace
+        JOIN LATERAL (
+          SELECT ref.oid AS relid
+          UNION
+          SELECT anc.relid::oid FROM pg_catalog.pg_partition_ancestors(ref.oid) anc
+        ) target ON TRUE
+        JOIN pg_catalog.pg_constraint con ON con.confrelid = target.relid
         JOIN pg_catalog.pg_class src ON src.oid = con.conrelid
         JOIN pg_catalog.pg_namespace srcn ON srcn.oid = src.relnamespace
-        JOIN pg_catalog.pg_class ref ON ref.oid = con.confrelid
-        JOIN pg_catalog.pg_namespace refn ON refn.oid = ref.relnamespace
         -- Pairing local conkey[i] to foreign confkey[i] by ordinality relies on
         -- the postgres invariant that conkey[i] references confkey[i]. unnest
         -- WITH ORDINALITY preserves array order; reordering or dropping
@@ -474,6 +507,7 @@ export const schemaTools = [
         WHERE refn.nspname = $1
           AND ref.relname = $2
           AND con.contype = 'f'
+          AND con.conparentid = 0
         GROUP BY con.conname, srcn.nspname, src.relname${constraintMetaGroupBy}
         ORDER BY srcn.nspname, src.relname, con.conname
       `;
@@ -533,7 +567,12 @@ export const schemaTools = [
           ]);
 
         if (!cols.ok) return cols;
-        if (!cols.data || cols.data.length === 0) {
+        // "Not found" is decided by the pg_class row, not by the column list:
+        // `CREATE TABLE t ()` is legal, as is a table whose columns have all
+        // been dropped, and either one exists with zero live columns. The
+        // column list only stands in when the kind fetch itself failed.
+        const relationExists = kindRes.ok ? (kindRes.data?.length ?? 0) > 0 : (cols.data?.length ?? 0) > 0;
+        if (!relationExists) {
           // JSON.stringify each piece so a name containing `"` or other
           // odd chars renders unambiguously rather than producing a broken
           // `Table "evil"name"."x" not found` message.
@@ -564,11 +603,9 @@ export const schemaTools = [
         // `kind` is reported as a top-level field, so a silent default to
         // "table" would mislabel a view or materialized view. Emit a warning
         // when the fetch failed so the caller sees the kind isn't trustworthy.
+        // (An ok-but-empty kind fetch never reaches here: it is the "not
+        // found" return above.)
         if (!kindRes.ok) warnings.push(`kind fetch failed, reported as "table": ${kindRes.error}`);
-        // ok-but-empty: the query succeeded but returned no row (e.g. a race
-        // where the relation was dropped between the cols fetch and this one).
-        // The `?? "table"` default would then silently mislabel the relation.
-        else if ((kindRes.data?.length ?? 0) === 0) warnings.push(`kind unavailable, reported as "table"`);
         if (!pk.ok) warnings.push(`primary_key fetch failed: ${pk.error}`);
         if (!fks.ok) warnings.push(`foreign_keys fetch failed: ${fks.error}`);
         if (!idxs.ok) warnings.push(`indexes fetch failed: ${idxs.error}`);

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it } from "node:test";
-import pg from "pg";
-import { shutdown } from "../api.js";
+import { describe, it } from "node:test";
+import { stubClient, stubConnect, stubPoolQuery, useStubbedPool } from "../test-helpers/pool-stub.js";
 import { ioTools } from "./io.js";
 
 const pgIoStats = ioTools.find((t) => t.name === "pg_io_stats")!;
@@ -112,9 +111,6 @@ interface IoResponse {
 }
 
 describe("pg_io_stats (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
   let seen: { sql: string; params: unknown[] }[] = [];
   let connectCalls = 0;
 
@@ -128,55 +124,31 @@ describe("pg_io_stats (stubbed connect, no live DB)", () => {
   function installStub(versionNum: number | null, failing: IoCategory[] = []) {
     seen = [];
     connectCalls = 0;
-    pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
-      if (versionNum === null) return Promise.reject(new Error("version probe unavailable"));
-      const text = typeof sql === "string" ? sql : "";
-      return Promise.resolve({ rows: text.includes("server_version_num") ? [{ v: String(versionNum) }] : [] });
-    } as unknown as typeof pg.Pool.prototype.query;
+    stubPoolQuery(async (text) => {
+      if (versionNum === null) throw new Error("version probe unavailable");
+      return { rows: text.includes("server_version_num") ? [{ v: String(versionNum) }] : [] };
+    });
 
-    const client = {
-      async query(sql: string, params: unknown[] = []) {
-        seen.push({ sql, params });
-        if (failing.includes(categorize(sql))) throw new Error("permission denied for view");
-        return { rows: rowsFor(sql) };
-      },
-      release() {
-        /* no-op */
-      },
-      // acquireClient() attaches an 'error' listener for the checked-out lifetime.
-      on() {
-        return this;
-      },
-      removeListener() {
-        return this;
-      },
-    };
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
+    const client = stubClient(async (sql: string, params: unknown[] = []) => {
+      seen.push({ sql, params });
+      if (failing.includes(categorize(sql))) throw new Error("permission denied for view");
+      return { rows: rowsFor(sql) };
+    });
+    stubConnect(() => {
       connectCalls += 1;
-      return Promise.resolve(client);
-    } as unknown as typeof pg.Pool.prototype.connect;
+      return client;
+    });
   }
 
   function sqlFor(category: IoCategory): string {
     return seen.find((q) => categorize(q.sql) === category)?.sql ?? "";
   }
 
-  beforeEach(async () => {
-    // shutdown() clears the pool AND the process-wide cached
-    // server_version_num. Without it the first test's version leaks into every
-    // later one and this whole suite becomes order-dependent -- the PG18 cases
-    // would "pass" against a stub configured for PG15.
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  });
-
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  });
+  // The shutdown() on the way in clears the pool AND the process-wide cached
+  // server_version_num. Without it the first test's version leaks into every
+  // later one and this whole suite becomes order-dependent -- the PG18 cases
+  // would "pass" against a stub configured for PG15.
+  useStubbedPool();
 
   // ── Version gate ───────────────────────────────────────────────────────
 

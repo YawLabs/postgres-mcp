@@ -8,11 +8,10 @@
 // run-it-on-each-host step, and the resulting bin/<platform>-<arch>/ artifact
 // is staged by stage-release-asset.mjs.
 //
-// Strategy: esbuild bundles src/index.ts + ALL its dependencies (including
-// the externals tsup leaves out -- @modelcontextprotocol/sdk and undici)
-// into ONE CommonJS file with zero remaining node_modules resolution, then
-// `oam compile` embeds that bundle into oam's runtime carrier and emits the
-// finished executable in one step. The result runs with no Node, no
+// Strategy: esbuild bundles src/index.ts + ALL its dependencies
+// (@modelcontextprotocol/server, pg, zod) into ONE CommonJS file with zero
+// remaining node_modules resolution, then `oam compile` embeds that bundle
+// into oam's runtime carrier and emits the finished executable in one step. The result runs with no Node, no
 // node_modules, and no PATH dependency.
 //
 // CRITICAL: the bundle handed to `oam compile` MUST be CJS. `oam compile` runs
@@ -46,6 +45,11 @@ const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
 // (oam or node) at launch time. A compiled standalone binary IS its runtime,
 // so there is nothing to select and embedding the launcher would only add a
 // spawn. `main` always names the server's own dist entry.
+//
+// One consequence: POSTGRES_MCP_SANDBOX is the launcher's feature (it spawns a
+// fresh oam under --permission), so the binary cannot apply it. The server
+// refuses to start when it sees that variable switched on (src/index.ts)
+// rather than serve unsandboxed.
 //
 // This used to read `bin`, which silently broke the moment `bin` was repointed
 // at the launcher in 0.9.0: the mapping produced `bin/postgres-mcp.ts`, a file
@@ -115,10 +119,11 @@ await esbuild.build({
   // everything else.
   banner: { js: "const __binImportMetaUrl = require('node:url').pathToFileURL(__filename).href;" },
   define: { __VERSION__: JSON.stringify(version), 'import.meta.url': '__binImportMetaUrl' },
-  // Optional native addons some servers pull transitively (ssh2 -> cpu-features)
-  // are require()'d inside try/catch; mark them external so esbuild doesn't
-  // choke on the .node binary -- they degrade gracefully when absent.
-  external: ['cpu-features'],
+  // No `external`: nothing in this server's dependency tree needs one. pg's
+  // optional `pg-native` is not installed, and esbuild leaves an unresolvable
+  // require() inside try/catch (which is how pg's lazily-loaded native client
+  // reaches it) as a runtime call, made only if the native client is asked
+  // for.
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);

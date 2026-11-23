@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { after, afterEach, before, describe, it } from "node:test";
 import pg from "pg";
-import { getPool, runReadOnly, shutdown } from "../api.js";
+import { getApplicationName, getPool, runReadOnly, shutdown } from "../api.js";
 import { runRolePreflight } from "../preflight.js";
 import { explainTools } from "../tools/explain.js";
 import { queryTools } from "../tools/query.js";
@@ -16,6 +16,10 @@ import { integrationEnabled } from "./fixtures.js";
 const SCHEMA = "pgmcp_security_test";
 const LIMITED_ROLE = "pgmcp_security_reader";
 const LIMITED_PASSWORD = "not-a-real-secret";
+// Role-check cases. Each holds a database-level grant, so it is dropped with
+// DROP OWNED first (see dropRole).
+const README_ROLE = "pgmcp_security_readme";
+const NOINHERIT_ROLE = "pgmcp_security_noinherit";
 const ADVISORY_KEY = 730_001;
 const LIMIT_KEYS = [
   "POSTGRES_MAX_ROWS",
@@ -26,8 +30,8 @@ const LIMIT_KEYS = [
 ] as const;
 
 const pgReadonly = queryTools.find((t) => t.name === "pg_readonly");
-const pgExplain = explainTools[0];
-if (!pgReadonly) throw new Error("pg_readonly must be defined");
+const pgExplain = explainTools.find((t) => t.name === "pg_explain");
+if (!pgReadonly || !pgExplain) throw new Error("pg_readonly and pg_explain must be defined");
 
 type Res = { ok: boolean; error?: string; data?: { rows: Record<string, unknown>[]; plan?: unknown } };
 const readonly = async (sql: string): Promise<Res> => (await pgReadonly.handler({ sql })) as Res;
@@ -37,11 +41,29 @@ describe("integration: security limits", { skip: !integrationEnabled() }, () => 
   const savedEnv = new Map(LIMIT_KEYS.map((k) => [k, process.env[k]]));
   let admin: pg.Client;
 
+  const urlFor = (role: string): string => {
+    const url = new URL(originalUrl);
+    url.username = role;
+    url.password = LIMITED_PASSWORD;
+    return url.toString();
+  };
+  // DROP OWNED also revokes the role's grants on shared objects (the
+  // database's CONNECT), which would otherwise block DROP ROLE. It errors on a
+  // role that does not exist, hence the lookup.
+  const dropRole = async (role: string): Promise<void> => {
+    const found = await admin.query("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1", [role]);
+    if (found.rowCount === 0) return;
+    await admin.query(`DROP OWNED BY ${role}`);
+    await admin.query(`DROP ROLE ${role}`);
+  };
+
   before(async () => {
     admin = new pg.Client({ connectionString: originalUrl });
     await admin.connect();
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
     await admin.query(`DROP ROLE IF EXISTS ${LIMITED_ROLE}`);
+    await dropRole(README_ROLE);
+    await dropRole(NOINHERIT_ROLE);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
     await admin.query(`CREATE TABLE ${SCHEMA}.t (id int)`);
     await admin.query(`INSERT INTO ${SCHEMA}.t VALUES (1)`);
@@ -76,6 +98,8 @@ describe("integration: security limits", { skip: !integrationEnabled() }, () => 
     await shutdown();
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
     await admin.query(`DROP ROLE IF EXISTS ${LIMITED_ROLE}`);
+    await dropRole(README_ROLE);
+    await dropRole(NOINHERIT_ROLE);
     await admin.end();
   });
 
@@ -168,8 +192,13 @@ describe("integration: security limits", { skip: !integrationEnabled() }, () => 
     // The reset must keep what the connection was opened with.
     const timeout = await readonly("SHOW statement_timeout");
     assert.equal(timeout.data?.rows[0]?.statement_timeout, "4321ms");
+    // Expected value derived as query.integration.test.ts does: an
+    // application_name in DATABASE_URL outranks the pool option, which is
+    // POSTGRES_APPLICATION_NAME or the "postgres-mcp" default.
+    const dsnAppName = /[?&]application_name=([^&]*)/.exec(process.env.DATABASE_URL ?? "")?.[1];
+    const expectedName = dsnAppName === undefined ? getApplicationName() : decodeURIComponent(dsnAppName);
     const name = await getPool().query("SHOW application_name");
-    assert.equal(name.rows[0].application_name, "postgres-mcp");
+    assert.equal(name.rows[0].application_name, expectedName);
   });
 
   it("the role check flags this superuser and passes a least-privilege role", async () => {
@@ -194,5 +223,39 @@ describe("integration: security limits", { skip: !integrationEnabled() }, () => 
     await runRolePreflight(false, (l) => riskyLines.push(l));
     assert.match(riskyLines.join("\n"), /pg_signal_backend/);
     assert.match(riskyLines.join("\n"), /write privileges/);
+  });
+
+  // The README's "Read-only agent" recipe, statement for statement. A plain
+  // GRANT of a predefined role also grants SET on it (PG16+), and the check
+  // used to name pg_read_all_data as a SET ROLE target -- so the documented
+  // least-privilege setup could never get the clean verdict.
+  it("the README least-privilege recipe gets the clean verdict", async () => {
+    const db = (await admin.query("SELECT current_database() AS db")).rows[0].db as string;
+    await admin.query(`CREATE ROLE ${README_ROLE} LOGIN PASSWORD '${LIMITED_PASSWORD}'`);
+    await admin.query(`GRANT CONNECT ON DATABASE ${pg.escapeIdentifier(db)} TO ${README_ROLE}`);
+    await admin.query(`GRANT USAGE ON SCHEMA public TO ${README_ROLE}`);
+    await admin.query(`GRANT pg_read_all_data TO ${README_ROLE}`);
+
+    process.env.DATABASE_URL = urlFor(README_ROLE);
+    const lines: string[] = [];
+    await runRolePreflight(false, (l) => lines.push(l));
+    assert.deepEqual(lines, [
+      `[postgres-mcp] role check: "${README_ROLE}" has none of the elevated attributes or grants checked for.`,
+    ]);
+  });
+
+  // The other side of that filter: without INHERIT, the predefined role's
+  // privileges are reachable ONLY through SET ROLE, which is exactly the reach
+  // the check exists to report.
+  it("a NOINHERIT member of pg_monitor is still told it can SET ROLE to it", async () => {
+    await admin.query(`CREATE ROLE ${NOINHERIT_ROLE} LOGIN NOINHERIT PASSWORD '${LIMITED_PASSWORD}'`);
+    await admin.query(`GRANT pg_monitor TO ${NOINHERIT_ROLE}`);
+
+    process.env.DATABASE_URL = urlFor(NOINHERIT_ROLE);
+    const lines: string[] = [];
+    await runRolePreflight(false, (l) => lines.push(l));
+    const text = lines.join("\n");
+    assert.match(text, /NOT effectively read-only/, text);
+    assert.match(text, /can SET ROLE to [^\n]*\bpg_monitor\b/, text);
   });
 });

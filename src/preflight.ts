@@ -38,6 +38,20 @@ const RISKY_FUNCTIONS = ["dblink_connect_u", "lo_export", "lo_import", "pg_read_
 const sqlList = (items: string[]): string => items.map((i) => `'${i}'`).join(", ");
 
 /**
+ * Which other roles count as SET ROLE targets; shared by the list and its
+ * count so the two cannot drift. Predefined roles (the reserved `pg_` prefix:
+ * pg_monitor, pg_read_all_data, ...) stay in only while their privileges are
+ * NOT already inherited: with INHERIT off, SET reach into them is exactly the
+ * risk, but a plain `GRANT pg_read_all_data TO mcp_reader` -- the README's
+ * least-privilege recipe -- also grants SET, and warning about a role whose
+ * privileges the session already holds made the clean verdict unreachable for
+ * the recommended setup. Ordinary roles are always listed, inherited or not:
+ * SET ROLE changes current_user, which row-level security policies can key on.
+ */
+const SETTABLE_WHERE = `r.oid <> me.oid AND pg_catalog.pg_has_role(r.oid, priv.name)
+      AND NOT (left(r.rolname::text, 3) = 'pg_' AND pg_catalog.pg_has_role(r.oid, 'USAGE'))`;
+
+/**
  * One statement, so one audit line. `pg_has_role(..., 'SET')` exists from
  * PostgreSQL 16; before that membership is what allows SET ROLE. The privilege
  * name is a runtime value, so the CASE works on every version.
@@ -60,18 +74,16 @@ SELECT
     ORDER BY 1
   ) AS dangerous_memberships,
   ARRAY(
-    -- Predefined roles (pg_monitor, pg_read_all_data, ...) stay in: they only
-    -- matter when INHERIT is off, but then SET reach into them is exactly the
-    -- risk. LIMIT 20 caps the list; settable_count is computed over the FULL set
+    -- LIMIT 20 caps the list; settable_count is computed over the FULL set
     -- (no LIMIT) so analyzeRole can flag truncation instead of printing 20 names
     -- that read as complete.
     SELECT r.rolname::text FROM pg_catalog.pg_roles r, priv
-    WHERE r.oid <> me.oid AND pg_catalog.pg_has_role(r.oid, priv.name)
+    WHERE ${SETTABLE_WHERE}
     ORDER BY 1 LIMIT 20
   ) AS settable_roles,
   (
     SELECT count(*)::int FROM pg_catalog.pg_roles r, priv
-    WHERE r.oid <> me.oid AND pg_catalog.pg_has_role(r.oid, priv.name)
+    WHERE ${SETTABLE_WHERE}
   ) AS settable_count,
   EXISTS (
     SELECT 1 FROM pg_catalog.pg_roles r, priv
@@ -86,7 +98,8 @@ SELECT
     SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r', 'p') AND ${userSchemaFilter("n.nspname")}
       AND pg_catalog.has_table_privilege(c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')
-  ) AS can_write_tables
+  ) AS can_write_tables,
+  current_setting('standard_conforming_strings') = 'on' AS standard_conforming_strings
 FROM me`;
 
 export interface RoleFacts {
@@ -103,6 +116,8 @@ export interface RoleFacts {
   can_set_superuser: boolean;
   risky_functions: string[];
   can_write_tables: boolean;
+  /** The statement guard (src/sql-guard.ts) reads string literals assuming this is on. */
+  standard_conforming_strings: boolean;
 }
 
 /** What is wrong with this role for an agent, one finding per entry. */
@@ -111,8 +126,11 @@ export function analyzeRole(facts: RoleFacts, writesAllowed: boolean): string[] 
   if (facts.superuser) {
     findings.push("is a SUPERUSER: it can run server programs, read server files and bypass every permission check");
   }
-  if (facts.can_set_superuser) findings.push("can SET ROLE to a superuser");
-  if (facts.dangerous_memberships.length > 0) {
+  // The privilege findings below are gated on !superuser: pg_has_role() answers
+  // true for a superuser on every role, so the SQL reports memberships and SET
+  // reach it does not hold, and the SUPERUSER line already covers all of it.
+  if (!facts.superuser && facts.can_set_superuser) findings.push("can SET ROLE to a superuser");
+  if (!facts.superuser && facts.dangerous_memberships.length > 0) {
     findings.push(`is a member of ${facts.dangerous_memberships.join(", ")}`);
   }
   if (!facts.superuser && facts.settable_roles.length > 0) {
@@ -136,6 +154,15 @@ export function analyzeRole(facts: RoleFacts, writesAllowed: boolean): string[] 
     findings.push(
       "holds write privileges on tables, which only the transaction wrapper is holding back (dblink or a " +
         "SECURITY DEFINER function can step outside it)",
+    );
+  }
+  // Not gated on !superuser: this is a session setting the statement guard
+  // depends on whatever the role, and a superuser connection still relies on
+  // the guard for its read-only checks.
+  if (facts.standard_conforming_strings === false) {
+    findings.push(
+      "connects with standard_conforming_strings=off, so the read-only statement checks misread a backslash in a " +
+        "string literal and a blocked call can hide behind one (`ALTER ROLE ... SET standard_conforming_strings = on`)",
     );
   }
   return findings;

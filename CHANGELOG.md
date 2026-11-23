@@ -7,6 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **The read-only statement guard no longer misses three spellings of a blocked call:** `U&"name" UESCAPE '!' (...)`
+  (a `U&"..."` identifier is now refused when it carries a `UESCAPE` clause, is called, or follows a dot), attribute
+  notation with no parenthesis (`(arg).pg_cancel_backend`, which PostgreSQL runs as a call), and a call hidden behind
+  an `E'...'` string continued on the next line, which the guard used to read in the wrong escape mode.
+- **The read-only guard also refuses `pg_promote`, `pg_stat_reset*`, `pg_stat_statements_reset`, the replication-slot
+  functions that create, copy, drop, advance, sync or consume a slot, and the SQL-from-text functions `crosstab`,
+  `crosstab2`-`crosstab4`, `connectby` and `xpath_table`.** The `pg_replication_slots` view and the `peek` functions
+  stay readable.
+- **The read-only guard also refuses the backup functions `pg_backup_start` / `pg_backup_stop` (and the PostgreSQL 14
+  names `pg_start_backup` / `pg_stop_backup`), `pg_log_standby_snapshot`, `pg_wal_replay_pause` /
+  `pg_wal_replay_resume`, `pg_replication_origin_advance` and `pg_replication_origin_session_setup`,** whose effects a
+  rollback does not undo: a backup stays open on the pooled connection, which `DISCARD ALL` does not end. Creating or
+  dropping a replication origin is transactional, so `pg_replication_origin_create` / `_drop` stay callable.
+- **The server refuses to start when `POSTGRES_MCP_SANDBOX` is on but it was started without its launcher**
+  (`node dist/index.js`, `npm start`, an `oam compile` binary). It used to serve unsandboxed without a word. Only an
+  absent variable or an explicit `0`, `false` or `off` lets it start.
+- `pg_index_advisor`'s stacked-query check compares the structured SQLSTATE `08P01` instead of searching error text,
+  which can echo the caller's own SQL.
+
+### Changed
+- **Breaking:** on read-only paths a qualified column whose name is on the guard's function list (`t.dblink_exec`) is
+  refused, because PostgreSQL can run that spelling as a call. Write the column unqualified.
+- **Breaking:** `pg_explain` refuses `hypothetical_indexes` together with `analyze: true`. HypoPG ignores hypothetical
+  indexes under `EXPLAIN ANALYZE`, so the call used to return the real plan as if the index did not help;
+  `costs: false` still works with them.
+- **Breaking:** value types change in every tool result: `float4` / `float8` `NaN`, `Infinity` and `-Infinity` come
+  back as the strings `"NaN"`, `"Infinity"` and `"-Infinity"` instead of `null`, and `bytea` values as PostgreSQL's
+  `\x` hex string instead of `{"type":"Buffer","data":[...]}`, one array element per byte. A client that tested for
+  `null` or read `data` gets a string.
+- **Breaking:** with `POSTGRES_MCP_SANDBOX` on, starting the server without its launcher (`node dist/index.js`,
+  `npm start`, an `oam compile` binary) exits with an error instead of serving unsandboxed (see Security).
+- The startup role check warns when the connection has `standard_conforming_strings=off`, under which the statement
+  guard misreads backslashes in string literals, for a superuser connection too. The fix is
+  `ALTER ROLE ... SET standard_conforming_strings = on`.
+- SQLSTATE 25001 errors (`VACUUM`, `CREATE INDEX CONCURRENTLY`, `CREATE DATABASE`, `ALTER SYSTEM`, ...) now add that
+  this server runs every statement inside a transaction block, with or without `ALLOW_WRITES`, and to run them with
+  psql or a migration tool; the `pg_query` description says the same. The read-only refusal of `VACUUM` no longer
+  recommends `pg_query` with `ALLOW_WRITES=1`, which cannot run it either. In read-only mode, where PostgreSQL refuses
+  `CREATE` / `DROP INDEX CONCURRENTLY`, `DETACH PARTITION CONCURRENTLY` and `CREATE` / `DROP DATABASE` or `TABLESPACE`
+  as writes (25006) before reaching the transaction-block check, the error says `ALLOW_WRITES=1 would not help` and
+  gives the same psql advice, instead of telling you to set `ALLOW_WRITES=1`.
+- `pg_advisor` `sequence_exhaustion` measures each sequence against the bound it is heading for, `limit_value`:
+  `max_value` when ascending, `min_value` when descending (descending sequences used to be left out), narrowed to the
+  owning column's range when the sequence is `OWNED BY` (SERIAL, IDENTITY) a `smallint` or `integer` column. A
+  pre-PG10 SERIAL feeding an `int4` column from a bigint sequence used to read as about 0% used until the column
+  overflowed; `pct_used` is now `last_value / limit_value` and can exceed 1 for a sequence already past its column's
+  range. Rows gain `increment_by`, `limit_value`, `limited_by` (`sequence` or `column`), `owned_by` and
+  `owned_by_type`. Sequences the role cannot read are counted in a `_warnings` entry instead of being treated as
+  healthy, and a sequence whose bound is 0 (a countdown to `MINVALUE 0`, an ascending one with `MAXVALUE 0`) is left
+  out without failing the category.
+- `POSTGRES_STATEMENT_TIMEOUT_MS`, `POSTGRES_CONNECTION_TIMEOUT_MS`, `POSTGRES_MAX_ROWS` and `POSTGRES_POOL_MAX` print
+  one stderr warning when set to a value they cannot use (empty, non-numeric, 0, negative) and use the default, as
+  they did silently before. The warning for an out-of-range `POSTGRES_MAX_RESULT_BYTES` /
+  `POSTGRES_QUERY_DEADLINE_MS` names the 2147483647 maximum.
+- When a release publishes but a post-publish check fails, `release.sh`'s FAILED banner says whether re-running
+  `./release.sh <version>` will repeat the checks (only while `HEAD` is still the tagged commit) and prints the npm,
+  GitHub, MCP Registry and smoke-test commands to run by hand.
+- `pg_index_advisor`'s generated index names keep non-ASCII letters and digits instead of turning them into
+  underscores.
+- Tool descriptions corrected: `pg_top_queries` shows constants as `$1`, `$2`, ..., not `?`; `pg_index_advisor` says
+  only `max_explains` sets `budget_exhausted` (a `max_candidates` cut goes to `_warnings`) and that candidates on a
+  partitioned table name its leaf partitions; `pg_table_privileges` no longer claims `pg_read_all_data` gives a
+  complete picture (only a superuser sees every grant); `pg_describe_table` says `validated` is reported on every
+  version, `enforced` / `has_period` on PostgreSQL 18+.
+
+### Fixed
+- **The README's least-privilege role passes the startup role check cleanly.** The plain
+  `GRANT pg_read_all_data TO mcp_reader` also grants `SET`, and the check warned `can SET ROLE to pg_read_all_data`.
+  A predefined `pg_` role whose privileges the role already inherits is no longer named; one granted without
+  inheritance, and any ordinary role, still is. For a superuser the check prints the SUPERUSER finding (plus the
+  `standard_conforming_strings=off` one when that applies) instead of also listing role attributes, memberships and
+  `SET ROLE` reach that `pg_has_role()` reports for every role.
+- **With `POSTGRES_MCP_SANDBOX=1` the launcher passes `POSTGRES_MAX_RESULT_BYTES` and `POSTGRES_QUERY_DEADLINE_MS` to
+  the sandboxed server.** oam dropped both, so the server silently ran on its defaults.
+- **A `pg_query` write that fails at `COMMIT`** (a deferred constraint, a serialization failure) leaves an `ok: false`
+  audit line with its SQLSTATE instead of an `ok: true` line for rows that never persisted.
+- `postgres-mcp --help` and `-h` print usage and exit 0; they used to start the stdio server, which then waited on
+  stdin. `version` and `--help` no longer validate the `POSTGRES_AUDIT_*` variables or create the audit file, so a
+  bad audit setting no longer breaks a command that serves nothing.
+- When `dist/index.js` is missing, the launcher says `could not start the server` in one line instead of an uncaught
+  stack trace.
+- A refused connection to a host name with several addresses (`localhost` on a dual-stack machine) reports the
+  per-address failures (`connect ECONNREFUSED ::1:5432; connect ECONNREFUSED 127.0.0.1:5432`) instead of an empty
+  `Error: `. The same goes for the stderr line when the server cannot connect to terminate a statement that ran past
+  its deadline, which used to end in a blank reason.
+- With `POSTGRES_STATEMENT_TIMEOUT_MS` near PostgreSQL's maximum and `POSTGRES_QUERY_DEADLINE_MS` unset, the derived
+  client-side deadline overflowed Node's timer and failed every statement after 1 ms; it is now capped at 2147483647.
+- `POSTGRES_CONNECTION_TIMEOUT_MS` above 2147483647 is capped at 2147483647 with a stderr warning. Node's timer turned
+  it into 1 ms, so every connect failed with a connection-timeout error.
+- `POSTGRES_MAX_ROWS` or `POSTGRES_POOL_MAX` values that floor to 0 (such as `0.5`) print a stderr warning and use the
+  default (1000 rows, 5 connections). Every query used to come back empty and truncated, and the pool silently used
+  pg's own default of 10.
+- A result whose columns share a name carries a `_warnings` entry saying the earlier columns are missing from `rows`
+  and to alias them.
+- `pg_index_advisor`: existing indexes are recognised again (node-pg returned their key columns as an unparsed array
+  string, so none ever suppressed a duplicate candidate), and a partial index, one with a different sort direction, or
+  one with a non-default operator class or collation (`text_pattern_ops`, `COLLATE "C"`) no longer hides a candidate
+  it cannot serve; multi-column `ORDER BY` candidates keep the query's sort order instead of being reordered by
+  selectivity, and statements that sort the same table in different orders each get a candidate in their own order;
+  an index made only of `ORDER BY` / `GROUP BY` columns is no longer pruned or flagged `requires_skip_scan`;
+  `min_improvement: 0` no longer returns recommendations that lower no cost; reversed (`5 < col`) and cast-wrapped
+  comparisons count as range predicates, while `ILIKE`, `NOT LIKE` and operators such as `<@`, `<<`, `@>` and `>>` no
+  longer take the candidate's single range slot; a failed server-version probe no longer skips
+  every parameterized statement and blames the server's age; and an inheritance parent's columns read one `pg_stats`
+  row each, so candidate column order is stable between calls.
+- `pg_advisor` `wraparound_risk` measures each table against the LOWER of its per-table
+  `autovacuum_freeze_max_age` / `autovacuum_multixact_freeze_max_age` and the cluster setting, as autovacuum does, so a
+  per-table value raised above the GUC no longer hides a table about to be force-vacuumed.
+  `tables_without_primary_key` reports a PK-less partitioned table once, as the parent, instead of also listing every
+  partition.
+- `pg_replication_status` no longer fails the whole call when the role lacks `pg_read_all_stats`: replica `state` /
+  `sync_state` come back `null` and a `_warnings` entry says why.
+- `pg_describe_table` lists a foreign key that references a partitioned table once, as declared, instead of once more
+  per partition; `referenced_by` on a partition shows the declared constraints, including foreign keys to its
+  partitioned parent. An existing table with zero columns is described instead of reported as not found.
+- `pg_seq_scan_tables` no longer fails with `numeric field overflow` when a table's seq_scan/idx_scan ratio reaches
+  10^8, and `pg_health`'s `active_queries` ages no longer overflow for a backend older than about 3.2 years.
+  `pg_health`'s `database`, `connections` and `table_count` read `null` instead of vanishing when a sub-query returns
+  no rows.
+- `pg_unused_indexes` no longer offers indexes that back an `EXCLUDE` constraint as drop candidates; unique indexes
+  stay left out as before.
+- `pg_top_queries` works when `pg_stat_statements` is installed in a schema outside the role's `search_path`, instead
+  of failing with `relation "pg_stat_statements" does not exist` right after its install check passed.
+
+### Documentation
+- The README's "What's new" covers 0.14 and adds a "Coming from 0.13.x?" note naming the four 0.14.0 breaking
+  changes. It also now lists every warning the startup role check can print and every function the read-only guard
+  refuses, says that `pg_query` cannot run `VACUUM` / `CREATE INDEX CONCURRENTLY` / `CREATE DATABASE` /
+  `ALTER SYSTEM`, gives the 2147483647 maximum of `POSTGRES_MAX_RESULT_BYTES` and `POSTGRES_QUERY_DEADLINE_MS`, says
+  which `ALLOW_WRITES` values warn, and says that `POSTGRES_MCP_SANDBOX` only works through the launcher. Every
+  install snippet and the Add to Yaw MCP button use `@yawlabs/postgres-mcp@latest`.
+
 ## [0.14.1] - 2026-11-21
 
 ### Changed
@@ -326,8 +459,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.13.6] - 2026-09-23
 
-### Changed
-- fix(audit): reject directory paths at startup on Windows (#61)
+### Fixed
+- **A `POSTGRES_AUDIT_LOG_FILE` that names a directory stops the server at startup on Windows too (#61).** There,
+  opening a directory for append succeeds, and the `EISDIR` only surfaced on the first write: one warning, then every
+  audit line lost. The server now checks the opened handle and refuses to start with `audit log path "..." is a
+  directory, not a file`, as it already did on Linux, where the open itself fails.
 
 ## [0.13.5] - 2026-09-23
 

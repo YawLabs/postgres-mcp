@@ -161,9 +161,11 @@ export function getAuditConfig(): AuditConfig {
 }
 
 /**
- * Reads the env and opens the sink. Idempotent, and called at api.ts module
- * load so a misconfigured audit log kills the process at startup, while the
- * operator is still watching, rather than at the first tool call -- or never.
+ * Reads the env and opens the sink. Idempotent, and called by index.ts on its
+ * server-start path (after the subcommands, before serving) so a misconfigured
+ * audit log kills the process at startup, while the operator is still
+ * watching, rather than at the first tool call -- or never. Until it runs,
+ * auditing is off.
  */
 export function initAudit(): void {
   if (initialized) return;

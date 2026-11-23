@@ -14,6 +14,8 @@ import {
   FIXTURE_GENERATED_TABLE,
   FIXTURE_IDENTITY_ALWAYS_COLUMN,
   FIXTURE_IDENTITY_BY_DEFAULT_COLUMN,
+  FIXTURE_PARTITIONED_FK_CONSTRAINT,
+  FIXTURE_PARTITIONED_FK_TABLE,
   FIXTURE_PG18_NOT_ENFORCED_CHECK,
   FIXTURE_PG18_NOT_ENFORCED_FK,
   FIXTURE_PG18_NOT_ENFORCED_TABLE,
@@ -26,12 +28,14 @@ import {
   FIXTURE_PG18_VIRTUAL_TABLE,
   FIXTURE_PLAIN_DEFAULT_COLUMN,
   FIXTURE_SCHEMA,
+  FIXTURE_ZERO_COLUMN_TABLE,
   fdwFixtureAvailable,
   integrationEnabled,
   pg18NotEnforcedAvailable,
   pg18NotNullNotValidAvailable,
   pg18TemporalKeyAvailable,
   pg18VirtualColumnAvailable,
+  probeServerVersionNum,
   setupFixtures,
   teardownFixtures,
 } from "./fixtures.js";
@@ -43,19 +47,6 @@ const listViews = schemaTools.find((t) => t.name === "pg_list_views")!;
 const listFunctions = schemaTools.find((t) => t.name === "pg_list_functions")!;
 const listExtensions = schemaTools.find((t) => t.name === "pg_list_extensions")!;
 const searchColumns = schemaTools.find((t) => t.name === "pg_search_columns")!;
-
-// Server-version probe for the PG18-gated `not_null_validated` / `enforced` /
-// `has_period` fields. Asks the server directly rather than importing the
-// handler's own getServerVersionNum(), so a regression in the probe the handler
-// gates on cannot also move this file's expectation. Returns 0 when the probe
-// itself fails; callers treat that as "cannot tell" and skip, matching this
-// file's habit of skipping rather than failing when a capability is absent.
-async function probeServerVersionNum(): Promise<number> {
-  const res = await runInternal<{ v: string }>("SELECT current_setting('server_version_num') AS v");
-  if (!res.ok || !res.data?.length) return 0;
-  const parsed = Number.parseInt(res.data[0].v, 10);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
 
 // pg_describe_table's row shapes, shared by the generated / identity /
 // constraint-metadata cases below. The PG18-only keys are declared OPTIONAL on
@@ -262,13 +253,17 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
         includeViews: false,
         limit: 500,
         offset: 0,
-      })) as { ok: boolean; data?: { name: string }[] };
+      })) as { ok: boolean; data?: { name: string }[]; error?: string };
+      // Asserted up front: a failed listing gives allNames = [], the loop below
+      // never runs, and the final deepEqual compares [] with [].
+      assert.equal(allRes.ok, true, `expected ok, got error: ${allRes.error}`);
       const allNames = (allRes.data ?? []).map((r) => r.name).sort();
 
       // Walk the table list two-at-a-time and verify each page is the
       // expected size (full pages of 2, then a final partial page with
       // whatever's left). Resilient to fixture growth.
       const pageSize = 2;
+      assert.ok(allNames.length > pageSize, `need more than one page to paginate, got ${JSON.stringify(allNames)}`);
       const pages: { name: string }[][] = [];
       for (let offset = 0; offset < allNames.length; offset += pageSize) {
         const page = (await listTables.handler({
@@ -276,7 +271,8 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
           includeViews: false,
           limit: pageSize,
           offset,
-        })) as { ok: boolean; data?: { name: string }[] };
+        })) as { ok: boolean; data?: { name: string }[]; error?: string };
+        assert.equal(page.ok, true, `page at offset=${offset}: expected ok, got error: ${page.error}`);
         const got = page.data ?? [];
         const expectedSize = Math.min(pageSize, allNames.length - offset);
         assert.equal(got.length, expectedSize, `page at offset=${offset} should have ${expectedSize} rows`);
@@ -370,6 +366,48 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
       assert.equal(res.ok, true);
       assert.equal(res.data?.partition_of?.table, "events");
       assert.equal(res.data?.partition_of?.schema, FIXTURE_SCHEMA);
+    });
+
+    // A foreign key INTO a partitioned table is stored as the declared
+    // pg_constraint row plus one internal clone per partition of the referenced
+    // table (`event_notes_event_fk_1` -> events_2026), all on the referencing
+    // table. Unfiltered, foreign_keys listed the clone as a second FK, and a
+    // 500-partition reference read as 501.
+    it("lists a foreign key to a partitioned table once, as declared, not once per partition", async () => {
+      const data = await describeFixtureTable(FIXTURE_PARTITIONED_FK_TABLE);
+      assert.deepEqual(
+        data.foreign_keys.map((fk) => `${fk.constraint_name} -> ${fk.foreign_table}`),
+        [`${FIXTURE_PARTITIONED_FK_CONSTRAINT} -> events`],
+      );
+      assert.deepEqual(data.foreign_keys[0].columns, ["event_id", "event_occurred_at"]);
+      assert.deepEqual(data.foreign_keys[0].foreign_columns, ["id", "occurred_at"]);
+    });
+
+    it("shows the declared foreign key in referenced_by on the partitioned parent and on its partition", async () => {
+      for (const table of ["events", "events_2026"]) {
+        const data = await describeFixtureTable(table);
+        const incoming = data.referenced_by.filter((r) => r.table === FIXTURE_PARTITIONED_FK_TABLE);
+        // On the partition this used to be the internal clone
+        // (`event_notes_event_fk_1`), a name nobody declared or can DROP.
+        assert.deepEqual(
+          incoming.map((r) => r.constraint_name),
+          [FIXTURE_PARTITIONED_FK_CONSTRAINT],
+          `${table}: referenced_by from ${FIXTURE_PARTITIONED_FK_TABLE}`,
+        );
+        assert.deepEqual(incoming[0].columns, ["event_id", "event_occurred_at"]);
+        assert.deepEqual(incoming[0].referenced_columns, ["id", "occurred_at"]);
+      }
+    });
+
+    // `CREATE TABLE t ()` is legal and is what a table with every column
+    // dropped looks like. Existence used to be read off the column list, so
+    // this table came back as "not found".
+    it("describes an existing zero-column table instead of reporting it as not found", async () => {
+      const data = await describeFixtureTable(FIXTURE_ZERO_COLUMN_TABLE);
+      assert.equal(data.kind, "table");
+      assert.deepEqual(data.columns, []);
+      assert.deepEqual(data.primary_key, []);
+      assert.equal(data._warnings, undefined, `no _warnings expected, got ${JSON.stringify(data._warnings)}`);
     });
 
     it("handles quoted identifiers like 'Odd Table'", async () => {
@@ -688,7 +726,6 @@ describe("integration: schema tools", { skip: !integrationEnabled() }, () => {
     // so these assertions go through `in` deliberately.
     it("omits not_null_validated / enforced / has_period below PG18 and includes them on 18+", async () => {
       const version = await probeServerVersionNum();
-      if (version === 0) return; // version undeterminable -- nothing to gate on
 
       const data = await describeFixtureTable("products");
       assert.ok(data.constraints.length > 0, "products should expose CHECK + UNIQUE constraints");

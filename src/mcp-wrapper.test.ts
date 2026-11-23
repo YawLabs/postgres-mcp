@@ -27,26 +27,9 @@ describe("wrapToolHandler: ok result -> content block (no isError)", () => {
     assert.match(res.content[0]!.text, /\n {2}"rows"/, "expected 2-space pretty indentation");
   });
 
-  it("substitutes { success: true } when ok is true but data is absent", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: true }), "pg_test");
-    const res = await wrapped({});
-    assert.equal(res.isError, undefined);
-    assert.equal(res.content[0]!.text, JSON.stringify({ success: true }, null, 2));
-  });
-
-  it("substitutes { success: true } when data is explicitly null/undefined", async () => {
-    for (const data of [null, undefined]) {
-      const wrapped = wrapToolHandler(async () => ({ ok: true, data }), "pg_test");
-      const res = await wrapped({});
-      // `data ?? { success: true }` -- nullish coalescing, so both null and
-      // undefined fall through to the success sentinel.
-      assert.equal(res.content[0]!.text, JSON.stringify({ success: true }, null, 2));
-    }
-  });
-
-  it("preserves falsy-but-defined data (0, false, '', []) instead of the sentinel", async () => {
-    // ?? only catches null/undefined, so a falsy-but-present payload must be
-    // serialized verbatim -- NOT replaced by { success: true }.
+  it("preserves falsy-but-defined data (0, false, '', []) rather than reading it as missing", async () => {
+    // Only null/undefined count as "no data", so a falsy-but-present payload
+    // must be serialized verbatim.
     for (const data of [0, false, "", []] as const) {
       const wrapped = wrapToolHandler(async () => ({ ok: true, data }), "pg_test");
       const res = await wrapped({});
@@ -74,6 +57,53 @@ describe("wrapToolHandler: malformed (non-ApiResponse) result -> distinct isErro
     const res = await wrapped({});
     assert.equal(res.isError, true);
     assert.equal(res.content[0]!.text, "Error: tool handler returned a malformed result (missing ok)");
+  });
+
+  it("maps ok:true with no data to its own error, not to an invented { success: true } body", async () => {
+    // The wrapper used to substitute `{ success: true }`, which no tool's
+    // outputSchema declares: the SDK would have rejected it with a validation
+    // error naming neither the handler nor the cause.
+    for (const result of [{ ok: true }, { ok: true, data: null }, { ok: true, data: undefined }]) {
+      const res = await wrapToolHandler(async () => result, "pg_test")({});
+      assert.equal(res.isError, true, JSON.stringify(result));
+      assert.equal(res.content[0]!.text, "Error: tool handler returned a malformed result (ok without data)");
+      assert.equal("structuredContent" in res, false);
+    }
+  });
+});
+
+// pg parses float4/float8 with parseFloat, and JSON has no NaN or Infinity:
+// JSON.stringify writes `null` for all three, which a caller reads as SQL NULL.
+describe("wrapToolHandler: non-finite numbers keep their value instead of becoming null", () => {
+  it("renders NaN / Infinity / -Infinity as strings, in the text and in structuredContent", async () => {
+    const data = {
+      rows: [{ x: Number.NaN, y: Number.POSITIVE_INFINITY, z: Number.NEGATIVE_INFINITY, n: null, f: 1.5 }],
+      list: [Number.NaN, 2],
+    };
+    const res = await wrapToolHandler(async () => ({ ok: true, data }), "pg_test")({});
+    const expected = {
+      rows: [{ x: "NaN", y: "Infinity", z: "-Infinity", n: null, f: 1.5 }],
+      list: ["NaN", 2],
+    };
+    assert.equal(res.isError, undefined);
+    assert.deepEqual(res.structuredContent, expected);
+    assert.deepEqual(JSON.parse(res.content[0]!.text), expected);
+  });
+});
+
+// node-pg returns bytea as a Buffer, whose toJSON is { type: "Buffer", data:
+// [...] } -- one array element, and with the indent one line, per byte.
+describe("wrapToolHandler: a Buffer (bytea) is rendered as PostgreSQL's hex form", () => {
+  it("writes \\x-prefixed hex for a Buffer, nested or top-level, and leaves a look-alike object alone", async () => {
+    const lookAlike = { type: "Buffer", data: [1, 2] };
+    const data = { rows: [{ b: Buffer.from([0xde, 0xad, 0x00, 0xef]), empty: Buffer.alloc(0), j: lookAlike }] };
+    const res = await wrapToolHandler(async () => ({ ok: true, data }), "pg_test")({});
+    assert.equal(res.isError, undefined);
+    assert.deepEqual(res.structuredContent, { rows: [{ b: "\\xdead00ef", empty: "\\x", j: lookAlike }] });
+    assert.deepEqual(JSON.parse(res.content[0]!.text), res.structuredContent);
+
+    const top = await wrapToolHandler(async () => ({ ok: true, data: Buffer.from("hi") }), "pg_test")({});
+    assert.equal(top.content[0]!.text, '"\\\\x6869"');
   });
 });
 
@@ -150,6 +180,23 @@ describe("wrapToolHandler: a THROWN exception -> its own isError block", () => {
     assert.equal(res.isError, true);
     assert.equal(res.content[0]!.text, "Error: async rejection");
   });
+
+  it("names the per-address failures of an AggregateError whose own message is empty", async () => {
+    // What a refused connection to `localhost` on a dual-stack host throws:
+    // message "", the text only in `errors`. It used to read as "Error: ".
+    const wrapped = wrapToolHandler(async () => {
+      throw Object.assign(
+        new AggregateError(
+          [new Error("connect ECONNREFUSED ::1:5432"), new Error("connect ECONNREFUSED 127.0.0.1:5432")],
+          "",
+        ),
+        { code: "ECONNREFUSED" },
+      );
+    }, "pg_test");
+    const res = await wrapped({});
+    assert.equal(res.isError, true);
+    assert.equal(res.content[0]!.text, "Error: connect ECONNREFUSED ::1:5432; connect ECONNREFUSED 127.0.0.1:5432");
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -190,12 +237,6 @@ describe("wrapToolHandler: structuredContent mirrors the content text", () => {
     const res = await wrapped({});
     assert.deepEqual(res.structuredContent, { rows: [] });
     assert.equal(res.content[0]!.text, "[]");
-  });
-
-  it("carries the { success: true } sentinel when ok is true but data is absent", async () => {
-    const wrapped = wrapToolHandler(async () => ({ ok: true }), "pg_test");
-    const res = await wrapped({});
-    assert.deepEqual(res.structuredContent, { success: true });
   });
 
   it("omits structuredContent for a scalar payload rather than inventing a wrapper key", async () => {
@@ -255,7 +296,8 @@ describe("wrapToolHandler: no error path carries structuredContent", () => {
 //
 // Faithful boundary: we drive the REAL `withSharedClient` from api.ts with a
 // deterministic connect failure (stub `pg.Pool.prototype.connect` to reject,
-// the same pg client boundary api.test.ts stubs). No network, no live DB.
+// the same pg client boundary audit.test.ts and security.test.ts stub). No
+// network, no live DB.
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("withSharedClient connect failure propagates as a throw", () => {

@@ -127,6 +127,88 @@ describe("findBlockedFunction", () => {
     assert.equal(findBlockedFunction('SELECT U&"col" FROM t'), null);
   });
 
+  it("refuses a unicode-escaped identifier carrying a UESCAPE clause", () => {
+    // The clause sits between the name and the parenthesis, and its literal
+    // can be any string form (measured on PG18: all of these are calls).
+    const bypasses = [
+      `SELECT U&"pg_terminate_backend" UESCAPE '!' (123)`,
+      `SELECT U&"dblink!005fexec" UESCAPE '!'('a','b')`,
+      `SELECT U&"dblink!005fexec" /* c */ uescape -- x\n '!' /* d */ ('a')`,
+      `SELECT u&"dblink!005fexec" UESCAPE E'!' ('a')`,
+      `SELECT U&"dblink!005fexec" UESCAPE $$!$$ ('a')`,
+      `SELECT U&"dblink!005fexec" UESCAPE '!'\n'' ('a')`,
+    ];
+    for (const sql of bypasses) assert.match(findBlockedFunction(sql) ?? "", /^U&"/, sql);
+    // A unicode-escaped string keeps its UESCAPE clause: only identifiers name functions.
+    assert.equal(findBlockedFunction("SELECT U&'d!0061t!+000061' UESCAPE '!'"), null);
+  });
+
+  it("finds a call written in attribute notation, with no parenthesis", () => {
+    // PostgreSQL runs `(arg).fn` as `fn(arg)` (measured on PG18).
+    assert.equal(findBlockedFunction("SELECT ('/etc/passwd'::text).pg_read_file"), "pg_read_file");
+    assert.equal(findBlockedFunction('SELECT (123) . /* c */ "pg_cancel_backend"'), "pg_cancel_backend");
+    assert.equal(findBlockedFunction("SELECT (t.x).pg_ls_dir FROM t"), "pg_ls_dir");
+    assert.equal(findBlockedFunction("SELECT (ARRAY['x'])[1].lo_import"), "lo_import");
+    assert.equal(findBlockedFunction("SELECT t.dblink_exec FROM t"), "dblink_exec");
+    assert.match(findBlockedFunction(`SELECT ('x'::text).U&"pg_read!005ffile" UESCAPE '!'`) ?? "", /^U&"/);
+    assert.match(findBlockedFunction(`SELECT ('x'::text).U&"pg_read\\005ffile"`) ?? "", /^U&"/);
+    // The dot must be the token directly before the name.
+    assert.equal(findBlockedFunction("SELECT t.a, dblink_exec FROM t"), null);
+    assert.equal(findBlockedFunction("SELECT t.pg_read_file_count FROM t"), null);
+  });
+
+  it("reads a continued E-string in E mode, so its backslash-quote does not end it", () => {
+    // PostgreSQL joins literals across a newline and keeps the first one's
+    // mode (measured on PG18): the second segment below is an escaped quote,
+    // and the call after it is live code.
+    const hidden = (gap: string, fn: string) => `SELECT E'a'${gap}'\\'' || ${fn} || '...'`;
+    assert.equal(findBlockedFunction(hidden("\n", "set_config('role','x',false)")), "set_config");
+    assert.equal(findBlockedFunction(hidden("\r", "pg_read_file('/etc/passwd')")), "pg_read_file");
+    assert.equal(findBlockedFunction(hidden(" -- c\n", "pg_terminate_backend(123)")), "pg_terminate_backend");
+    assert.equal(findBlockedFunction(hidden("\n-- c\n\t", "dblink('y')")), "dblink");
+    assert.equal(findBlockedFunction(hidden("\n'b'\n", "dblink('y')")), "dblink");
+    // A benign continuation stays one literal, in either mode.
+    assert.equal(findBlockedFunction("SELECT E'a'\n'\\' dblink_exec(1)'"), null);
+    assert.equal(findBlockedFunction("SELECT 'a'\n'dblink_exec(1)'"), null);
+    // A plain string's continuation is plain too: the backslash is a character.
+    assert.equal(findBlockedFunction("SELECT 'a'\n'\\' || dblink('y')"), "dblink");
+  });
+
+  it("covers functions that run SQL from text or act outside the transaction", () => {
+    const calls: [string, string][] = [
+      ["SELECT * FROM crosstab('select pg_terminate_backend(1)') AS t(a int, b int)", "crosstab"],
+      ["SELECT * FROM crosstab2('select 1')", "crosstab2"],
+      ["SELECT * FROM connectby('t', 'k', 'p', '1', 0) AS t(k text, p text, l int)", "connectby"],
+      ["SELECT * FROM xpath_table('k', 'x', 't', '/a', 'true') AS t(k int, a text)", "xpath_table"],
+      ["SELECT pg_stat_reset()", "pg_stat_reset"],
+      ["SELECT pg_stat_reset_shared('bgwriter')", "pg_stat_reset_shared"],
+      ["SELECT pg_stat_statements_reset()", "pg_stat_statements_reset"],
+      ["SELECT pg_promote()", "pg_promote"],
+      ["SELECT pg_create_physical_replication_slot('s')", "pg_create_physical_replication_slot"],
+      ["SELECT pg_drop_replication_slot('s')", "pg_drop_replication_slot"],
+      ["SELECT pg_replication_slot_advance('s', '0/0')", "pg_replication_slot_advance"],
+      ["SELECT * FROM pg_logical_slot_get_changes('s', NULL, NULL)", "pg_logical_slot_get_changes"],
+      ["SELECT pg_backup_start('x')", "pg_backup_start"],
+      ["SELECT * FROM pg_backup_stop()", "pg_backup_stop"],
+      ["SELECT pg_start_backup('x')", "pg_start_backup"],
+      ["SELECT * FROM pg_stop_backup(false)", "pg_stop_backup"],
+      ["SELECT pg_log_standby_snapshot()", "pg_log_standby_snapshot"],
+      ["SELECT pg_wal_replay_pause()", "pg_wal_replay_pause"],
+      ["SELECT pg_wal_replay_resume()", "pg_wal_replay_resume"],
+      ["SELECT pg_replication_origin_advance('o', '0/0')", "pg_replication_origin_advance"],
+      ["SELECT pg_replication_origin_session_setup('o')", "pg_replication_origin_session_setup"],
+    ];
+    for (const [sql, name] of calls) assert.equal(findBlockedFunction(sql), name, sql);
+    // The catalog views with neighbouring names stay readable.
+    assert.equal(findBlockedFunction("SELECT * FROM pg_catalog.pg_replication_slots"), null);
+    assert.equal(findBlockedFunction("SELECT s.stats_reset FROM pg_catalog.pg_stat_replication_slots s"), null);
+    assert.equal(findBlockedFunction("SELECT * FROM pg_logical_slot_peek_changes('s', NULL, NULL)"), null);
+    // Read-only progress probes, and the transactional origin create/drop.
+    assert.equal(findBlockedFunction("SELECT pg_replication_origin_progress('o', false)"), null);
+    assert.equal(findBlockedFunction("SELECT pg_replication_origin_create('o')"), null);
+    assert.equal(findBlockedFunction("SELECT pg_is_wal_replay_paused()"), null);
+  });
+
   it("ignores strings, dollar quotes, comments and non-call uses", () => {
     assert.equal(findBlockedFunction("SELECT 'dblink_exec(1)'"), null);
     assert.equal(findBlockedFunction("SELECT 'it''s dblink_exec(1)'"), null);
@@ -146,5 +228,15 @@ describe("findBlockedFunction", () => {
 
   it("is enforced by assertReadOnlyStatement with a fix in the message", () => {
     assert.throws(() => assertReadOnlyStatement("SELECT dblink_exec('x', 'DELETE FROM t')"), /real boundary/);
+  });
+
+  it("does not send a blocked VACUUM to pg_query, which cannot run it either", () => {
+    // pg_query always opens a transaction and VACUUM is refused inside one.
+    assert.throws(
+      () => assertReadOnlyStatement("VACUUM t"),
+      (err: unknown) =>
+        err instanceof GuardError && /psql or a maintenance job/.test(err.message) && !/ALLOW_WRITES/.test(err.message),
+    );
+    assert.throws(() => assertReadOnlyStatement("SET ROLE x"), /`pg_query` with ALLOW_WRITES=1/);
   });
 });

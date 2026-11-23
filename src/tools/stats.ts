@@ -105,19 +105,38 @@ export function hasStatementsInfo(extVersion: string): boolean {
  * than reporting nothing -- it would look authoritative while describing a
  * different window.
  *
- * Unqualified (no `pg_catalog.` prefix) because the view belongs to the
- * extension and lives in whatever schema it was installed into, matching the
- * bare `pg_stat_statements` reference in the main query below.
+ * Never `pg_catalog.`-qualified: the view belongs to the extension and lives
+ * in whatever schema it was installed into. `relation` is that schema-qualified
+ * name, built by {@link statementsRelation} -- the same prefix the main query
+ * below puts on `pg_stat_statements`.
  *
  * The view is documented as holding exactly one row, so no WHERE clause is
  * needed; `withStatsReset` still warns rather than emitting a bare null if that
  * ever fails to hold.
  */
-const STATEMENTS_STATS_RESET_SQL = `SELECT
+function statementsStatsResetSql(relation: string): string {
+  return `SELECT
      stats_reset::text AS stats_reset,
      EXTRACT(EPOCH FROM (now() - stats_reset))::numeric(14, 2)::float8 AS stats_reset_age_seconds,
      dealloc::text AS dealloc
-   FROM pg_stat_statements_info`;
+   FROM ${relation}`;
+}
+
+/**
+ * Schema-qualify one of the extension's views. The install probe reads
+ * `pg_catalog.pg_extension`, which answers whatever schema the extension lives
+ * in, so naming the view bare would let that probe pass and the very next
+ * statement fail with 42P01 whenever the schema is off the role's search_path
+ * (`CREATE EXTENSION pg_stat_statements SCHEMA monitoring`).
+ *
+ * `schema` is `extnamespace::regnamespace::text`, which postgres has already
+ * quoted where the name needs it -- so it is pasted as-is, never re-quoted. An
+ * absent schema (a probe row without the column) falls back to the bare name.
+ * Exported for unit testing.
+ */
+export function statementsRelation(schema: string | null | undefined, view: string): string {
+  return schema ? `${schema}.${view}` : view;
+}
 
 export const statsTools = [
   {
@@ -126,7 +145,7 @@ export const statsTools = [
       "Top N queries by total or mean execution time. Requires the `pg_stat_statements` " +
       "extension to be installed and enabled (most managed Postgres providers have it on " +
       "by default). Returns `{rows, stats_reset, stats_reset_age_seconds, dealloc}`: each row has " +
-      "normalized query text (constants replaced with `?`), call count, " +
+      "normalized query text (constants replaced with `$1`, `$2`, ...), call count, " +
       "total/mean/min/max time in ms, rows returned, and cache hit ratio. Use this to find " +
       "slow queries worth optimizing.\n" +
       "`calls` and `total_time_ms` are cumulative since the last `pg_stat_statements_reset()`, so " +
@@ -176,7 +195,7 @@ export const statsTools = [
     outputSchema: z.object({
       rows: z.array(
         z.object({
-          query: z.string().describe("Normalized text: constants replaced with `?`."),
+          query: z.string().describe("Normalized text: constants replaced with `$1`, `$2`, ..."),
           calls: z.string().describe("Bigint as a decimal string."),
           total_time_ms: z.number(),
           mean_time_ms: z.number(),
@@ -224,8 +243,9 @@ export const statsTools = [
         limit?: number;
       };
 
-      // Single probe answers BOTH "is the extension installed?" (no rows -> no)
-      // AND "what's the extversion?" (used to pick column names below). Saves
+      // Single probe answers "is the extension installed?" (no rows -> no),
+      // "what's the extversion?" (used to pick column names below) AND "which
+      // schema holds its views?" (see statementsRelation). Saves
       // a round-trip vs. issuing EXISTS and SELECT extversion separately --
       // the actual stats query is still a second round-trip, but it has to be
       // since the column names are dynamic.
@@ -233,8 +253,9 @@ export const statsTools = [
       // Column names changed in Postgres 13 (pg_stat_statements 1.8):
       // `total_time` -> `total_exec_time`, `mean_time` -> `mean_exec_time`,
       // etc. We pick the right column names from the version below.
-      const versionRes = await runInternal<{ version: string }>(
-        `SELECT extversion AS version FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
+      const versionRes = await runInternal<{ version: string; schema?: string | null }>(
+        `SELECT extversion AS version, extnamespace::regnamespace::text AS schema
+           FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements'`,
       );
       if (!versionRes.ok) return versionRes;
       if (!versionRes.data || versionRes.data.length === 0) {
@@ -247,6 +268,7 @@ export const statsTools = [
         };
       }
       const extVersion = versionRes.data[0]?.version ?? "0";
+      const extSchema = versionRes.data[0]?.schema;
       const useExecSuffix = compareVersions(extVersion, "1.8") >= 0;
       const totalCol = useExecSuffix ? "total_exec_time" : "total_time";
       const meanCol = useExecSuffix ? "mean_exec_time" : "mean_time";
@@ -270,15 +292,19 @@ export const statsTools = [
       // SELECT below aliases `calls::text AS calls`, and postgres resolves
       // `ORDER BY calls` to the output alias FIRST. Sorting text would mean
       // "9" beats "10" lexically. Qualify with the table name so postgres
-      // routes to the source bigint column. The timing columns aren't aliased
-      // back to themselves (they become *_ms), so they need no qualification.
+      // routes to the source bigint column (the bare relation name still
+      // resolves when the FROM entry is schema-qualified). The timing columns
+      // aren't aliased back to themselves (they become *_ms), so they need no
+      // qualification.
       const orderCol =
         orderBy === "total_time" ? totalCol : orderBy === "mean_time" ? meanCol : "pg_stat_statements.calls";
 
       // Gated, not tried-and-caught: pg_stat_statements_info does not exist
       // below extension 1.9, and naming a missing view is SQLSTATE 42P01, which
       // takes the whole tool down instead of just costing the reset context.
-      const infoSql = hasStatementsInfo(extVersion) ? STATEMENTS_STATS_RESET_SQL : null;
+      const infoSql = hasStatementsInfo(extVersion)
+        ? statementsStatsResetSql(statementsRelation(extSchema, "pg_stat_statements_info"))
+        : null;
 
       // Two queries on one connection -- see api.ts:withSharedClient. The info
       // probe deliberately runs even when the ranking comes back empty: "no
@@ -315,7 +341,7 @@ export const statsTools = [
              THEN (shared_blks_hit::float8 / (shared_blks_hit + shared_blks_read) * 100)::numeric(5, 2)::float8
              ELSE NULL
            END AS hit_percent${ioTimingCols}
-         FROM pg_stat_statements
+         FROM ${statementsRelation(extSchema, "pg_stat_statements")}
          WHERE dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
          ORDER BY ${orderCol} DESC NULLS LAST
          LIMIT $1`,
@@ -445,6 +471,10 @@ export const statsTools = [
             last_seq_scan?: string | null;
             last_idx_scan?: string | null;
           }>(
+            // ratio is round()ed, not cast to numeric(10, 2): that cast caps
+            // the value below 10^8 and raises 22003 past it, which failed the
+            // whole tool on the most extreme seq-scan offender (10^8 seq scans
+            // against one index scan) -- the row this tool exists to find.
             `SELECT
                schemaname AS schema,
                relname AS "table",
@@ -454,7 +484,7 @@ export const statsTools = [
                seq_tup_read::text AS seq_tup_read,
                CASE
                  WHEN COALESCE(idx_scan, 0) = 0 THEN NULL
-                 ELSE (seq_scan::numeric / idx_scan)::numeric(10, 2)::float8
+                 ELSE round(seq_scan::numeric / idx_scan, 2)::float8
                END AS ratio${tableLastScanCols(serverVersion)}
              FROM pg_catalog.pg_stat_user_tables
              WHERE n_live_tup >= $1
@@ -488,9 +518,9 @@ export const statsTools = [
       "unknown and the counts prove nothing. This list is only trustworthy once the reset age " +
       "comfortably exceeds the slowest cycle that could use the index - a monthly report, a " +
       "quarterly close, a yearly job, a failover-only query path.\n" +
-      "PRIMARY KEY and UNIQUE indexes are already excluded from these results: they enforce a " +
-      "constraint and stay load-bearing at zero scans, so they never appear here and their " +
-      "absence is not evidence of anything.\n" +
+      "PRIMARY KEY, UNIQUE and EXCLUDE-constraint indexes are already excluded from these " +
+      "results: they enforce a constraint and stay load-bearing at zero scans, so they never " +
+      "appear here and their absence is not evidence of anything.\n" +
       "On PostgreSQL 16+ each row also carries `last_idx_scan`, the timestamp of the most " +
       "recent scan (null = never scanned since the reset). 'Not scanned since 2026-02-14' is a " +
       "far better basis for a decision than a bare count.\n" +
@@ -582,6 +612,7 @@ export const statsTools = [
              WHERE s.idx_scan <= $1
                AND NOT i.indisunique
                AND NOT i.indisprimary
+               AND NOT i.indisexclusion
                ${schemaFilter}
              ORDER BY pg_relation_size(s.indexrelid) DESC
              LIMIT $2`,

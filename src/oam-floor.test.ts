@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { after, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { after, before, describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Ported from aws-mcp's src/oam-floor.test.ts. Authored in src/, executed from
 // dist/, so one hop up from import.meta.url reaches the repo root in both
@@ -172,5 +172,54 @@ describe("check-oam-floor catches drift", () => {
     const r = runChecker(root);
     assert.notEqual(r.code, 0, r.out);
     assert.match(r.out, /OAM_MIN/);
+  });
+});
+
+describe("scripts/lib/versions.mjs", () => {
+  const LIB = join(repoRoot, "scripts", "lib", "versions.mjs");
+  let lib: {
+    parseVersion: (text: unknown) => [number, number, number] | null;
+    compareVersions: (a: number[], b: number[]) => number;
+    isMainModule: (argv1: string | undefined, moduleUrl: string) => boolean;
+  };
+  before(async () => {
+    // A computed specifier keeps tsc from resolving the untyped .mjs.
+    lib = await import(pathToFileURL(LIB).href);
+  });
+
+  it("parses a leading version, with or without a v, from strings and non-strings", () => {
+    assert.deepEqual(lib.parseVersion(" v0.21.1-rc.1 "), [0, 21, 1]);
+    assert.deepEqual(lib.parseVersion("1.1.16"), [1, 1, 16]);
+    // One copy called text.trim() and threw here; the shared one coerces.
+    assert.equal(lib.parseVersion(undefined), null);
+    assert.equal(lib.parseVersion("version 1.2.3"), null);
+  });
+
+  it("compares numerically, not as strings", () => {
+    assert.equal(lib.compareVersions([0, 10, 0], [0, 9, 9]), 1);
+    assert.equal(lib.compareVersions([0, 9, 9], [0, 10, 0]), -1);
+    assert.equal(lib.compareVersions([1, 1, 16], [1, 1, 16]), 0);
+  });
+
+  it("matches the main module through a junction, and nothing else", () => {
+    const linkParent = mkdtempSync(join(tmpdir(), "postgres-mcp-lib-link-"));
+    dirs.push(linkParent);
+    const link = join(linkParent, "lib");
+    symlinkSync(join(repoRoot, "scripts", "lib"), link, process.platform === "win32" ? "junction" : "dir");
+    const url = pathToFileURL(LIB).href;
+    assert.equal(lib.isMainModule(join(link, "versions.mjs"), url), true);
+    assert.equal(lib.isMainModule(LIB, url), true);
+    assert.equal(lib.isMainModule(undefined, url), false);
+    assert.equal(lib.isMainModule(CHECKER, url), false);
+  });
+
+  it("is the only copy: the three release scripts import it instead of carrying their own", () => {
+    // The copies had already drifted apart once (see the non-string case above).
+    for (const name of ["check-oam-floor.mjs", "check-yaw-mcp-floor.mjs", "update-manifests.mjs"]) {
+      const src = readFileSync(join(repoRoot, "scripts", name), "utf8");
+      assert.match(src, /from ["']\.\/lib\/versions\.mjs["']/, `${name} must import scripts/lib/versions.mjs`);
+      assert.doesNotMatch(src, /function (parseVersion|compareVersions|isMainModule|invokedDirectly)\b/, name);
+      assert.doesNotMatch(src, /realpathSync/, `${name} compares main-module paths itself`);
+    }
   });
 });

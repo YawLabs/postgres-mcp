@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { isWritesAllowed, runReadOnly, runReadWrite } from "../api.js";
+import { warningsField } from "./output.js";
 import { paramsArray } from "./params.js";
 
 /**
@@ -8,11 +9,12 @@ import { paramsArray } from "./params.js";
  * in this file return it unchanged, so they share one schema -- two copies
  * would drift apart the first time a field is added to one of them.
  *
- * `command` and `truncated` are optional because `toQueryResult` SPREADS them
- * in conditionally: `command` is omitted on the cursor path (there the tag
- * describes the FETCH, not the user's statement) and `truncated` appears only
- * when the row cap actually bit. Neither is ever null, so modelling them as
- * nullable would advertise a value the code cannot produce.
+ * `command`, `truncated` and `_warnings` are optional because `toQueryResult`
+ * SPREADS them in conditionally: `command` is omitted on the cursor path (there
+ * the tag describes the FETCH, not the user's statement), `truncated` appears
+ * only when the row cap actually bit, and `_warnings` only when columns share a
+ * name. None is ever null, so modelling them as nullable would advertise a
+ * value the code cannot produce.
  */
 const queryResultOutput = z.object({
   rows: z
@@ -48,6 +50,12 @@ const queryResultOutput = z.object({
     .boolean()
     .optional()
     .describe("Present and true only when the result hit POSTGRES_MAX_ROWS and rows were dropped."),
+  // Not the multi-query partial-failure channel warningsField documents, but
+  // the same key and shape: present only when there is something to say.
+  _warnings: warningsField.describe(
+    "Present only when result columns share a name: each row then holds only the last column of " +
+      "that name. Alias the columns and re-run.",
+  ),
 });
 
 export const queryTools = [
@@ -108,7 +116,10 @@ export const queryTools = [
       "null, arrays (for postgres arrays / ANY), or objects (for json/jsonb columns). Dates and " +
       "UUIDs can be passed as ISO strings. Large result sets are truncated to " +
       "POSTGRES_MAX_ROWS (default 1000) with a `truncated: true` flag; a result over " +
-      "POSTGRES_MAX_RESULT_BYTES fails instead. Session state does not carry over between calls.",
+      "POSTGRES_MAX_RESULT_BYTES fails instead. Session state does not carry over between calls. " +
+      "Every statement runs inside a transaction block, with or without `ALLOW_WRITES`, so " +
+      "statements that refuse one (VACUUM, CREATE INDEX CONCURRENTLY, CREATE DATABASE, " +
+      "ALTER SYSTEM) cannot be run through this tool; use psql or a migration tool for those.",
     annotations: {
       title: "Run SQL query",
       readOnlyHint: false, // conditionally destructive based on role + ALLOW_WRITES

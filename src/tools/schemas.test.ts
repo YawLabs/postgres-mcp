@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it } from "node:test";
-import pg from "pg";
-import { shutdown } from "../api.js";
+import { describe, it } from "node:test";
+import { stubClient, stubConnect, stubPoolQuery, useStubbedPool } from "../test-helpers/pool-stub.js";
 import { schemaTools } from "./schemas.js";
 
 const pgDescribeTable = schemaTools.find((t) => t.name === "pg_describe_table")!;
@@ -66,7 +65,6 @@ function rowsFor(sql: string): Record<string, unknown>[] {
     case "kind":
       return [{ kind: "table" }];
     case "columns":
-      // Non-empty or the handler short-circuits to "Table ... not found."
       // The PG18-only column is mirrored the way the server would: present
       // only when the handler actually named it.
       return [
@@ -113,63 +111,42 @@ function groupByOf(sql: string): string | null {
 }
 
 describe("pg_describe_table version gating (stubbed connect, no live DB)", () => {
-  const originalConnect = pg.Pool.prototype.connect;
-  const originalQuery = pg.Pool.prototype.query;
-  const originalDbUrl = process.env.DATABASE_URL;
   let seen: { sql: string; params: unknown[] }[] = [];
 
   /**
    * @param versionNum server_version_num the probe reports; `null` makes the
    *   probe reject, exercising getServerVersionNum's "assume oldest" 0.
+   * @param overrides per-sub-query replacements for rowsFor: rows to return
+   *   instead, or an Error for the sub-query to throw.
    */
-  function installStub(versionNum: number | null) {
+  function installStub(
+    versionNum: number | null,
+    overrides: Partial<Record<DescribeQuery, Record<string, unknown>[] | Error>> = {},
+  ) {
     seen = [];
-    pg.Pool.prototype.query = function queryStub(this: pg.Pool, sql: unknown) {
-      if (versionNum === null) return Promise.reject(new Error("version probe unavailable"));
-      const text = typeof sql === "string" ? sql : "";
-      return Promise.resolve({ rows: text.includes("server_version_num") ? [{ v: String(versionNum) }] : [] });
-    } as unknown as typeof pg.Pool.prototype.query;
+    stubPoolQuery(async (text) => {
+      if (versionNum === null) throw new Error("version probe unavailable");
+      return { rows: text.includes("server_version_num") ? [{ v: String(versionNum) }] : [] };
+    });
 
-    const client = {
-      async query(sql: string, params: unknown[] = []) {
-        seen.push({ sql, params });
-        return { rows: rowsFor(sql) };
-      },
-      release() {
-        /* no-op */
-      },
-      // acquireClient() attaches an 'error' listener for the checked-out lifetime.
-      on() {
-        return this;
-      },
-      removeListener() {
-        return this;
-      },
-    };
-    pg.Pool.prototype.connect = function connectStub(this: pg.Pool) {
-      return Promise.resolve(client);
-    } as unknown as typeof pg.Pool.prototype.connect;
+    const client = stubClient(async (sql: string, params: unknown[] = []) => {
+      seen.push({ sql, params });
+      const override = overrides[categorize(sql)];
+      if (override instanceof Error) throw override;
+      return { rows: override ?? rowsFor(sql) };
+    });
+    stubConnect(() => client);
   }
 
   function sqlFor(category: DescribeQuery): string {
     return seen.find((q) => categorize(q.sql) === category)?.sql ?? "";
   }
 
-  beforeEach(async () => {
-    // shutdown() clears the process-wide server_version_num cache, so each
-    // case's stubbed version is actually probed instead of reusing whatever
-    // the previous case (or a sibling suite in this runner) published.
-    await shutdown();
-    process.env.DATABASE_URL = "postgres://stub-host/stubdb";
-  });
-
-  afterEach(async () => {
-    pg.Pool.prototype.connect = originalConnect;
-    pg.Pool.prototype.query = originalQuery;
-    await shutdown();
-    if (originalDbUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = originalDbUrl;
-  });
+  // The shutdown() on the way in clears the process-wide server_version_num
+  // cache, so each case's stubbed version is actually probed instead of
+  // reusing whatever the previous case (or a sibling suite in this runner)
+  // published.
+  useStubbedPool();
 
   it("issues exactly the nine documented fanout sub-queries", async () => {
     installStub(180_000);
@@ -274,6 +251,92 @@ describe("pg_describe_table version gating (stubbed connect, no live DB)", () =>
     assert.match(sql, /con\.conenforced AS enforced/);
     assert.doesNotMatch(sql, /array_agg\(/);
     assert.equal(groupByOf(sql), null);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Foreign keys and partitioning. A foreign key that references a
+  // partitioned table is stored as the declared pg_constraint row plus one
+  // internal clone per referenced partition, so an unfiltered contype = 'f'
+  // scan reports a 500-partition reference as 501 foreign keys. The stub
+  // cannot hold a catalog, so these pin the predicates; the row counts are
+  // pinned against a server in schemas.integration.test.ts.
+  // ───────────────────────────────────────────────────────────────────────
+
+  for (const version of [150_000, 180_000]) {
+    it(`PG${version / 10_000}: foreign_keys drops the per-partition clones of a reference to a partitioned table`, async () => {
+      installStub(version);
+      await pgDescribeTable.handler({ table: "t" });
+      const sql = sqlFor("foreignKeys");
+      // A clone's parent constraint sits on the SAME referencing table.
+      assert.match(
+        sql,
+        /NOT EXISTS \(\s*SELECT 1 FROM pg_catalog\.pg_constraint parent\s+WHERE parent\.oid = con\.conparentid AND parent\.conrelid = con\.conrelid\s*\)/,
+      );
+      // Not `conparentid = 0`: a partition's own copy of its parent's foreign
+      // key has a parent too (on the partitioned table) and is the real
+      // constraint on that partition -- filtering it would empty the list.
+      assert.doesNotMatch(sql, /con\.conparentid = 0/);
+    });
+
+    it(`PG${version / 10_000}: referenced_by lists declared constraints, reaching a partition through its ancestors`, async () => {
+      installStub(version);
+      await pgDescribeTable.handler({ table: "t" });
+      const sql = sqlFor("referencedBy");
+      assert.match(sql, /AND con\.conparentid = 0/);
+      assert.match(sql, /pg_catalog\.pg_partition_ancestors\(ref\.oid\)/);
+      // pg_partition_ancestors returns nothing for a relation outside any
+      // partition tree, so without the relation itself in the set every
+      // ordinary table would lose its whole referenced_by list.
+      assert.match(sql, /SELECT ref\.oid AS relid\s+UNION\s+SELECT anc\.relid::oid/);
+      assert.match(sql, /JOIN pg_catalog\.pg_constraint con ON con\.confrelid = target\.relid/);
+    });
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Existence. `CREATE TABLE t ()` is legal, as is a table whose columns were
+  // all dropped, so an empty column list is not "no such table" -- the
+  // pg_class row is.
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("describes an existing zero-column table instead of reporting it as not found", async () => {
+    installStub(180_000, { columns: [] });
+    const res = (await pgDescribeTable.handler({ table: "t" })) as DescribeResponse;
+    assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
+    assert.deepEqual(res.data?.columns, []);
+    assert.equal(res.data?.kind, "table");
+    assert.equal(res.data?._warnings, undefined);
+  });
+
+  it("reports 'not found' when pg_class has no such relation", async () => {
+    installStub(180_000, { kind: [], columns: [] });
+    const res = (await pgDescribeTable.handler({ schema: "s", table: "t" })) as DescribeResponse;
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'Table "s"."t" not found.');
+  });
+
+  it("falls back to the column list for existence when the kind fetch itself fails", async () => {
+    installStub(180_000, { kind: new Error("permission denied") });
+    const described = (await pgDescribeTable.handler({ table: "t" })) as DescribeResponse;
+    assert.equal(described.ok, true);
+    assert.match((described.data?._warnings ?? []).join("\n"), /kind fetch failed, reported as "table"/);
+
+    installStub(180_000, { kind: new Error("permission denied"), columns: [] });
+    const missing = (await pgDescribeTable.handler({ table: "t" })) as DescribeResponse;
+    assert.equal(missing.ok, false);
+    assert.match(missing.error ?? "", /not found/);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // The description is the only thing an agent reads before calling. It used
+  // to file `validated` under "PostgreSQL 18+", so an agent on PG15-17 had no
+  // reason to look at the one field that flags a NOT VALID constraint there.
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("the description says `validated` is reported on every version, not only on PG18+", () => {
+    const description = pgDescribeTable.description;
+    assert.match(description, /report `validated` on every version/);
+    assert.doesNotMatch(description, /18\+ constraints also report `validated`/);
+    assert.match(description, /On PostgreSQL 18\+ they also report `enforced` \/ `has_period`/);
   });
 
   // ───────────────────────────────────────────────────────────────────────

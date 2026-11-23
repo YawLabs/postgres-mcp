@@ -5,6 +5,7 @@ import {
   PG16,
   PG18,
   runInternal,
+  type SharedRunnerResult,
   TERMINATE_OWN_BACKEND_SQL,
   withSharedClient,
 } from "../api.js";
@@ -78,6 +79,11 @@ type OnTransactionLost = (error: string | undefined) => void;
  * search that converged on nothing (measured: a socket death during the only
  * candidate's hypopg_create_index). A statement that already ran keeps its
  * result even when the RELEASE after it fails.
+ *
+ * The STATEMENT's result is handed back as the runner produced it, SQLSTATE
+ * (`code`) included, so a caller that branches on which error it was reads the
+ * structured code rather than the formatted text. A refused SAVEPOINT returns
+ * no code at all: it says nothing about the statement, which never ran.
  */
 async function runIsolated<R extends Record<string, unknown>>(
   run: SharedRunner,
@@ -85,7 +91,7 @@ async function runIsolated<R extends Record<string, unknown>>(
   params: unknown[] = [],
   options?: Parameters<SharedRunner>[2],
   onLost?: OnTransactionLost,
-): Promise<ApiResponse<R[]>> {
+): Promise<SharedRunnerResult<R>> {
   const sp = await run(`SAVEPOINT ${ADVISOR_SAVEPOINT}`);
   if (!sp.ok) {
     onLost?.(sp.error);
@@ -187,10 +193,16 @@ export interface IndexCandidate {
   /**
    * True when the LEADING column appears in at least one filter or join
    * predicate somewhere in the workload. False means the leading column is only
-   * ever an ORDER BY / GROUP BY key -- which is what the PG18 skip-scan gate
-   * turns on. See {@link applySkipScanGate}.
+   * ever an ORDER BY / GROUP BY key -- half of what the PG18 skip-scan gate
+   * turns on. See {@link requiresSkipScan}.
    */
   leadingConstrained: boolean;
+  /**
+   * True when a column AFTER the leading one appears in a filter or join
+   * predicate. The other half of the gate: an unconstrained leading column is
+   * only a problem when something behind it has to be searched.
+   */
+  trailingConstrained: boolean;
   /** Indices into the workload array for statements whose plan touched this relation. */
   statements: number[];
   /** Sequential scans on this table since the last stats reset; orders the candidate list. */
@@ -307,10 +319,13 @@ export function extractIdentifiers(condition: string): string[] {
  *
  * A heuristic, and labelled as one: it looks for the column token immediately
  * beside a comparison operator on either side, so both `col > x` and `x < col`
- * read as a range. When no operator sits next to the token -- the column
- * appears inside a function call, a CASE, or an operator this does not know --
- * it returns "equality", because equality is the placement that costs least
- * when wrong. An equality column sits in the key prefix, where a btree can
+ * read as a range. "Beside" allows for how VERBOSE -- which this tool always
+ * passes -- actually renders a column: alias-qualified, and wrapped in a cast
+ * whenever the comparison needed one, so the real shapes are `(5 < u.age)` and
+ * `((u.name)::text > 'm'::text)`. When no operator sits next to the token --
+ * the column appears inside a function call, a CASE, or an operator this does
+ * not know -- it returns "equality", because equality is the placement that
+ * costs least when wrong. An equality column sits in the key prefix, where a btree can
  * still use it for a range scan; mis-labelling a true equality column as a
  * range would push every later column past the index's first inequality and
  * make them unsearchable.
@@ -327,9 +342,27 @@ export function classifyRole(column: string, condition: string): "equality" | "r
   // alternative matches its second (which is how `'x' <> col` slipped through
   // as a range even after the `<` was guarded). `<=` and `>=` are listed first
   // so the alternation prefers them over the guarded single-character forms.
-  const rangeOps = "(?:<=|>=|<(?!>)|(?<!<)>|~~)";
-  if (new RegExp(`${token}\\s*${rangeOps}`).test(condition)) return "range";
-  if (new RegExp(`${rangeOps}\\s*${token}`).test(condition)) return "range";
+  //
+  // The same prefix trap applies to every longer operator that starts or ends
+  // with one of these characters, and the cast tail below reaches them for any
+  // cast column: `~~*` (ILIKE, which a btree cannot bound) starts with `~~`,
+  // `<@`/`<<`/`<->`/`<%` start with `<`, `@>`/`>>`/`->`/`%>` end with `>`, and
+  // `<<=`/`>>=` contain `<=`/`>=`. Each alternative is therefore fenced on both
+  // sides against the characters that would make it part of a longer operator.
+  // A `-` after `>` is NOT fenced, so a bare negative bound (`n > -5`) still
+  // reads as a range; VERBOSE quotes it as `'-5'` anyway.
+  const rangeOps =
+    "(?:(?<![<&|])<=(?!>)|(?<![>])>=|(?<![<&|])<(?![<>@\\-^#+~%|=])|(?<![<>@\\-#=~+%|&])>(?![>^|=])|(?<![!~])~~(?!\\*))";
+  // `(u.name)::text`, `((u.n)::text)::bigint`: each closing paren must carry a
+  // cast, so the paren that closes a FUNCTION call (`lower(u.name) > 'm'`, which
+  // a plain btree on the column cannot bound) still reads as "no operator here".
+  const typeName = '[A-Za-z_"][\\w$."]*(?: [A-Za-z_][\\w$]*)*(?:\\([\\d, ]*\\))?(?:\\[\\])*';
+  const castTail = `(?:\\)::${typeName})*`;
+  // The alias VERBOSE puts in front of every column, and the paren(s) a cast
+  // opens in front of that.
+  const qualifier = '(?:(?:"(?:[^"]|"")*"|[A-Za-z_][\\w$]*)\\.)?';
+  if (new RegExp(`${token}${castTail}\\s*${rangeOps}`).test(condition)) return "range";
+  if (new RegExp(`${rangeOps}\\s*\\(*${qualifier}${token}`).test(condition)) return "range";
   if (new RegExp(`${token}\\s+BETWEEN\\b`, "i").test(condition)) return "range";
   return "equality";
 }
@@ -523,7 +556,14 @@ export function normalizeDistinct(nDistinct: number | null, reltuples: number | 
  * index narrows fastest at its root. Then AT MOST ONE range column -- a btree
  * cannot search past its first inequality, so a second range column adds bytes
  * and buys nothing. Sort columns come last, where they can still serve an ORDER
- * BY that follows the filtered prefix.
+ * BY that follows the filtered prefix -- in the order the planner reported
+ * them, NOT by selectivity: a btree on (b, a) cannot serve ORDER BY a, b, so
+ * reordering them builds an index for a different query.
+ *
+ * `sortOrder` is the order to lay the sort columns in: one statement's own
+ * harvest order, so a key merged from several statements can still follow each
+ * statement's ORDER BY. Sort columns it does not name follow in `columns`'
+ * order. Absent, the sort columns keep `columns`' order.
  *
  * A column that appeared in several roles is placed by its strongest one
  * (equality, then range, then sort), because that is the position from which
@@ -533,6 +573,7 @@ export function orderCandidateColumns(
   columns: Map<string, Set<PredicateRole>>,
   stats: Map<string, ColumnStats>,
   maxColumns: number,
+  sortOrder: Iterable<string> = [],
 ): string[] {
   const equality: string[] = [];
   const range: string[] = [];
@@ -552,8 +593,14 @@ export function orderCandidateColumns(
   };
   equality.sort(bySelectivity);
   range.sort(bySelectivity);
-  sort.sort(bySelectivity);
-  return [...equality, ...range.slice(0, 1), ...sort].slice(0, maxColumns);
+  // `sort` keeps its first-seen order: the Map preserves insertion order, and
+  // harvestPlanPredicates records a Sort Key's entries in array order. Columns
+  // `sortOrder` names move to the front, in its order.
+  const sortOnly = new Set(sort);
+  const leading = [...new Set(sortOrder)].filter((column) => sortOnly.has(column));
+  const placed = new Set(leading);
+  const ordered = [...leading, ...sort.filter((column) => !placed.has(column))];
+  return [...equality, ...range.slice(0, 1), ...ordered].slice(0, maxColumns);
 }
 
 /**
@@ -576,7 +623,19 @@ export function orderCandidateColumns(
  * Single-column candidates are never pruned: their leading column IS the only
  * column, and if it was harvested at all it came from a predicate or an
  * ordering the index can serve directly.
+ *
+ * Neither is a candidate made ONLY of ordering columns. An (a, b) btree serves
+ * ORDER BY a, b by being read in order, on every version, with nothing to skip
+ * over; the rule is about a filtered column stuck BEHIND an unfiltered one.
+ * {@link orderCandidateColumns} always places filtered columns first, so today
+ * the generator produces no candidate this gate prunes -- it guards the rule
+ * for the day a skip-scan shape is generated on purpose.
  */
+export function requiresSkipScan(candidate: IndexCandidate): boolean {
+  return candidate.columns.length > 1 && !candidate.leadingConstrained && candidate.trailingConstrained;
+}
+
+/** Apply the version gate described on {@link requiresSkipScan}. */
 export function applySkipScanGate(
   candidates: IndexCandidate[],
   serverVersionNum: number,
@@ -589,10 +648,60 @@ export function applySkipScanGate(
   const kept: IndexCandidate[] = [];
   const pruned: IndexCandidate[] = [];
   for (const candidate of candidates) {
-    if (candidate.columns.length <= 1 || candidate.leadingConstrained) kept.push(candidate);
-    else pruned.push(candidate);
+    if (requiresSkipScan(candidate)) pruned.push(candidate);
+    else kept.push(candidate);
   }
   return { kept, pruned };
+}
+
+/** `pg_index.indoption` for a key column that is ASC NULLS LAST, the btree default. */
+const INDOPTION_ASC_NULLS_LAST = 0;
+/** DESC (1) + NULLS FIRST (2): the default for a DESC column, and the exact mirror of the above. */
+const INDOPTION_DESC_NULLS_FIRST = 3;
+
+/**
+ * The leading key columns of an EXISTING btree index that a candidate on the
+ * same columns would only duplicate.
+ *
+ * Every candidate this tool generates is a plain, whole-table btree with every
+ * column ASC NULLS LAST, so an existing index stands in for one only as far as
+ * it is the same thing:
+ *
+ * - A PARTIAL index covers none of it. It holds only the rows its predicate
+ *   admits, and a query that does not imply that predicate cannot use it.
+ * - An expression position ends the prefix: `indkey` is 0 there, which the
+ *   query renders as null, and the columns AFTER it are no longer at the key
+ *   position the prefix claims.
+ * - A change of direction ends the prefix too. A btree read backward serves
+ *   the mirror ordering, so all-ASC and all-DESC (with their default NULLS
+ *   placement) are interchangeable -- but (a, b DESC) cannot return ORDER BY
+ *   a, b, and neither can a column whose NULLS placement was flipped.
+ * - A non-default operator class or collation ends the prefix as well.
+ *   `plain[position]` is false there: (email text_pattern_ops) answers `=` but
+ *   neither `email > 'm'` nor ORDER BY email, and (email COLLATE "C") orders by
+ *   a different collation than the column's own. Counting either as covering
+ *   would drop the plain candidate before it is ever costed, silently hiding a
+ *   recommendation; ending the prefix costs at most one EXPLAIN on a candidate
+ *   HypoPG then declines. A position `plain` does not reach reads as default,
+ *   the behaviour before it was read.
+ */
+export function coveredIndexPrefix(
+  columns: readonly (string | null)[],
+  options: readonly (number | null)[],
+  partial: boolean,
+  plain: readonly (boolean | null)[] = [],
+): string[] {
+  if (partial) return [];
+  const lead = options[0] ?? INDOPTION_ASC_NULLS_LAST;
+  if (lead !== INDOPTION_ASC_NULLS_LAST && lead !== INDOPTION_DESC_NULLS_FIRST) return [];
+  const covered: string[] = [];
+  for (const [position, column] of columns.entries()) {
+    if (typeof column !== "string") break;
+    if ((options[position] ?? INDOPTION_ASC_NULLS_LAST) !== lead) break;
+    if (plain[position] === false) break;
+    covered.push(column);
+  }
+  return covered;
 }
 
 /** Stable key for de-duplicating candidates and matching them against existing indexes. */
@@ -610,8 +719,9 @@ function candidateKey(schema: string, table: string, columns: string[]): string 
  * Generating the prefixes is what lets the greedy search choose.
  *
  * `existingIndexPrefixes` holds, for every real btree index on the table, the
- * key columns of each of its prefixes -- so a candidate an existing index
- * already covers is dropped before it costs an EXPLAIN.
+ * key columns of each prefix it genuinely covers (see
+ * {@link coveredIndexPrefix}) -- so a candidate an existing index already
+ * covers is dropped before it costs an EXPLAIN.
  */
 export function buildCandidates(options: {
   /** Per-statement harvest, indexed the same as the workload array. */
@@ -651,28 +761,40 @@ export function buildCandidates(options: {
   const seen = new Set<string>();
   for (const [key, predicates] of merged) {
     const stats = columnStats.get(key) ?? new Map<string, ColumnStats>();
-    const ordered = orderCandidateColumns(predicates.columns, stats, maxIndexColumns);
-    if (ordered.length === 0) continue;
     const statements = [...(touchedBy.get(key) ?? [])].sort((a, b) => a - b);
-    for (let width = 1; width <= ordered.length; width++) {
-      const columns = ordered.slice(0, width);
-      const dedupeKey = candidateKey(predicates.schema, predicates.table, columns);
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-      // An existing index whose key STARTS with these columns already answers
-      // everything this candidate would. Checking prefixes rather than exact
-      // equality is what catches "you already have (a, b), stop proposing (a)".
-      if (existingIndexPrefixes.has(dedupeKey)) continue;
-      const leadColumn = columns[0];
-      const leadRoles = leadColumn === undefined ? undefined : predicates.columns.get(leadColumn);
-      candidates.push({
-        schema: predicates.schema,
-        table: predicates.table,
-        columns,
-        leadingConstrained: leadRoles !== undefined && (leadRoles.has("equality") || leadRoles.has("range")),
-        statements,
-        seqScans: seqScans.get(key) ?? 0,
-      });
+    // One key per statement's own sort order. The merged Map holds sort columns
+    // in first-seen order ACROSS the workload, so ORDER BY b in one statement
+    // and ORDER BY a, b in the next would otherwise only ever yield (b, a),
+    // which serves neither the second statement's ORDER BY nor the order the
+    // description promises. Statements that agree produce the same key, and the
+    // `seen` check folds those together.
+    const orderings = statements.map((index) =>
+      orderCandidateColumns(predicates.columns, stats, maxIndexColumns, perStatement[index]?.get(key)?.columns.keys()),
+    );
+    for (const ordered of orderings) {
+      for (let width = 1; width <= ordered.length; width++) {
+        const columns = ordered.slice(0, width);
+        const dedupeKey = candidateKey(predicates.schema, predicates.table, columns);
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
+        // An existing index whose key STARTS with these columns already answers
+        // everything this candidate would. Checking prefixes rather than exact
+        // equality is what catches "you already have (a, b), stop proposing (a)".
+        if (existingIndexPrefixes.has(dedupeKey)) continue;
+        const constrained = (column: string | undefined): boolean => {
+          const roles = column === undefined ? undefined : predicates.columns.get(column);
+          return roles !== undefined && (roles.has("equality") || roles.has("range"));
+        };
+        candidates.push({
+          schema: predicates.schema,
+          table: predicates.table,
+          columns,
+          leadingConstrained: constrained(columns[0]),
+          trailingConstrained: columns.slice(1).some(constrained),
+          statements,
+          seqScans: seqScans.get(key) ?? 0,
+        });
+      }
     }
   }
 
@@ -690,10 +812,16 @@ export function buildCandidates(options: {
   return candidates;
 }
 
-/** Render the CREATE INDEX a human can paste, with a generated name. */
+/**
+ * Render the CREATE INDEX a human can paste, with a generated name.
+ *
+ * The name keeps letters and digits of ANY script and replaces the rest: it is
+ * emitted quoted, so `é` needs no escaping, and flattening every non-ASCII
+ * letter to `_` gave all the indexes of a non-ASCII-named table the same name.
+ */
 export function renderCreateIndex(candidate: IndexCandidate, concurrently: boolean): string {
   const name = truncateToBytes(
-    `idx_${candidate.table}_${candidate.columns.join("_")}`.replace(/[^A-Za-z0-9_]/g, "_"),
+    `idx_${candidate.table}_${candidate.columns.join("_")}`.replace(/[^\p{L}\p{N}_]/gu, "_"),
     MAX_IDENTIFIER_BYTES,
   );
   const cols = candidate.columns.map(quoteIdent).join(", ");
@@ -804,7 +932,11 @@ export async function greedySearch(options: {
     // workload and noise on a 6-million one, and an absolute floor would have to
     // be re-tuned per database to mean the same thing.
     const improvement = before > 0 ? (before - best.after) / before : 0;
-    if (improvement < minImprovement) break;
+    // The strict-gain half is not redundant with the threshold: `minImprovement`
+    // may legitimately be 0 ("accept any gain"), and 0 < 0 is false, so without
+    // it a candidate that moved nothing would be accepted, round after round,
+    // as a recommendation that helps no statement.
+    if (best.after >= before || improvement < minImprovement) break;
 
     const candidate = remaining[best.position];
     if (!candidate) break;
@@ -850,7 +982,11 @@ export interface ExplainOutcome {
 }
 
 /**
- * SQLSTATE 08P01 (protocol_violation) as `formatPgError` renders it.
+ * SQLSTATE 08P01 (protocol_violation), compared against the runner's structured
+ * `code` -- never searched for in the formatted error text. That text leads
+ * with the server's message, which echoes identifiers out of the statement, so
+ * `SELECT 1 FROM "(code: 08P01)"` fails with 42P01 and a message containing
+ * the very fragment a text match would look for.
  *
  * Reached only from the BIND step of the extended protocol -- "bind message
  * supplies 0 parameters, but prepared statement requires 1". Bind is the LAST
@@ -858,7 +994,7 @@ export interface ExplainOutcome {
  * rejects a multi-statement string. It is therefore positive evidence that the
  * text is a SINGLE statement carrying `$n` placeholders.
  */
-const BIND_COUNT_MISMATCH = /\(code: 08P01\)/;
+const BIND_COUNT_MISMATCH = "08P01";
 
 /**
  * Reject a statement that packs more than one command into one string, before
@@ -917,7 +1053,7 @@ export async function assertSingleStatement(
     return { ok: true, cost, plan };
   }
 
-  if (BIND_COUNT_MISMATCH.test(probe.error ?? "")) {
+  if (probe.code === BIND_COUNT_MISMATCH) {
     // Single statement, placeholders unbound. Safe to plan on the simple
     // protocol, which is the only one GENERIC_PLAN can use.
     return { ok: true };
@@ -1034,18 +1170,26 @@ export const indexAdvisorTools = [
       "deliberately loose (a token matching a real column name on a different table can slip through); " +
       "HypoPG is the arbiter, and anything that does not lower cost is discarded. Column ORDER within " +
       "each candidate is equality columns first (most selective first, from `pg_stats`), then at most " +
-      "one range column, then sort columns.\n" +
+      "one range column, then sort columns in the order the planner sorts by them (one ordering per " +
+      "statement, so two statements that sort the same table differently each get their own). Candidates are " +
+      "plain btree indexes on the relations the plan SCANS, so for a partitioned table they name each " +
+      "leaf partition rather than the parent.\n" +
       "The search is greedy and BOUNDED. Each accepted index stays in place while the rest are " +
       "re-costed on top of it, so later picks account for what earlier ones already fixed. " +
       "`max_candidates` caps how many candidates are considered and `max_explains` caps total EXPLAIN " +
-      "round trips; when a cap stops the search early, `budget_exhausted` is true and the result is a " +
-      "truncated search, not a converged one.\n" +
+      "round trips; when `max_explains` stops the search early, `budget_exhausted` is true and the " +
+      "result is a truncated search, not a converged one. A `max_candidates` truncation is reported in " +
+      "`_warnings` instead.\n" +
       "PostgreSQL 18 note, and it reverses a rule you have probably internalized: PG18 added B-tree " +
       "SKIP SCAN, so a multi-column index whose LEADING column the query never constrains CAN now be " +
       "used. The classic 'leading column never filtered means the index is useless' heuristic is wrong " +
       "on PG18+. This tool gates that prune on the server version -- on PG18+ such candidates are kept " +
       "and costed (`skip_scan_available: true`, and an accepted one carries `requires_skip_scan`), " +
-      "below PG18 they are pruned as unusable and counted in `candidates_pruned_leading_column`.\n" +
+      "below PG18 they are pruned as unusable and counted in `candidates_pruned_leading_column`. An " +
+      "index made only of ORDER BY / GROUP BY columns is not one of them: it is read in order on every " +
+      "version and is never pruned. The generator currently places filtered columns ahead of ordering " +
+      "columns, so it does not itself propose the skip-scan shape; use `pg_explain`'s " +
+      "`hypothetical_indexes` to cost one by hand.\n" +
       "Requires the HypoPG extension (`CREATE EXTENSION hypopg;`). Hypothetical indexes are " +
       "session-scoped and are reset before the call returns, on the success and the failure path " +
       "alike, so they never touch disk and never leak into a later query plan. Statements are only " +
@@ -1142,8 +1286,9 @@ export const indexAdvisorTools = [
           requires_skip_scan: z
             .boolean()
             .describe(
-              "True when the leading column is never constrained by the workload, so this index relies on " +
-                "PostgreSQL 18 skip scan. Never true below PG18, where such candidates are pruned instead.",
+              "True when the leading column is never constrained by the workload but a column behind it is, " +
+                "so this index relies on PostgreSQL 18 skip scan. Never true below PG18, where such " +
+                "candidates are pruned instead, and never true for an index of ordering columns only.",
             ),
           helps_statements: z.array(
             z.object({
@@ -1458,7 +1603,12 @@ export const indexAdvisorTools = [
             // a recommendation.
             const parameterized = /\$\d/.test(statement.sql);
             needsGenericPlan.push(parameterized);
-            if (parameterized && serverVersion < PG16) {
+            // 0 is "the version probe failed", not "older than 16": skipping there
+            // would drop a whole pg_stat_statements workload (every row carries
+            // `$n`) and blame the server's age for it. GENERIC_PLAN is attempted
+            // instead, and a server that really predates it refuses the option
+            // into the ordinary "could not plan" warning.
+            if (parameterized && serverVersion !== 0 && serverVersion < PG16) {
               baselineCosts.push(null);
               rawPlans.push(undefined);
               warnings.push(
@@ -1472,9 +1622,12 @@ export const indexAdvisorTools = [
             // Stacked-query guard, run ONCE per statement rather than per
             // EXPLAIN: the SQL text is fixed for the life of the search, so a
             // statement cleared here stays cleared for every re-costing the
-            // greedy loop does. A rejected statement gets a null baseline, and
-            // every later stage is already gated on that -- `evaluate` skips
-            // any index whose baseline is null -- so it is never sent again.
+            // greedy loop does. A rejected statement gets a null baseline AND no
+            // plan, and the missing plan is what keeps it from ever being sent
+            // again: it harvests to nothing, so no candidate lists it among its
+            // `statements` and `evaluate` is never asked to re-cost it. (The
+            // null-baseline check inside `evaluate` is a second line, not the
+            // mechanism -- do not let a rejected statement acquire a plan.)
             const guard = await assertSingleStatement(run, buildExplainSql(statement.sql, parameterized), onLost);
             if (!guard.ok) {
               baselineCosts.push(null);
@@ -1569,8 +1722,13 @@ export const indexAdvisorTools = [
                FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
-               LEFT JOIN pg_catalog.pg_stats s
-                      ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname
+               LEFT JOIN LATERAL (
+                      SELECT st.n_distinct
+                        FROM pg_catalog.pg_stats st
+                       WHERE st.schemaname = n.nspname AND st.tablename = c.relname AND st.attname = a.attname
+                       ORDER BY st.inherited
+                       LIMIT 1
+                    ) s ON true
               WHERE c.relkind IN ('r', 'p', 'm')
                 AND a.attnum > 0
                 AND NOT a.attisdropped
@@ -1585,6 +1743,12 @@ export const indexAdvisorTools = [
             };
           }
 
+          // One stats row per column, chosen on purpose (the LATERAL above). An
+          // inheritance parent has two -- its own rows (`inherited` false) and
+          // the whole tree's -- and a plain join returned both, leaving the key
+          // order to whichever arrived last. Its own rows win: those are the
+          // rows an index on this table holds. A partitioned table has only
+          // the inherited row, which is then the one taken.
           const knownColumns = new Map<string, Set<string>>();
           const columnStats = new Map<string, Map<string, ColumnStats>>();
           for (const row of colsRes.data ?? []) {
@@ -1614,17 +1778,40 @@ export const indexAdvisorTools = [
           // Isolated because its failure is treated as soft below: the search
           // goes on with a warning, which is only safe if the failure has not
           // aborted the transaction the search runs in.
-          const idxRes = await runIsolated<{ schema: string; table: string; columns: (string | null)[] }>(
+          const idxRes = await runIsolated<{
+            schema: string;
+            table: string;
+            columns: (string | null)[] | null;
+            options: (number | null)[] | null;
+            plain: (boolean | null)[] | null;
+            partial: boolean | null;
+          }>(
             run,
             `SELECT n.nspname AS schema,
                     c.relname  AS "table",
                     ARRAY(
-                      SELECT a.attname
+                      SELECT a.attname::text
                         FROM unnest(i.indkey[0:i.indnkeyatts - 1]) WITH ORDINALITY AS k(attnum, ord)
                         LEFT JOIN pg_catalog.pg_attribute a
                           ON a.attrelid = c.oid AND a.attnum = k.attnum
                        ORDER BY k.ord
-                    ) AS columns
+                    ) AS columns,
+                    ARRAY(
+                      SELECT k.opt::int4
+                        FROM unnest(i.indoption[0:i.indnkeyatts - 1]) WITH ORDINALITY AS k(opt, ord)
+                       ORDER BY k.ord
+                    ) AS options,
+                    ARRAY(
+                      SELECT COALESCE(oc.opcdefault AND k.coll = a.attcollation, false)
+                        FROM unnest(i.indkey[0:i.indnkeyatts - 1],
+                                    i.indclass[0:i.indnkeyatts - 1],
+                                    i.indcollation[0:i.indnkeyatts - 1]) WITH ORDINALITY AS k(attnum, opc, coll, ord)
+                        LEFT JOIN pg_catalog.pg_attribute a
+                          ON a.attrelid = c.oid AND a.attnum = k.attnum
+                        LEFT JOIN pg_catalog.pg_opclass oc ON oc.oid = k.opc
+                       ORDER BY k.ord
+                    ) AS plain,
+                    i.indpred IS NOT NULL AS partial
                FROM pg_catalog.pg_index i
                JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
                JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
@@ -1642,17 +1829,26 @@ export const indexAdvisorTools = [
             for (const row of idxRes.data ?? []) {
               const key = `${row.schema}.${row.table}`;
               if (!relationNames.has(key)) continue;
-              const columns: string[] = [];
-              // An expression index has indkey 0 for the expression position,
-              // which the LEFT JOIN renders as null. Stop at the first null
-              // rather than skipping it: the columns AFTER an expression are no
-              // longer at the key position this prefix claims, so keeping them
-              // would block a candidate the index does not actually cover.
-              for (const column of row.columns ?? []) {
-                if (typeof column !== "string") break;
-                columns.push(column);
-              }
-              // Every PREFIX of an existing key is covered by that index, so
+              // A partial index, an expression position, a change of sort
+              // direction and a non-default opclass or collation (`plain`
+              // false) each limit what the index stands in for; see
+              // coveredIndexPrefix. `partial` is tested with `=== true` so a
+              // row of an unexpected shape reads as "covers" -- the behaviour
+              // before the flag existed -- rather than as partial.
+              //
+              // The `::text` on attname in the query is load-bearing: node-pg
+              // has no parser for `name[]` and hands it back as the literal
+              // string `{status,created_at}`. Read as a list, that string is
+              // its characters, so no existing index ever matched a candidate
+              // (measured against PostgreSQL 18). `text[]` arrives as an array;
+              // anything else is taken to cover nothing.
+              const columns = coveredIndexPrefix(
+                Array.isArray(row.columns) ? row.columns : [],
+                Array.isArray(row.options) ? row.options : [],
+                row.partial === true,
+                Array.isArray(row.plain) ? row.plain : [],
+              );
+              // Every PREFIX of the covered key is covered by that index, so
               // each one blocks a candidate.
               for (let width = 1; width <= columns.length; width++) {
                 existingIndexPrefixes.add(`${row.schema} ${row.table} ${columns.slice(0, width).join(" ")}`);
@@ -1679,8 +1875,8 @@ export const indexAdvisorTools = [
           if (pruned.length > 0) {
             warnings.push(
               `${pruned.length} multi-column candidate(s) were pruned because their leading column is ` +
-                "never constrained by this workload and this server predates PostgreSQL 18 B-tree skip " +
-                "scan, which is what would make such an index usable",
+                "never constrained by this workload while a later one is, and this server predates " +
+                "PostgreSQL 18 B-tree skip scan, which is what would make such an index usable",
             );
           }
           const candidates = kept.slice(0, max_candidates);
@@ -1868,7 +2064,7 @@ export const indexAdvisorTools = [
               workload_cost_reduction_pct: round2(reduction),
               // Only ever true on PG18+: applySkipScanGate removes exactly these
               // candidates below that, so the field cannot contradict the gate.
-              requires_skip_scan: !entry.candidate.leadingConstrained && entry.candidate.columns.length > 1,
+              requires_skip_scan: requiresSkipScan(entry.candidate),
               helps_statements: [...entry.perStatement.entries()]
                 .sort((a, b) => a[0] - b[0])
                 .map(([index, costs]) => ({

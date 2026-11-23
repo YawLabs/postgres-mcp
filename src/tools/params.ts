@@ -20,7 +20,7 @@ export const paramValue: z.ZodType<unknown> = z.lazy(() =>
  * Max nesting depth allowed inside a single parameter value (arrays and
  * objects each count as one level). 32 comfortably exceeds anything a
  * realistic jsonb payload uses while keeping the Zod `.refine` walk
- * cheap and bounding stack use for the iterative depth check below.
+ * cheap.
  */
 export const MAX_PARAM_DEPTH = 32;
 
@@ -47,13 +47,20 @@ function isWithinDepth(value: unknown, maxDepth: number): boolean {
 }
 
 /**
- * Top-level params array with a nesting-depth guard. Zod's recursive parse
- * for `paramValue` will itself eat call stack on deep input -- in practice
- * JSON.parse caps recursion well below Node's stack limit, but a clear
- * validation error here beats a `Maximum call stack size exceeded`
- * RangeError out of the request path. Used in place of
- * `z.array(paramValue).optional()` by `pg_query`, `pg_readonly`, and
- * `pg_explain` so every parameterized tool inherits the cap.
+ * Top-level params array with a nesting-depth guard: a value nested deeper
+ * than MAX_PARAM_DEPTH gets a clear validation error instead of reaching pg.
+ * Used in place of `z.array(paramValue).optional()` by `pg_query`,
+ * `pg_readonly`, and `pg_explain` so every parameterized tool inherits the cap.
+ *
+ * What the refine does NOT do is protect Zod's own parse. A refine runs after
+ * the base schema, and the base schema is the recursive `paramValue`, so Zod
+ * has walked the whole value before the depth is looked at. Measured with zod
+ * 4 on Node 26: nesting of 500 levels still gets the message below, while
+ * 2,000 and more -- which JSON.parse accepts -- throw `RangeError: Maximum
+ * call stack size exceeded` out of the parse and never reach the refine (the
+ * exact depth depends on the stack available). Checking the depth
+ * first needs a pipe (`z.array(z.unknown()).refine(...).pipe(...)`), which
+ * works but changes the published input schema to `items: {}`.
  */
 export const paramsArray = z.array(paramValue).refine((arr) => arr.every((v) => isWithinDepth(v, MAX_PARAM_DEPTH)), {
   message: `Parameter value exceeds maximum nesting depth of ${MAX_PARAM_DEPTH}`,

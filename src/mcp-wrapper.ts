@@ -5,8 +5,8 @@
  * api.ts:ApiResponse). The MCP protocol wants a
  * `{ content, structuredContent?, isError? }` envelope. This module is the
  * single place that translation happens, so the mapping is testable in
- * isolation (index.ts wires it up but cannot be imported under test -- it has a
- * top-level `server.connect`).
+ * isolation (index.ts wires it up but cannot be imported under test -- it
+ * starts the stdio server at module top level, through `serveStdio`).
  *
  * A success carries the payload TWICE: once as `structuredContent` (the typed
  * object the SDK validates against the tool's outputSchema) and once as the
@@ -32,6 +32,7 @@
  * wire, because no unit test of this module can observe it.
  */
 
+import { errorMessage } from "./api.js";
 import { runWithAuditTool } from "./audit.js";
 
 // The SDK's `CallToolResult` carries an index signature (`[x: string]: unknown`)
@@ -58,7 +59,7 @@ type ToolHandler = (input: unknown) => Promise<unknown>;
  * is a LIVE object -- the SDK validates it against the tool's outputSchema and
  * then hands it to the transport to serialize -- while `content` is a string
  * produced here, and a raw handler value can hold things that survive only one
- * of those trips. A bigint is the concrete case: the replacer below renders it
+ * of those trips. A bigint is the concrete case: jsonReplacer renders it
  * as a decimal string in the text, but left in the live object it throws "Do not
  * know how to serialize a BigInt" inside the transport, OUTSIDE this module's
  * try/catch, where nothing is left to shape it into an error envelope. Fields
@@ -76,7 +77,10 @@ type ToolHandler = (input: unknown) => Promise<unknown>;
  *
  * Returns undefined when the payload is neither object nor array. A handler
  * resolving to a bare number/string/boolean has no object form, and inventing a
- * key for it would advertise a shape no tool's outputSchema declares.
+ * key for it would advertise a shape no tool's outputSchema declares. No tool
+ * returns one today, and one that did would be rejected by the SDK: index.ts
+ * registers an outputSchema for every tool, which makes structuredContent
+ * mandatory on a success.
  */
 function toStructuredContent(serialized: string): Record<string, unknown> | undefined {
   const parsed: unknown = JSON.parse(serialized);
@@ -86,12 +90,41 @@ function toStructuredContent(serialized: string): Record<string, unknown> | unde
 }
 
 /**
+ * JSON.stringify replacer for a tool payload: the values JSON has no form for,
+ * rendered the way PostgreSQL writes them instead of crashing or turning into
+ * something else. A `function`, not an arrow: `this` is the holder, and
+ * `this[key]` is the value BEFORE its `toJSON` ran, which is the only place a
+ * Buffer is still recognisable as one.
+ *
+ *   - bigint: JSON.stringify throws on it. pg can hand one back (int8 with a
+ *     custom type parser), so it becomes its decimal string instead of the
+ *     whole response crashing into the catch as an opaque "Do not know how to
+ *     serialize a BigInt".
+ *   - NaN / Infinity / -Infinity: pg parses float4/float8 with parseFloat, and
+ *     JSON renders all three as `null` -- which reads as SQL NULL. They become
+ *     the strings "NaN" / "Infinity" / "-Infinity", the same spelling a
+ *     `numeric` NaN already arrives in.
+ *   - Buffer (bytea): `toJSON` gives `{ type: "Buffer", data: [...] }`, one
+ *     array element -- and with the indent, one line -- per byte. It becomes
+ *     the `\x`-prefixed hex string PostgreSQL itself prints for bytea.
+ */
+function jsonReplacer(this: unknown, key: string, value: unknown): unknown {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  const raw = (this as Record<string, unknown>)[key];
+  if (Buffer.isBuffer(raw)) return `\\x${raw.toString("hex")}`;
+  return value;
+}
+
+/**
  * Wrap a tool handler so it always resolves to an MCP response envelope.
  *
- * - `{ ok: true }` / `{ ok: true, data: null|undefined }` -> serializes `{ success: true }`
- *   (the `data ?? { success: true }` nullish coalesce treats absent, null, and
- *   undefined identically); any other data (including 0/false/''/[]) is
- *   serialized verbatim.
+ * - `{ ok: true, data }` -> `data` serialized verbatim (including 0/false/''/[]).
+ * - `{ ok: true }` with `data` absent, null or undefined -> isError envelope.
+ *   No handler returns that, and there is nothing honest to send for one: every
+ *   tool declares an outputSchema, so a made-up body (this used to substitute
+ *   `{ success: true }`) is rejected by the SDK with a validation error that
+ *   names neither the handler nor the cause.
  * - `{ ok: false, error }` -> `{ content: [text("Error: <error>")], isError: true }`
  * - handler throws        -> `{ content: [text("Error: <message>")], isError: true }`
  * - malformed result (null / not an object / no `ok` property) -> isError envelope
@@ -145,16 +178,20 @@ export function wrapToolHandler(handler: ToolHandler, toolName: string): (input:
         };
       }
 
-      // BigInt is not JSON-serializable -- JSON.stringify throws on it. pg can
-      // hand back bigint values (e.g. int8 with a custom type parser), so a
-      // replacer stringifies bigints rather than letting the whole response
-      // crash into the catch as an opaque "Do not know how to serialize a
-      // BigInt". Circular refs still throw and are caught below.
-      const text = JSON.stringify(
-        response.data ?? { success: true },
-        (_k, v) => (typeof v === "bigint" ? v.toString() : v),
-        2,
-      );
+      if (response.data === null || response.data === undefined) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Error: tool handler returned a malformed result (ok without data)",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Circular refs still throw and are caught below.
+      const text = JSON.stringify(response.data, jsonReplacer, 2);
       const envelope: McpToolResponse = {
         content: [{ type: "text" as const, text }],
       };
@@ -167,9 +204,10 @@ export function wrapToolHandler(handler: ToolHandler, toolName: string): (input:
       if (structured !== undefined) envelope.structuredContent = structured;
       return envelope;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      // errorMessage, not err.message: a refused connection can arrive as an
+      // AggregateError with an empty message (see api.ts:errorMessage).
       return {
-        content: [{ type: "text" as const, text: `Error: ${message}` }],
+        content: [{ type: "text" as const, text: `Error: ${errorMessage(err)}` }],
         isError: true,
       };
     }

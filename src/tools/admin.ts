@@ -63,7 +63,9 @@ const wraparoundTableRowOutput = z.object({
   table: z.string(),
   relkind: z.string().describe("Raw relkind: 'r' heap, 'm' materialized view, 't' TOAST -- the only three checked."),
   xid_age: z.number().describe("age(relfrozenxid)."),
-  freeze_max_age: z.number().describe("EFFECTIVE limit: a per-table storage parameter wins over the cluster GUC."),
+  freeze_max_age: z
+    .number()
+    .describe("EFFECTIVE limit: the LOWER of the per-table storage parameter and the cluster GUC, as autovacuum uses."),
   pct_of_freeze_max_age: z.number().nullable().describe("At 1.0 autovacuum forces an anti-wraparound VACUUM."),
   mxid_age: z.number().nullable().describe("mxid_age(relminmxid). Null when no multixact was ever recorded."),
   multixact_freeze_max_age: z.number().describe("EFFECTIVE limit, resolved the same way as freeze_max_age."),
@@ -96,6 +98,85 @@ const wraparoundDatabaseRowOutput = z.object({
   pct_of_multixact_freeze_max_age: z.number().nullable(),
   triggered_by: wraparoundTriggerOutput,
 });
+
+/**
+ * One pg_advisor sequence_exhaustion finding. The fields after max_value are
+ * optional in the schema only so the declared shape stays a superset of the
+ * pre-0.15 one; the query always returns them, `owned_by` / `owned_by_type`
+ * as null for a sequence no column owns.
+ */
+type SequenceExhaustionRow = {
+  schema: string;
+  sequence: string;
+  last_value: string;
+  max_value: string;
+  increment_by?: string;
+  limit_value?: string;
+  limited_by?: "sequence" | "column";
+  owned_by?: string | null;
+  owned_by_type?: string | null;
+  pct_used: number;
+};
+
+/**
+ * What the sequence_exhaustion statement returns: the findings, plus exactly
+ * one trailing `row_kind = 'skipped'` row whose only non-null column is
+ * `skipped_unreadable`. Both discriminator columns are optional so a row
+ * without them is still read as a finding.
+ */
+type SequenceQueryRow = SequenceExhaustionRow & {
+  row_kind?: "finding" | "skipped";
+  skipped_unreadable?: number | null;
+};
+
+/** Schema counterpart of {@link SequenceExhaustionRow}. */
+const sequenceExhaustionRowOutput = z.object({
+  schema: z.string(),
+  sequence: z.string(),
+  last_value: z.string().describe("Bigint as a decimal string."),
+  max_value: z.string().describe("The sequence's own max_value. Bigint as a decimal string."),
+  increment_by: z.string().optional().describe("Negative for a descending sequence. Bigint as a decimal string."),
+  limit_value: z
+    .string()
+    .optional()
+    .describe(
+      "The bound pct_used is measured against: max_value (ascending) or min_value (descending), " +
+        "narrowed to the owning column's type range when that is tighter.",
+    ),
+  limited_by: z
+    .enum(["sequence", "column"])
+    .optional()
+    .describe("'column' when the owning column's type is the tighter bound."),
+  owned_by: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("schema.table.column the sequence is OWNED BY (SERIAL or IDENTITY), null if none."),
+  owned_by_type: z.string().nullable().optional().describe("That column's type, e.g. 'integer'."),
+  pct_used: z
+    .number()
+    .describe(
+      "last_value / limit_value, rounded for display. The FILTER runs at full precision, so a " +
+        "displayed 0.5000 can sit just above the threshold. Can exceed 1 when a bigint sequence " +
+        "has already run past its integer column's range.",
+    ),
+});
+
+/**
+ * Splits the sequence_exhaustion statement's rows into the findings and the
+ * unreadable-sequence count carried by its trailing summary row. A missing
+ * summary row reads as 0 -- it is only absent when the statement did not run
+ * as written, and the caller already warns on a failed fetch.
+ */
+function splitSequenceRows(rows: SequenceQueryRow[]): { findings: SequenceExhaustionRow[]; skipped: number } {
+  const findings: SequenceExhaustionRow[] = [];
+  let skipped = 0;
+  for (const { row_kind, skipped_unreadable, ...row } of rows) {
+    if (row_kind === "skipped") skipped = Number(skipped_unreadable ?? 0);
+    else findings.push(row);
+  }
+  return { findings, skipped };
+}
 
 /**
  * Row shape shared by all three pg_table_bloat methods. `stats_reset` is PG19+
@@ -396,8 +477,8 @@ export const adminTools = [
       "answer 'who can write to this table?' or to audit schema-wide access before a migration. " +
       "Visibility caveat: backed by `information_schema.table_privileges`, which postgres filters " +
       "by what the calling role can see. A least-privileged role may not see grants involving " +
-      "unrelated third-party roles. For a complete picture, run as a superuser or a member of " +
-      "`pg_read_all_data`.",
+      "unrelated third-party roles. For a complete picture, run as a superuser -- membership of " +
+      "`pg_read_all_data` does NOT widen this view.",
     annotations: {
       title: "Show table privileges",
       readOnlyHint: true,
@@ -611,6 +692,12 @@ export const adminTools = [
     // sub-query degrades to [] plus a `_warnings` entry, but `is_replica` goes
     // NULL rather than false when its probe fails -- `false` would claim "this
     // is a primary" on a question that was never answered.
+    //
+    // `state` / `sync_state` are nullable because pg_stat_replication hides
+    // every walsender column but the pid from a role that neither owns the
+    // walsender nor holds pg_read_all_stats. Declared non-null, one such row
+    // failed output validation and cost the caller the slots and wal_position
+    // that had been read fine.
     outputSchema: z.object({
       is_replica: z.boolean().nullable().describe("pg_is_in_recovery(). Null means the probe failed, NOT 'primary'."),
       wal_position: z
@@ -635,8 +722,14 @@ export const adminTools = [
         z.object({
           application_name: z.string(),
           client_addr: z.string().nullable().describe("Null for a replica connected over a unix socket."),
-          state: z.string().describe("startup | catchup | streaming | backup | stopping."),
-          sync_state: z.string().describe("async | potential | sync | quorum."),
+          state: z
+            .string()
+            .nullable()
+            .describe("startup | catchup | streaming | backup | stopping. Null when the role lacks pg_read_all_stats."),
+          sync_state: z
+            .string()
+            .nullable()
+            .describe("async | potential | sync | quorum. Null when the role lacks pg_read_all_stats."),
           write_lag_seconds: z.number().nullable().describe("Null until the primary has measured a round trip."),
           flush_lag_seconds: z.number().nullable(),
           replay_lag_seconds: z.number().nullable(),
@@ -669,8 +762,8 @@ export const adminTools = [
           run<{
             application_name: string;
             client_addr: string | null;
-            state: string;
-            sync_state: string;
+            state: string | null;
+            sync_state: string | null;
             write_lag_seconds: number | null;
             flush_lag_seconds: number | null;
             replay_lag_seconds: number | null;
@@ -710,6 +803,15 @@ export const adminTools = [
         if (!slotsRes.ok) warnings.push(`slots fetch failed: ${slotsRes.error}`);
         if (!replicasRes.ok) warnings.push(`replicas fetch failed: ${replicasRes.error}`);
         if (!walRes.ok) warnings.push(`wal_position fetch failed: ${walRes.error}`);
+        // A NULL state is postgres redacting the row, not a replica without a
+        // state: say so, or the nulls read as "nothing to report".
+        const replicas = replicasRes.ok ? (replicasRes.data ?? []) : [];
+        const redacted = replicas.filter((r) => r.state === null).length;
+        if (redacted > 0) {
+          warnings.push(
+            `${redacted} replica row(s) have null state / sync_state / lag: the connecting role lacks pg_read_all_stats`,
+          );
+        }
 
         return {
           ok: true,
@@ -717,7 +819,7 @@ export const adminTools = [
             is_replica: walRes.ok ? (walRes.data?.[0]?.is_in_recovery ?? false) : null,
             wal_position: walRes.ok ? (walRes.data?.[0]?.wal_position ?? null) : null,
             slots: slotsRes.ok ? (slotsRes.data ?? []) : [],
-            replicas: replicasRes.ok ? (replicasRes.data ?? []) : [],
+            replicas,
             ...(warnings.length > 0 ? { _warnings: warnings } : {}),
           },
         };
@@ -730,7 +832,13 @@ export const adminTools = [
     description:
       "Rolled-up DBA lint pass. One call returns four categories of findings:\n" +
       "- sequence_exhaustion: SERIAL / BIGSERIAL / IDENTITY sequences whose `last_value` is " +
-      "above `seqExhaustionThreshold` of `max_value`. The classic incident class.\n" +
+      "above `seqExhaustionThreshold` of `limit_value`. The classic incident class. `limit_value` " +
+      "is the bound the sequence is heading for -- `max_value` when ascending, `min_value` when " +
+      "descending -- narrowed to the owning column's type when the sequence is OWNED BY a smallint " +
+      "or integer column (a pre-PG10 SERIAL feeds an int4 column from a bigint sequence, which " +
+      "overflows the column long before the sequence); `limited_by` says which one won. " +
+      "Sequences the role cannot read (no SELECT or USAGE) have no readable `last_value`, so they " +
+      "are counted in `_warnings` rather than silently treated as healthy.\n" +
       "- wraparound_risk: transaction-ID AND multixact wraparound pressure, the classic pageable " +
       "incident. `{autovacuum_freeze_max_age, autovacuum_multixact_freeze_max_age, databases[], " +
       "tables[]}`. Those two cluster GUCs are the divisors both lists are measured against (null " +
@@ -743,9 +851,10 @@ export const adminTools = [
       "across all of them. `tables` rows: `{schema, table, relkind, xid_age " +
       "(age(relfrozenxid)), freeze_max_age, pct_of_freeze_max_age, mxid_age (mxid_age(relminmxid)), " +
       "multixact_freeze_max_age, pct_of_multixact_freeze_max_age, triggered_by}`, where " +
-      "`freeze_max_age` / `multixact_freeze_max_age` are the EFFECTIVE limits -- a per-table " +
-      "`autovacuum_freeze_max_age` / `autovacuum_multixact_freeze_max_age` storage parameter wins " +
-      "over the GUC. A row is returned when EITHER ratio is at or above `wraparoundThreshold`, and " +
+      "`freeze_max_age` / `multixact_freeze_max_age` are the EFFECTIVE limits -- the LOWER of the " +
+      "per-table `autovacuum_freeze_max_age` / `autovacuum_multixact_freeze_max_age` storage " +
+      "parameter and the GUC, because autovacuum ignores a per-table value raised above the " +
+      "cluster setting. A row is returned when EITHER ratio is at or above `wraparoundThreshold`, and " +
       "`triggered_by` ('xid' | 'multixact' | 'both') says which one did it: 'xid' means chase " +
       "freezing/autovacuum, 'multixact' means chase the lock-heavy workload burning members. " +
       "`mxid_age` and `pct_of_multixact_freeze_max_age` are null on rows whose minmxid is " +
@@ -759,6 +868,7 @@ export const adminTools = [
       "those three keys are ABSENT on older servers rather than null.\n" +
       "- tables_without_primary_key: user tables (plain and partitioned) with no PK defined. Bloat " +
       "candidates and a sign of design drift; some replication setups also need PKs. " +
+      "Partitions are not listed separately -- a partitioned table is reported once, as the parent. " +
       "Foreign tables are excluded -- PostgreSQL forbids declaring PKs on foreign tables.\n" +
       "- public_tables_without_rls: tables in `public` (or any schema in `rlsSchemas`) with " +
       "row-level security disabled. Useful as a security baseline check.\n" +
@@ -779,7 +889,7 @@ export const adminTools = [
         .min(0)
         .max(1)
         .default(0.5)
-        .describe("Minimum used-fraction (last_value / max_value) to flag a sequence (default 0.5 = 50%)."),
+        .describe("Minimum used-fraction (last_value / limit_value) to flag a sequence (default 0.5 = 50%)."),
       wraparoundThreshold: z
         .number()
         .min(0)
@@ -803,20 +913,7 @@ export const adminTools = [
     // caller reading an empty `databases` list has no way to tell "nothing above
     // the threshold" from "the divisor was never readable" without them.
     outputSchema: z.object({
-      sequence_exhaustion: z.array(
-        z.object({
-          schema: z.string(),
-          sequence: z.string(),
-          last_value: z.string().describe("Bigint as a decimal string."),
-          max_value: z.string().describe("Bigint as a decimal string."),
-          pct_used: z
-            .number()
-            .describe(
-              "last_value / max_value, rounded for display. The FILTER runs at full precision, so a " +
-                "displayed 0.5000 can sit just above the threshold.",
-            ),
-        }),
-      ),
+      sequence_exhaustion: z.array(sequenceExhaustionRowOutput),
       wraparound_risk: z.object({
         autovacuum_freeze_max_age: z.number().nullable().describe("Cluster GUC; the divisor for the xid ratios."),
         autovacuum_multixact_freeze_max_age: z
@@ -830,7 +927,10 @@ export const adminTools = [
       }),
       tables_without_primary_key: z
         .array(z.object({ schema: z.string(), table: z.string() }))
-        .describe("Plain and partitioned tables only; foreign tables cannot have a PK and are excluded."),
+        .describe(
+          "Plain and partitioned tables only; foreign tables cannot have a PK and are excluded. " +
+            "Partitions are reported through their parent, never as their own rows.",
+        ),
       public_tables_without_rls: z.array(z.object({ schema: z.string(), table: z.string() })),
       _warnings: warningsField,
     }),
@@ -880,35 +980,112 @@ export const adminTools = [
       // 6-way fanout sharing one connection -- see api.ts:withSharedClient.
       return withSharedClient(async (run) => {
         const [seqRes, wrapGucRes, wrapDbRes, wrapTblRes, noPkRes, rlsRes] = await Promise.all([
-          run<{
-            schema: string;
-            sequence: string;
-            last_value: string;
-            max_value: string;
-            pct_used: number;
-          }>(
-            // pg_sequences was added in PG10. last_value can be NULL on a never-
-            // touched sequence; we filter those out (nothing to report yet).
+          run<SequenceQueryRow>(
+            // pg_sequences was added in PG10. Its last_value is NULL on a
+            // never-touched sequence (nothing to report yet) AND on one the
+            // role lacks SELECT/USAGE on -- the second is not "healthy", it is
+            // "could not look", so those are counted (see the `skipped` row
+            // below) rather than dropped in silence. A role scoped to specific
+            // tables, which the README recommends, hits this on every sequence
+            // it was not granted.
+            //
+            // limit_value is the bound the sequence is actually heading for:
+            // max_value when ascending, min_value when descending (the default
+            // descending sequence has max_value -1, which the old `max_value >
+            // 0` filter dropped outright). When the sequence is OWNED BY a
+            // column -- pg_depend deptype 'a' for SERIAL / OWNED BY, 'i' for
+            // IDENTITY -- the column's int2/int4 range narrows it: a pre-PG10
+            // SERIAL feeds an int4 column from a bigint sequence, and the
+            // incident is the column overflowing at 2^31 while the sequence
+            // reads as 0.0000% used. One level of domain is unwrapped through
+            // typbasetype; int8 and non-integer owners leave the sequence bound
+            // alone. The ratio's sign check keeps the measure meaningful: a
+            // descending sequence bounded at a POSITIVE min_value (or an
+            // ascending one at a negative max) has no last_value / bound
+            // reading, and is left out as before. That check does NOT guard
+            // the divisions -- PostgreSQL may evaluate the WHERE conjuncts in
+            // any order -- so both divide by NULLIF(limit_value, 0): a bound of
+            // 0 (MINVALUE 0 countdown, MAXVALUE 0 ascending) would otherwise
+            // raise division by zero and fail the whole category.
+            //
             // Divide in `numeric`, not `float8`: BIGINT sequences past 2^53 lose
             // precision in float8, and the danger zone (>= threshold) is exactly
             // where the reported pct_used must stay accurate.
             // Filter vs display precision differ on purpose: the WHERE clause
             // tests the full-precision ratio while the SELECT rounds pct_used
-            // to numeric(6,4) for display. So a displayed 0.5000 may correspond
+            // to 4 places for display. So a displayed 0.5000 may correspond
             // to a true ratio slightly above the threshold -- the filter is
-            // correct, the display is rounded.
-            `SELECT
-               schemaname AS schema,
-               sequencename AS sequence,
-               last_value::text AS last_value,
-               max_value::text AS max_value,
-               (last_value::numeric / NULLIF(max_value::numeric, 0))::numeric(6, 4)::float8 AS pct_used
-             FROM pg_catalog.pg_sequences
-             WHERE last_value IS NOT NULL
-               AND max_value > 0
-               AND (last_value::numeric / max_value::numeric) >= $1
-             ORDER BY pct_used DESC NULLS LAST
-             LIMIT $2`,
+            // correct, the display is rounded. round(), not numeric(6, 4): a
+            // bigint sequence already past its smallint column's range reads
+            // as a ratio in the hundreds of thousands, which would overflow a
+            // 6-digit numeric and fail the whole category.
+            //
+            // The skipped count rides in the SAME statement as one trailing
+            // `row_kind = 'skipped'` row (UNION ALL, so it is there even when
+            // nothing is flagged -- the case it exists for) instead of costing
+            // the fanout a seventh round trip on the shared connection.
+            `WITH seq AS (
+               SELECT
+                 s.schemaname,
+                 s.sequencename,
+                 s.last_value,
+                 s.max_value,
+                 s.increment_by,
+                 has_sequence_privilege(c.oid, 'SELECT,USAGE') AS readable,
+                 CASE WHEN s.increment_by > 0
+                   THEN LEAST(s.max_value,
+                              CASE o.typ WHEN 'int2'::regtype THEN 32767 WHEN 'int4'::regtype THEN 2147483647 END)
+                   ELSE GREATEST(s.min_value,
+                                 CASE o.typ WHEN 'int2'::regtype THEN -32768 WHEN 'int4'::regtype THEN -2147483648 END)
+                 END AS limit_value,
+                 CASE WHEN s.increment_by > 0 THEN s.max_value ELSE s.min_value END AS seq_bound,
+                 o.owned_by,
+                 o.owned_by_type
+               FROM pg_catalog.pg_sequences s
+               JOIN pg_catalog.pg_namespace n ON n.nspname = s.schemaname
+               JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = s.sequencename
+               LEFT JOIN LATERAL (
+                 SELECT
+                   format('%I.%I.%I', rn.nspname, r.relname, a.attname) AS owned_by,
+                   format_type(a.atttypid, a.atttypmod) AS owned_by_type,
+                   CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END AS typ
+                 FROM pg_catalog.pg_depend d
+                 JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+                 JOIN pg_catalog.pg_class r ON r.oid = a.attrelid
+                 JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace
+                 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                 WHERE d.classid = 'pg_catalog.pg_class'::regclass
+                   AND d.objid = c.oid
+                   AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                   AND d.refobjsubid > 0
+                   AND d.deptype IN ('a', 'i')
+                 LIMIT 1
+               ) o ON true
+             ),
+             flagged AS (
+               SELECT
+                 schemaname AS schema,
+                 sequencename AS sequence,
+                 last_value::text AS last_value,
+                 max_value::text AS max_value,
+                 increment_by::text AS increment_by,
+                 limit_value::text AS limit_value,
+                 CASE WHEN limit_value = seq_bound THEN 'sequence' ELSE 'column' END AS limited_by,
+                 owned_by,
+                 owned_by_type,
+                 round(last_value::numeric / NULLIF(limit_value, 0)::numeric, 4)::float8 AS pct_used
+               FROM seq
+               WHERE last_value IS NOT NULL
+                 AND sign(limit_value) = sign(increment_by)
+                 AND (last_value::numeric / NULLIF(limit_value, 0)::numeric) >= $1
+               ORDER BY pct_used DESC NULLS LAST
+               LIMIT $2
+             )
+             SELECT 'finding' AS row_kind, f.*, NULL::int AS skipped_unreadable FROM flagged f
+             UNION ALL
+             SELECT 'skipped', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    (SELECT count(*)::int FROM seq WHERE NOT readable)
+             ORDER BY row_kind, pct_used DESC NULLS LAST`,
             [seqExhaustionThreshold, limit],
           ),
           run<{ autovacuum_freeze_max_age: number; autovacuum_multixact_freeze_max_age: number }>(
@@ -938,9 +1115,8 @@ export const adminTools = [
             // wraparound incident hides from the check that was meant to catch
             // it.
             //
-            // numeric(10, 4), not the numeric(6, 4) used for sequence
-            // exhaustion: that ratio is bounded by 1 (a sequence cannot pass
-            // its max_value), this one is not. age() tops out near 2.1e9 and
+            // numeric(10, 4), not numeric(6, 4): this ratio is not bounded
+            // by 1. age() tops out near 2.1e9 and
             // autovacuum_freeze_max_age can legally be set as low as 1e5, so a
             // ratio of ~21000 is reachable and would overflow a 6-digit
             // numeric -- turning a wraparound alarm into a numeric field
@@ -1016,13 +1192,17 @@ export const adminTools = [
             //
             // freeze_max_age resolves the per-table storage parameter
             // (`ALTER TABLE ... SET (autovacuum_freeze_max_age = ...)`) and
-            // falls back to the cluster GUC. Without this, a table with a
-            // deliberately raised override reads as critical against the
-            // cluster default, and -- worse -- a table with a LOWERED override
-            // reads as safe when autovacuum is already forcing freezes on it.
+            // takes the LOWER of it and the cluster GUC, which is what
+            // autovacuum does: it computes Min(reloption, GUC), so a per-table
+            // value can only bring the forced VACUUM forward. Without the
+            // reloption, a table with a LOWERED override reads as safe when
+            // autovacuum is already forcing freezes on it. Without the LEAST,
+            // a RAISED override (the reloption accepts up to 2 billion)
+            // divides the age by a limit autovacuum ignores, and a table about
+            // to be force-vacuumed drops below the threshold.
             // pg_options_to_table is strict, so a NULL reloptions yields zero
-            // rows and the scalar subquery returns NULL for COALESCE to
-            // absorb. multixact_freeze_max_age resolves the same way from the
+            // rows and the scalar subquery returns NULL, which LEAST skips,
+            // leaving the GUC. multixact_freeze_max_age resolves the same way from the
             // separate `autovacuum_multixact_freeze_max_age` storage parameter
             // -- a table with a lowered multixact override is already being
             // force-vacuumed while it still reads as safe against the cluster
@@ -1072,13 +1252,13 @@ export const adminTools = [
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              CROSS JOIN LATERAL (
                SELECT
-                 COALESCE(
+                 LEAST(
                    (SELECT o.option_value::int
                     FROM pg_catalog.pg_options_to_table(c.reloptions) o
                     WHERE o.option_name = 'autovacuum_freeze_max_age'),
                    current_setting('autovacuum_freeze_max_age')::int
                  ) AS freeze_max_age,
-                 COALESCE(
+                 LEAST(
                    (SELECT o.option_value::int
                     FROM pg_catalog.pg_options_to_table(c.reloptions) o
                     WHERE o.option_name = 'autovacuum_multixact_freeze_max_age'),
@@ -1106,9 +1286,14 @@ export const adminTools = [
             // legal and usually unintended. Matches the relkind filter used
             // by public_tables_without_rls below.
             //
-            // Partition children (relkind='r') inherit the parent's PK as an
-            // indisprimary index on the child, so the NOT EXISTS clause keeps
-            // already filtering them out.
+            // Partitions are excluded outright (`NOT c.relispartition`). A
+            // partition of a parent WITH a PK inherits it as an indisprimary
+            // index and never matched anyway; a partition of a PK-less parent
+            // did match, so one such parent with 60 daily partitions filled
+            // the default LIMIT on its own and cut every later table off. The
+            // parent row is the finding. Deliberately NOT applied to
+            // public_tables_without_rls below: RLS is per relation and is not
+            // inherited, so a partition without it is its own finding.
             //
             // Foreign tables (relkind='f') are excluded: PostgreSQL forbids
             // PRIMARY KEY (and UNIQUE) constraints on foreign tables entirely,
@@ -1119,6 +1304,7 @@ export const adminTools = [
              FROM pg_catalog.pg_class c
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE c.relkind IN ('r', 'p')
+               AND NOT c.relispartition
                AND ${userSchemaFilter("n.nspname")}
                AND NOT EXISTS (
                  SELECT 1 FROM pg_catalog.pg_index i
@@ -1150,7 +1336,14 @@ export const adminTools = [
         // wraparound_risk must not also cost the caller the sequence and RLS
         // findings that came back fine.
         const warnings: string[] = [];
+        const seq = seqRes.ok ? splitSequenceRows(seqRes.data ?? []) : { findings: [], skipped: 0 };
         if (!seqRes.ok) warnings.push(`sequence_exhaustion fetch failed: ${seqRes.error}`);
+        if (seq.skipped > 0) {
+          warnings.push(
+            `sequence_exhaustion skipped ${seq.skipped} sequence(s) this role cannot read ` +
+              "(no SELECT or USAGE, so last_value is NULL); they were not checked and may be near exhaustion",
+          );
+        }
         if (!wrapGucRes.ok) {
           warnings.push(`wraparound_risk.autovacuum_freeze_max_age fetch failed: ${wrapGucRes.error}`);
         }
@@ -1162,7 +1355,7 @@ export const adminTools = [
         return {
           ok: true,
           data: {
-            sequence_exhaustion: seqRes.ok ? seqRes.data : [],
+            sequence_exhaustion: seq.findings,
             wraparound_risk: {
               // `?? null` rather than leaving it undefined: an absent key
               // serializes away entirely, so a caller reading an empty
@@ -1350,7 +1543,9 @@ export const adminTools = [
       return runInternal<BloatRow>(
         // dead_ratio = dead / (live + dead): bounded [0, 1]. A 100%-dead table
         // (live=0, dead>0) correctly reports 1.0 instead of 0. Tables with both
-        // counters at 0 are filtered out -- nothing to report.
+        // counters at 0 are filtered out -- nothing to report. The filter's own
+        // division carries NULLIF like the pgstattuple branch above: postgres
+        // does not promise to evaluate the `> 0` guard first.
         `SELECT
            schemaname AS schema,
            relname AS "table",
@@ -1364,7 +1559,7 @@ export const adminTools = [
            last_analyze::text AS last_analyze${statsResetCol}
          FROM pg_catalog.pg_stat_user_tables
          WHERE (n_live_tup + n_dead_tup) > 0
-           AND (n_dead_tup::float8 / (n_live_tup + n_dead_tup)) >= $1
+           AND (n_dead_tup::float8 / NULLIF(n_live_tup + n_dead_tup, 0)) >= $1
            ${schemaFilter}
          ORDER BY n_dead_tup DESC
          LIMIT $2`,

@@ -15,6 +15,7 @@ const leastPrivilege: RoleFacts = {
   can_set_superuser: false,
   risky_functions: [],
   can_write_tables: false,
+  standard_conforming_strings: true,
 };
 
 describe("analyzeRole", () => {
@@ -32,10 +33,46 @@ describe("analyzeRole", () => {
       [{ bypass_rls: true }, /BYPASSRLS/],
       [{ risky_functions: ["dblink_connect_u"] }, /dblink_connect_u/],
       [{ can_write_tables: true }, /write privileges/],
+      [{ standard_conforming_strings: false }, /standard_conforming_strings=off/],
     ];
     for (const [patch, expected] of cases) {
       assert.match(analyzeRole({ ...leastPrivilege, ...patch }, false).join("\n"), expected);
     }
+  });
+
+  it("reports a superuser as one finding, not as the memberships pg_has_role invents for it", () => {
+    // pg_has_role() is true for a superuser on every role, so the SQL returns
+    // all five dangerous memberships and SET reach it does not hold (measured
+    // on PG18 as `postgres`: MEMBER = t, the pg_auth_members row absent).
+    const findings = analyzeRole(
+      {
+        ...leastPrivilege,
+        superuser: true,
+        can_set_superuser: true,
+        dangerous_memberships: ["pg_read_server_files", "pg_write_all_data"],
+        settable_roles: ["app_owner"],
+        settable_count: 1,
+      },
+      false,
+    );
+    assert.equal(findings.length, 1, JSON.stringify(findings));
+    assert.match(findings[0] ?? "", /SUPERUSER/);
+  });
+
+  it("warns about standard_conforming_strings=off for a superuser too", () => {
+    // A session setting, not a privilege: the statement guard misreads
+    // backslashes whatever the role, so the SUPERUSER gate must not hide it.
+    const findings = analyzeRole({ ...leastPrivilege, superuser: true, standard_conforming_strings: false }, false);
+    assert.equal(findings.length, 2, JSON.stringify(findings));
+    assert.match(findings[0] ?? "", /SUPERUSER/);
+    assert.match(findings[1] ?? "", /standard_conforming_strings=off/);
+  });
+
+  it("reads standard_conforming_strings, which the statement guard assumes is on", () => {
+    assert.match(
+      ROLE_PREFLIGHT_SQL,
+      /current_setting\('standard_conforming_strings'\) = 'on' AS standard_conforming_strings/,
+    );
   });
 
   it("does not warn about table writes when writes were asked for", () => {
@@ -71,10 +108,22 @@ describe("analyzeRole", () => {
     }
   });
 
-  it("keeps predefined pg_ roles in the SET ROLE scan", () => {
-    // pg_monitor/pg_read_all_data matter when INHERIT is off; the old
-    // left(rolname,3) <> 'pg_' filter silently dropped that reach.
-    assert.doesNotMatch(ROLE_PREFLIGHT_SQL, /rolname, 3/);
+  it("keeps predefined pg_ roles in the SET ROLE scan unless their privileges are already inherited", () => {
+    // pg_monitor/pg_read_all_data matter when INHERIT is off; an unconditional
+    // left(rolname,3) <> 'pg_' filter silently dropped that reach. Inherited
+    // ones are dropped: SET ROLE into them adds nothing, and the README's
+    // `GRANT pg_read_all_data TO mcp_reader` would otherwise always warn.
+    // Pin the whole WHERE clause of both scans, so a filter re-added under any
+    // spelling fails here.
+    const scans = [
+      ...ROLE_PREFLIGHT_SQL.matchAll(/FROM pg_catalog\.pg_roles r, priv\s+WHERE ([\s\S]*?)\s+(?:ORDER BY|\) AS)/g),
+    ]
+      .map((m) => (m[1] ?? "").replace(/\s+/g, " "))
+      .filter((where) => !where.includes("r.rolsuper"));
+    const expected =
+      "r.oid <> me.oid AND pg_catalog.pg_has_role(r.oid, priv.name) " +
+      "AND NOT (left(r.rolname::text, 3) = 'pg_' AND pg_catalog.pg_has_role(r.oid, 'USAGE'))";
+    assert.deepEqual(scans, [expected, expected], "settable_roles and settable_count must share one filter");
   });
 });
 

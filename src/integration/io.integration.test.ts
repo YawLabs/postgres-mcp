@@ -7,9 +7,9 @@
 
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { PG16, PG18, runInternal } from "../api.js";
+import { PG16, PG18 } from "../api.js";
 import { ioTools } from "../tools/io.js";
-import { integrationEnabled, setupFixtures, teardownFixtures } from "./fixtures.js";
+import { integrationEnabled, probeServerVersionNum, setupFixtures, teardownFixtures } from "./fixtures.js";
 
 const ioStats = ioTools.find((t) => t.name === "pg_io_stats")!;
 
@@ -85,22 +85,6 @@ const BYTE_FIELD_PAIRS = [
 // without the parameter.
 const IO_METHODS = ["worker", "io_uring", "sync"];
 
-// Server-version capability probe. Asks the server directly rather than
-// importing the handler's own getServerVersionNum(), for the same reason
-// admin.integration.test.ts re-probes for the PG16-gated last_*_scan columns:
-// getServerVersionNum is what the handler uses to PICK its SQL branch, so a
-// regression in that probe (a stale process-wide cache surviving a pool swap,
-// a 0-on-failure that silently downgrades the query) must not also move the
-// expectation this file checks it against. Returns 0 when the probe itself
-// fails, which callers treat as "cannot tell" and skip -- matching this
-// suite's habit of skipping rather than failing when a capability is absent.
-async function probeServerVersionNum(): Promise<number> {
-  const res = await runInternal<{ v: string }>("SELECT current_setting('server_version_num') AS v");
-  if (!res.ok || !res.data?.length) return 0;
-  const parsed = Number.parseInt(res.data[0].v, 10);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
 async function callIoStats(input: Record<string, unknown>): Promise<IoStatsData> {
   const res = (await ioStats.handler(input)) as { ok: boolean; data?: IoStatsData; error?: string };
   assert.equal(res.ok, true, `expected ok, got error: ${res.error}`);
@@ -144,7 +128,7 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
   // so a query that would 42703 on every live server still passes there.
   it("executes the pg_stat_io query and returns rows on PG16+", async () => {
     const version = await probeServerVersionNum();
-    if (version === 0 || version < PG16) return; // covered by the refusal test below
+    if (version < PG16) return; // covered by the refusal test below
 
     // Called with `{}` on purpose: direct (non-MCP) callers bypass the zod
     // schema, so the handler re-applies the defaults itself. `limit` is the
@@ -179,13 +163,14 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
   });
 
   // Every documented field, on every row, including the mostly-NULL ones that
-  // only appear with the zero-filter off. A counter that stops being cast to
-  // ::text comes back as a JS number from node-pg (int8 OID 20) and silently
-  // loses precision past 2^53; a timing that loses its ::float8 tail comes
-  // back as a numeric STRING instead. Both are invisible to a substring stub.
+  // only appear with the zero-filter off. The counters must arrive as digit
+  // strings (the ::text casts pin that whatever int8 type parser is installed;
+  // a JS number would lose precision past 2^53), and a timing that loses its
+  // ::float8 tail comes back as a numeric STRING instead. Both are invisible
+  // to a substring stub.
   it("returns every counter as a non-negative integer string and every timing as a finite number or null", async () => {
     const version = await probeServerVersionNum();
-    if (version === 0 || version < PG16) return;
+    if (version < PG16) return;
 
     const data = await callIoStats({ includeZeroRows: true, limit: 1000 });
     if (!subqueryRan(data, "io fetch failed", "pg_stat_io")) return;
@@ -242,7 +227,7 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
   // PG16/17 (or op_bytes on PG18) is a 42703 that takes the whole query down.
   it("normalizes the byte fields on whichever accounting branch the server takes", async () => {
     const version = await probeServerVersionNum();
-    if (version === 0 || version < PG16) return;
+    if (version < PG16) return;
 
     const data = await callIoStats({ includeZeroRows: true, limit: 1000 });
     const isPg18 = version >= PG18;
@@ -296,7 +281,7 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
   // and a truncated superset would make the subset relation vacuously fragile.
   it("includeZeroRows:false returns a subset of includeZeroRows:true", async () => {
     const version = await probeServerVersionNum();
-    if (version === 0 || version < PG16) return;
+    if (version < PG16) return;
 
     const all = await callIoStats({ includeZeroRows: true, limit: 1000 });
     const filtered = await callIoStats({ includeZeroRows: false, limit: 1000 });
@@ -328,7 +313,7 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
 
   it("respects limit", async () => {
     const version = await probeServerVersionNum();
-    if (version === 0 || version < PG16) return;
+    if (version < PG16) return;
 
     const all = await callIoStats({ includeZeroRows: true, limit: 1000 });
     if (!subqueryRan(all, "io fetch failed", "pg_stat_io")) return;
@@ -359,7 +344,7 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
   // so a regression that emits the keys with null values still fails.
   it("exposes io_method and in_flight on PG18+ and omits BOTH keys below 18", async () => {
     const version = await probeServerVersionNum();
-    if (version === 0 || version < PG16) return;
+    if (version < PG16) return;
 
     const data = await callIoStats({ includeZeroRows: false, limit: 200 });
 
@@ -400,8 +385,8 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
     for (const row of data.in_flight ?? []) {
       assert.equal(typeof row.pid, "number", `in_flight.pid must be a number, got ${JSON.stringify(row.pid)}`);
       assert.equal(typeof row.io_id, "number", `in_flight.io_id must be a number, got ${JSON.stringify(row.io_id)}`);
-      // ::text on both, for the same int8-precision reason as the counters --
-      // and because ::text is correct whether the column is int4 or int8.
+      // ::text on both, pinning the string shape as for the counters -- and
+      // because ::text is correct whether the column is int4 or int8.
       assert.ok(row.off === null || typeof row.off === "string", "in_flight.off must be string | null");
       assert.ok(row.length === null || typeof row.length === "string", "in_flight.length must be string | null");
     }
@@ -414,7 +399,7 @@ describe("integration: pg_io_stats", { skip: !integrationEnabled() }, () => {
   // so the detected version number is part of the contract, not decoration.
   it("refuses below PG16 with an error naming the version requirement", async () => {
     const version = await probeServerVersionNum();
-    if (version === 0 || version >= PG16) return;
+    if (version >= PG16) return;
 
     const res = (await ioStats.handler({ includeZeroRows: false, limit: 200 })) as { ok: boolean; error?: string };
     assert.equal(res.ok, false, `expected a refusal on server_version_num=${version}, got ok:true`);

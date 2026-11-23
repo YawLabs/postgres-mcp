@@ -3,13 +3,31 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { after, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { after, before, describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // The same one-level hop src/oam-floor.test.ts uses: authored in src/, executed
 // from dist/, so resolving off import.meta.url reaches the repo root either way.
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CHECKER = join(repoRoot, "scripts", "check-yaw-mcp-floor.mjs");
+
+// The current floor, read from the checker rather than copied into the
+// fixtures: copies made every floor bump turn the "passes" cases red until the
+// test was edited too. The stale values below (1.1.12, ^0.19.0) stay literal.
+let FLOOR = "";
+let RANGE = "";
+before(async () => {
+  // A computed specifier keeps tsc from resolving the untyped .mjs; importing
+  // it does not run main() (isMainModule guards it).
+  const mod = (await import(pathToFileURL(CHECKER).href)) as {
+    YAW_MCP_MIN: string;
+    YAW_MCP_COMPLIANCE_RANGE: string;
+  };
+  FLOOR = mod.YAW_MCP_MIN;
+  RANGE = mod.YAW_MCP_COMPLIANCE_RANGE;
+  assert.match(FLOOR, /^\d+\.\d+\.\d+$/);
+  assert.match(RANGE, /^\^\d+\.\d+\.\d+$/);
+});
 
 const dirs: string[] = [];
 after(() => {
@@ -46,7 +64,7 @@ describe("the Yaw MCP floor is consistent across this repo", () => {
 
 describe("check-yaw-mcp-floor catches drift", () => {
   it("passes a tree with the pinned range and a current claim", () => {
-    const root = fixture({ compliance: "^0.20.4", readme: "Tested with Yaw MCP 1.1.16 or newer.\n" });
+    const root = fixture({ compliance: RANGE, readme: `Tested with Yaw MCP ${FLOOR} or newer.\n` });
     const r = runChecker(root);
     assert.equal(r.code, 0, r.out);
   });
@@ -59,12 +77,12 @@ describe("check-yaw-mcp-floor catches drift", () => {
   });
 
   it("does not require the devDependency at all", () => {
-    const r = runChecker(fixture({ readme: "Tested with Yaw MCP 1.1.16 or newer.\n" }));
+    const r = runChecker(fixture({ readme: `Tested with Yaw MCP ${FLOOR} or newer.\n` }));
     assert.equal(r.code, 0, r.out);
   });
 
   it("flags a README claim naming the previous floor, with file and line", () => {
-    const root = fixture({ compliance: "^0.20.4", readme: "# x\n\nTested with Yaw MCP 1.1.12 or newer.\n" });
+    const root = fixture({ compliance: RANGE, readme: "# x\n\nTested with Yaw MCP 1.1.12 or newer.\n" });
     const r = runChecker(root);
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /README\.md:3 +says 1\.1\.12/);

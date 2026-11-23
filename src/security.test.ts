@@ -16,10 +16,12 @@ import {
   runReadWriteRollback,
   shutdown,
 } from "./api.js";
+import { initAudit, resetAuditForTests, setAuditSinkForTests } from "./audit.js";
 import { explainTools } from "./tools/explain.js";
 
 const pgExplain = explainTools[0];
 const BACKEND_PID = 4242;
+const AUDIT_ENV_KEYS = ["POSTGRES_AUDIT_LOG", "POSTGRES_AUDIT_LOG_FILE", "POSTGRES_AUDIT_REDACT"] as const;
 const ENV_KEYS = [
   "DATABASE_URL",
   "ALLOW_WRITES",
@@ -112,12 +114,54 @@ describe("user SQL limits (fake client)", () => {
   describe("read-only statement policy", () => {
     it("refuses a blocked statement before taking a connection", async () => {
       use(makeClient());
-      for (const sql of ["DO $$ BEGIN NULL; END $$", "/* c */ SET ROLE postgres", "SELECT dblink_exec('a', 'b')"]) {
+      for (const sql of [
+        "DO $$ BEGIN NULL; END $$",
+        "/* c */ SET ROLE postgres",
+        "SELECT dblink_exec('a', 'b')",
+        // Three spellings PostgreSQL runs as a call (measured on PG18) that a
+        // name-then-parenthesis scan misses: a UESCAPE clause between the two,
+        // attribute notation, and a call behind a continued E-string.
+        `SELECT U&"dblink!005fexec" UESCAPE '!'('a', 'b')`,
+        `SELECT U&"pg_terminate_backend" UESCAPE '!' (123)`,
+        "SELECT ('/etc/passwd'::text).pg_read_file",
+        'SELECT (123) . "pg_cancel_backend"',
+        "SELECT E'a'\n'\\'' || set_config('role', 'x', false) || '...'",
+      ]) {
         const res = await runReadOnly(sql);
         assert.equal(res.ok, false, sql);
         assert.match(res.error ?? "", /Blocked in read-only mode/);
         assert.doesNotMatch(res.error ?? "", /\(code:/, "the message is complete without a code suffix");
       }
+      assert.equal(connects, 0);
+    });
+
+    it("leaves an audit line for a refused statement", async () => {
+      // The refusal is raised inside the audited span on purpose: hoisting the
+      // guard above it would drop refused agent SQL from the trail.
+      const savedAuditEnv = AUDIT_ENV_KEYS.map((key) => [key, process.env[key]] as const);
+      for (const key of AUDIT_ENV_KEYS) delete process.env[key];
+      process.env.POSTGRES_AUDIT_LOG = "1";
+      resetAuditForTests();
+      const lines: string[] = [];
+      try {
+        initAudit();
+        setAuditSinkForTests((line) => {
+          lines.push(line);
+        });
+        use(makeClient());
+        assert.equal((await runReadOnly("SET ROLE postgres")).ok, false);
+      } finally {
+        for (const [key, value] of savedAuditEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        resetAuditForTests();
+      }
+      assert.equal(lines.length, 1, JSON.stringify(lines));
+      const record = JSON.parse(lines[0] as string) as Record<string, unknown>;
+      assert.equal(record.ok, false);
+      assert.equal(record.sqlstate, "PGMCP_BLOCKED");
+      assert.equal(record.source, "user");
       assert.equal(connects, 0);
     });
 
@@ -418,7 +462,7 @@ describe("user SQL limits (fake client)", () => {
       assert.ok(logged.some((l) => /POSTGRES_MAX_RESULT_BYTES="lots" is not a positive integer/.test(l)));
       assert.ok(
         logged.some((l) => /POSTGRES_MAX_RESULT_BYTES="1e10" is not a positive integer/.test(l)),
-        "over 2^31-1 must warn: setTimeout would coerce such a deadline to 1 ms",
+        "a value over 2^31-1 must warn: the byte limit shares the deadline's ceiling",
       );
     });
 

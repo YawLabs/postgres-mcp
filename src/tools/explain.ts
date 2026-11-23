@@ -212,7 +212,10 @@ export const explainTools = [
       "Set `hypothetical_indexes` to a list of `{table, columns, using?}` to ask the planner " +
       "'what would the plan be if these indexes existed?' -- requires the HypoPG extension " +
       "(`CREATE EXTENSION hypopg`). The hypothetical indexes are torn down at the end of the " +
-      "call, never touching real disk.",
+      "call, never touching real disk. `hypothetical_indexes` cannot be combined with " +
+      "`analyze: true`: a hypothetical index has no data to execute against, so HypoPG stands " +
+      "down for EXPLAIN ANALYZE and the combination is rejected rather than answered with the " +
+      "real plan.",
     annotations: {
       title: "Explain query plan",
       readOnlyHint: false,
@@ -277,7 +280,8 @@ export const explainTools = [
         .optional()
         .describe(
           "List of indexes the planner should pretend exist for this EXPLAIN. Requires the HypoPG " +
-            "extension. Indexes are session-scoped and reset at the end of the call.",
+            "extension. Indexes are session-scoped and reset at the end of the call. Plain EXPLAIN " +
+            "only: rejected together with `analyze: true`.",
         ),
     }),
     // One key, two shapes, decided by `format`. Modelling it as a union rather
@@ -441,6 +445,25 @@ export const explainTools = [
         if (err) return { ok: false, error: err };
       }
 
+      // HypoPG only injects into a plain EXPLAIN: hypo_is_simple_explain()
+      // bails as soon as the option list carries an `analyze` key, because a
+      // hypothetical index has nothing to execute against. Left unchecked the
+      // call created the index, ran EXPLAIN ANALYZE, and returned the REAL
+      // plan with ok:true -- which reads as "the index does not help"
+      // (measured on 15/17/18: Seq Scan under ANALYZE, Index Scan without).
+      // `costs: false` is deliberately NOT refused: COSTS OFF plans still use
+      // the hypothetical index (measured on the same three majors).
+      if (hypoIndexes.length > 0 && analyze) {
+        return {
+          ok: false,
+          error:
+            "`hypothetical_indexes` cannot be combined with `analyze: true`: a hypothetical index has " +
+            "no data to execute against, so HypoPG ignores it under EXPLAIN ANALYZE and the plan would " +
+            "silently be the real one. Drop `analyze` to see the plan with the hypothetical indexes, " +
+            "or drop `hypothetical_indexes` to measure the real plan.",
+        };
+      }
+
       // Options that do not parse at all on an older server: postgres answers
       // with `unrecognized EXPLAIN option "generic_plan"`, which reads like the
       // caller typed a garbage keyword rather than "your server is too old".
@@ -522,8 +545,10 @@ export const explainTools = [
       // value of an option hypopg does not inspect, so it satisfies the
       // grammar (still 42601 for `EXPLAIN (COSTS ON) ANALYZE SELECT 1`,
       // measured) with no plan effect. Note it only lands when no other flag
-      // is present: `costs: false` emits COSTS OFF first, and hypopg skips
-      // COSTS OFF plans upstream (pre-existing, unrelated to this filler).
+      // is present; `costs: false` emits COSTS OFF instead, which hypopg
+      // injects under just the same (measured on 15/17/18). The one flag that
+      // does switch hypopg off, ANALYZE, is refused alongside
+      // hypothetical_indexes above.
       if (flags.length === 0) flags.push("COSTS ON");
       const explainSql = `EXPLAIN (${flags.join(", ")}) ${sql}`;
 
@@ -579,10 +604,12 @@ export const explainTools = [
       // EXPLAIN returns one row per plan line (`QUERY PLAN` column). Flatten for readability.
       if (format === "text") {
         const lines = rows.map((r) => String(r["QUERY PLAN"] ?? ""));
-        // The cursor FETCH caps at POSTGRES_MAX_ROWS; toQueryResult sets
-        // `truncated` when it does. For a text plan that means the plan was
-        // chopped mid-output, so flag it rather than returning a silently
-        // incomplete plan.
+        // toQueryResult slices the rows at POSTGRES_MAX_ROWS and sets
+        // `truncated` when it does. (A post-fetch slice, not a bounded FETCH:
+        // EXPLAIN cannot be DECLAREd as a cursor, so it always takes the
+        // direct-exec path.) For a text plan that means the plan was chopped
+        // mid-output, so flag it rather than returning a silently incomplete
+        // plan.
         if ((result.data as { truncated?: boolean }).truncated) {
           lines.push(`... [plan truncated at ${rows.length} lines; raise POSTGRES_MAX_ROWS to see the full plan]`);
         }
